@@ -73,6 +73,55 @@ const OSCILLATION_MIN_SWING_DEG: f64 = 0.3;
 /// "corrected, then held", which `trend_worsening` and the amplitude tiers already grade fairly.
 const OSCILLATION_MIN_REVERSALS: usize = 2;
 
+/// Danger-cut sink-rate threshold (m/s, positive = descending). PROJECT-DERIVED, and unlike
+/// `GS_CUT_LOW_DEG` this has **no NATOPS-numeric backing at all**: NAVAIR 00-80T-104 §6.6.4 and
+/// the `TMRD` ("Too Much Rate of Descent") comment code in NAVAIR 00-80T-105 both leave excessive
+/// sink rate to the controlling LSO's judgment ("aircraft/engine performance, approach dynamics,
+/// and environmental conditions"), never a number. Publicly documented CATOBAR approach/touchdown
+/// sink rate is roughly 600-800 ft/min (~3.0-4.1 m/s) by design (no flare); this threshold sits at
+/// roughly double that nominal corridor so a normal, intentional no-flare approach or touchdown
+/// never trips it, while a real dive or late correction well outside that corridor does.
+const SINK_RATE_CUT_MPS: f64 = 8.0;
+/// Danger-cut bank-angle threshold (degrees, absolute value). PROJECT-DERIVED, same rationale as
+/// `SINK_RATE_CUT_MPS`: NATOPS has no numeric criterion for "excessive" bank either (the "Level
+/// your wings" imperative call and the `W`/`TMA`/`DLW`/`DRW` comment codes are qualitative only).
+/// Set at double `GROOVE_ROLLOUT_MAX_BANK_DEG` (`src/track.rs`, 15 deg) — well beyond any ordinary
+/// groove correction, in the range where a real risk of a wingtip/deck-edge strike or a genuine
+/// loss of control margin this close to the ship becomes plausible.
+const BANK_ANGLE_CUT_DEG: f64 = 30.0;
+/// Reinforced persistence guard for the two danger-cut checks above, deliberately stricter than
+/// `PERSISTENCE_MIN_CONSECUTIVE_SAMPLES` (2): a Cut is the harshest verdict available (0 points),
+/// so a single hard telemetry bump or one noisy frame must never trigger it on its own. Three
+/// consecutive samples is still well under a second at scoring cadence.
+const DANGER_CUT_MIN_CONSECUTIVE_SAMPLES: usize = 3;
+
+/// `_OK_` ("Okay underline", NAVAIR 00-80T-104 §11.4.1, `OFFICIAL` symbol meaning "Perfect
+/// pass") amplitude tolerance, degrees. The *symbol* and its meaning are official; these
+/// specific numbers are not — NATOPS documents no numerical criterion for awarding it. Borrowed
+/// instead from a real, currently-maintained open-source LSO grading implementation, MOOSE
+/// `Ops.Airboss` (`Airboss.lua`, `AIRBOSS.GLE`/`AIRBOSS.LUE` `_max`/`_min` fields) — the same
+/// historical/MOOSE-inspired lineage already behind `GS_SLIGHT_*`/`LU_SLIGHT` above, tightened
+/// to the band Airboss itself reserves for a zero-deviation "Unicorn" pass. Deliberately
+/// asymmetric on GS, matching the source: very slightly more tolerance for a hair high than for
+/// a hair low, which stays the more dangerous side close to the ramp.
+const OK_PERFECT_GS_HIGH_DEG: f64 = 0.4;
+const OK_PERFECT_GS_LOW_DEG: f64 = 0.3;
+const OK_PERFECT_LU_ABS_DEG: f64 = 0.5;
+/// `_OK_` groove-time window, seconds. Unlike the amplitude band above, this one **is**
+/// `OFFICIAL`: NAVAIR 00-80T-105 §6.2.4.3 states a standard Case I groove should run "15 - 18
+/// seconds" from wings-level/centered-ball to touchdown. Applied identically to every CATOBAR
+/// type (F-14, F/A-18, T-45) despite the T-45 flying a different glide slope (3.0 deg vs 3.5
+/// deg for the others) that likely implies a different real approach speed and therefore a
+/// different natural groove length — the module has no per-type approach-speed reference to
+/// adjust for this, so the raw NATOPS window is used unadjusted for every type. A known,
+/// documented limitation (see `tasking-roadmap.md`), not an oversight. Deliberately **not**
+/// coupled to which wire is caught: the historical MOOSE "wire 3 + 15-18.99 s" combination this
+/// module's own values descend from was already reviewed and left disabled (see
+/// `docs/GRADING_REFERENCE.md`) precisely because no NATOPS text ties a specific wire to a
+/// grade.
+const OK_PERFECT_GROOVE_TIME_MIN_S: f64 = 15.0;
+const OK_PERFECT_GROOVE_TIME_MAX_S: f64 = 18.0;
+
 // ---------------------------------------------------------------------------
 // PassGrade — project score using selected official display symbols
 // ---------------------------------------------------------------------------
@@ -93,11 +142,9 @@ const OSCILLATION_MIN_REVERSALS: usize = 2;
 /// | `WO`    | 1.0    | Waveoff |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum PassGrade {
-    /// Perfect pass (official `_OK_` symbol). No automatic rule currently emits it.
-    #[expect(
-        dead_code,
-        reason = "reserved for an explicit official/manual _OK_ grade"
-    )]
+    /// Perfect pass (`OFFICIAL` `_OK_` symbol, NAVAIR 00-80T-104 §11.4.1). Emitted by
+    /// `grade_from_gates` when amplitude is within `OK_PERFECT_*` and groove time falls in
+    /// `OK_PERFECT_GROOVE_TIME_MIN_S..=OK_PERFECT_GROOVE_TIME_MAX_S` — see its doc comment.
     Perfect,
     Ok,
     OkParentheses,
@@ -235,16 +282,26 @@ pub fn compute_pass_grade(
     grading: &Grading,
     gates: &GateDeviations,
     trajectory: &[TrajectoryDeviation],
-    _groove_time_secs: Option<f64>,
+    groove_time_secs: Option<f64>,
 ) -> PassGrade {
     match grading {
         Grading::Unknown => PassGrade::Incomplete,
         Grading::WaveoffUnknown => PassGrade::WaveoffUnknown,
         Grading::Bolter if gates.all_valid() => PassGrade::Bolter,
-        Grading::Recovered { .. } if gates.all_valid() => grade_from_gates(gates, trajectory),
+        Grading::Recovered { .. } if gates.all_valid() => {
+            grade_from_gates(gates, trajectory, groove_time_secs)
+        }
         // A qualification touch-and-go keeps the independently measured
         // approach grade, but can never receive a trap/wire-specific upgrade.
-        Grading::TouchAndGo { .. } if gates.all_valid() => grade_from_gates(gates, trajectory),
+        // `_OK_` ("Perfect pass") is reserved for a real trap: a touch-and-go is a deliberate
+        // hook-up practice pass, never a full stop, so it is capped one tier down instead (see
+        // docs/GRADING_REFERENCE.md: "A touch-and-go cannot receive `_OK_` or points").
+        Grading::TouchAndGo { .. } if gates.all_valid() => {
+            match grade_from_gates(gates, trajectory, groove_time_secs) {
+                PassGrade::Perfect => PassGrade::Ok,
+                other => other,
+            }
+        }
         Grading::TouchAndGo { .. } | Grading::Bolter | Grading::Recovered { .. } => {
             PassGrade::Incomplete
         }
@@ -279,7 +336,9 @@ pub fn compute_vstol_approach_grade_points(
             }
 
             if gate_scores.is_empty() {
-                let fallback = grade_from_gates(gates, &[]);
+                // V/STOL never earns `_OK_`/groove-time bonuses (see this function's doc
+                // comment), so `None` here is not a simplification, it is the actual rule.
+                let fallback = grade_from_gates(gates, &[], None);
                 (fallback, fallback.points())
             } else {
                 let average_points = gate_scores.iter().sum::<f64>() / gate_scores.len() as f64;
@@ -341,19 +400,23 @@ fn grade_single_gate(gate: &crate::track::GateDatum, quarter_nm: bool) -> PassGr
 pub(crate) fn grade_from_gates(
     gates: &GateDeviations,
     trajectory: &[TrajectoryDeviation],
+    groove_time_secs: Option<f64>,
 ) -> PassGrade {
     // Dangerously low at the 1/4-nm gate → Cut pass. GS_CUT_LOW_DEG is negative, so this
     // triggers when the hook is well below the ideal glide path at close range. Also checked
     // at every continuous sample inside the 1/4-nm gate distance, not only at the exact gate
     // crossing: a brief dip below threshold that recovers before crossing 463 m is just as
-    // dangerous as one measured exactly at the gate.
+    // dangerous as one measured exactly at the gate. A sustained excessive sink rate or bank
+    // angle in that same zone (`dangerous_sink_rate_or_bank`) is graded the same way — see its
+    // doc comment for why those thresholds carry no NATOPS-numeric backing, unlike GS_CUT_LOW_DEG.
     let quarter_nm_cut = gates
         .at_quarter_nm
         .as_ref()
         .is_some_and(|g| g.gs_deviation_deg < GS_CUT_LOW_DEG)
         || trajectory.iter().any(|d| {
             d.distance_m <= crate::track::GATE_QUARTER_NM && d.gs_deviation_deg < GS_CUT_LOW_DEG
-        });
+        })
+        || dangerous_sink_rate_or_bank(trajectory);
     if quarter_nm_cut {
         return PassGrade::Cut;
     }
@@ -444,11 +507,65 @@ pub(crate) fn grade_from_gates(
     // approach is treated as NoGrade if it happens inside LATE_WINDOW_DISTANCE_M, where there
     // is no distance left to correct it. It never raises a grade, and never touches Cut or an
     // already-NoGrade result. See docs/GRADING_REFERENCE.md, "Late-approach weighting".
-    if matches!(tier, PassGrade::Ok | PassGrade::OkParentheses) && late_window_severe(trajectory) {
+    let tier = if matches!(tier, PassGrade::Ok | PassGrade::OkParentheses)
+        && late_window_severe(trajectory)
+    {
         PassGrade::NoGrade
     } else {
         tier
+    };
+
+    // `_OK_` (NAVAIR 00-80T-104 §11.4.1, "Perfect pass"): only reachable from a pass that has
+    // already cleared every check above and landed on plain `Ok` — this is a strict tightening
+    // of `Ok`, never an alternate path, so trend/oscillation/late-window already vouch for the
+    // approach before this even runs. See `OK_PERFECT_*` for why the amplitude band is
+    // PROJECT-DERIVED (MOOSE Airboss-sourced) while the groove-time window is NATOPS `OFFICIAL`.
+    if tier == PassGrade::Ok
+        && is_amplitude_perfect(gates, trajectory)
+        && groove_time_secs.is_some_and(|t| {
+            (OK_PERFECT_GROOVE_TIME_MIN_S..=OK_PERFECT_GROOVE_TIME_MAX_S).contains(&t)
+        })
+    {
+        PassGrade::Perfect
+    } else {
+        tier
     }
+}
+
+/// Whether every gate and every continuous-trajectory sample stayed inside the `_OK_` tolerance
+/// band (`OK_PERFECT_GS_HIGH_DEG`/`OK_PERFECT_GS_LOW_DEG`/`OK_PERFECT_LU_ABS_DEG`). Gates are
+/// already bracket/skew-validated single points of trusted evidence, so each one is checked
+/// directly, with no pardon for a single reading. The continuous trajectory gets the same
+/// noise-pardon as everywhere else in this module (`PERSISTENCE_MIN_CONSECUTIVE_SAMPLES`): one
+/// isolated, non-repeating frame outside the band does not by itself deny `_OK_`, since a real
+/// perfect pass should not be punished for a single unrelated telemetry hiccup.
+fn is_amplitude_perfect(gates: &GateDeviations, trajectory: &[TrajectoryDeviation]) -> bool {
+    let gate_within_band = |gate: &Option<crate::track::GateDatum>| match gate {
+        Some(g) => {
+            g.gs_deviation_deg <= OK_PERFECT_GS_HIGH_DEG
+                && g.gs_deviation_deg >= -OK_PERFECT_GS_LOW_DEG
+                && g.lineup_deg.abs() <= OK_PERFECT_LU_ABS_DEG
+        }
+        None => true,
+    };
+    if !gate_within_band(&gates.at_three_quarter_nm)
+        || !gate_within_band(&gates.at_half_nm)
+        || !gate_within_band(&gates.at_quarter_nm)
+    {
+        return false;
+    }
+
+    let elevated: Vec<bool> = trajectory
+        .iter()
+        .map(|d| {
+            d.gs_deviation_deg > OK_PERFECT_GS_HIGH_DEG
+                || d.gs_deviation_deg < -OK_PERFECT_GS_LOW_DEG
+                || d.lineup_deg.abs() > OK_PERFECT_LU_ABS_DEG
+        })
+        .collect();
+    !persistent_mask(&elevated, PERSISTENCE_MIN_CONSECUTIVE_SAMPLES)
+        .iter()
+        .any(|&keep| keep)
 }
 
 /// Whether any continuous trajectory sample inside `LATE_WINDOW_DISTANCE_M` of touchdown
@@ -503,8 +620,8 @@ fn persistent_trajectory_values(trajectory: &[TrajectoryDeviation]) -> (Vec<f64>
         .iter()
         .map(|d| d.lineup_deg.abs() >= LU_SLIGHT)
         .collect();
-    let gs_keep = persistent_mask(&gs_elevated);
-    let lu_keep = persistent_mask(&lu_elevated);
+    let gs_keep = persistent_mask(&gs_elevated, PERSISTENCE_MIN_CONSECUTIVE_SAMPLES);
+    let lu_keep = persistent_mask(&lu_elevated, PERSISTENCE_MIN_CONSECUTIVE_SAMPLES);
 
     let gs = trajectory
         .iter()
@@ -522,9 +639,11 @@ fn persistent_trajectory_values(trajectory: &[TrajectoryDeviation]) -> (Vec<f64>
 }
 
 /// For each run of consecutive `true` values in `elevated`, marks the whole run `true` in the
-/// result only if the run is at least `PERSISTENCE_MIN_CONSECUTIVE_SAMPLES` long; shorter runs
-/// (a lone spike) come back `false`.
-fn persistent_mask(elevated: &[bool]) -> Vec<bool> {
+/// result only if the run is at least `min_run` samples long; shorter runs (a lone spike) come
+/// back `false`. `min_run` is a parameter (rather than always `PERSISTENCE_MIN_CONSECUTIVE_SAMPLES`)
+/// so the danger-cut checks below can require a stricter run length
+/// (`DANGER_CUT_MIN_CONSECUTIVE_SAMPLES`) than the ordinary amplitude guard.
+fn persistent_mask(elevated: &[bool], min_run: usize) -> Vec<bool> {
     let mut keep = vec![false; elevated.len()];
     let mut i = 0;
     while i < elevated.len() {
@@ -533,7 +652,7 @@ fn persistent_mask(elevated: &[bool]) -> Vec<bool> {
             while i < elevated.len() && elevated[i] {
                 i += 1;
             }
-            if i - start >= PERSISTENCE_MIN_CONSECUTIVE_SAMPLES {
+            if i - start >= min_run {
                 keep[start..i].fill(true);
             }
         } else {
@@ -541,6 +660,32 @@ fn persistent_mask(elevated: &[bool]) -> Vec<bool> {
         }
     }
     keep
+}
+
+/// Danger cut: a sustained excessive sink rate or bank angle at or inside the quarter-NM gate —
+/// the same "no distance left to correct it" zone as `GS_CUT_LOW_DEG` — is graded as a Cut,
+/// exactly like a dangerously low glideslope. See `SINK_RATE_CUT_MPS`/`BANK_ANGLE_CUT_DEG` for why
+/// neither threshold is NATOPS-numeric. Guarded by `DANGER_CUT_MIN_CONSECUTIVE_SAMPLES` so a
+/// single spike or noisy frame never cuts a pass on its own.
+fn dangerous_sink_rate_or_bank(trajectory: &[TrajectoryDeviation]) -> bool {
+    let near_ramp: Vec<&TrajectoryDeviation> = trajectory
+        .iter()
+        .filter(|d| d.distance_m <= crate::track::GATE_QUARTER_NM)
+        .collect();
+    let sink_elevated: Vec<bool> = near_ramp
+        .iter()
+        .map(|d| d.sink_rate_mps >= SINK_RATE_CUT_MPS)
+        .collect();
+    let bank_elevated: Vec<bool> = near_ramp
+        .iter()
+        .map(|d| d.bank_deg.abs() >= BANK_ANGLE_CUT_DEG)
+        .collect();
+    persistent_mask(&sink_elevated, DANGER_CUT_MIN_CONSECUTIVE_SAMPLES)
+        .iter()
+        .any(|&keep| keep)
+        || persistent_mask(&bank_elevated, DANGER_CUT_MIN_CONSECUTIVE_SAMPLES)
+            .iter()
+            .any(|&keep| keep)
 }
 
 /// A.4 (NATOPS `OC` — overcontrolled): whether GS or (signed) lineup deviation reversed
@@ -645,87 +790,91 @@ mod tests {
     }
 
     #[test]
-    fn test_perfect_pass_is_ok() {
-        // All deviations well within OK margins.
+    fn test_clean_pass_without_groove_time_evidence_is_ok_not_perfect() {
+        // All deviations well within OK margins (in fact within the tighter `_OK_` band too),
+        // but no groove time is known here (`None`): `_OK_` is never granted absent that
+        // evidence, so this stays `Ok`, not `Perfect`. See
+        // `clean_pass_with_groove_time_in_window_reaches_perfect_regardless_of_wire` for the
+        // same amplitude with groove time actually supplied.
         let g = gates_deg(0.2, 0.3, 0.1, 0.2, 0.1, 0.1);
-        assert_eq!(grade_from_gates(&g, &[]), PassGrade::Ok);
+        assert_eq!(grade_from_gates(&g, &[], None), PassGrade::Ok);
     }
 
     #[test]
     fn test_slight_gs_deviation_is_ok_parentheses() {
         // 0.6° high GS at 3/4 nm: exceeds GS_SLIGHT_HIGH (0.5°) → (OK).
         let g = gates_deg(0.6, 0.3, 0.1, 0.2, 0.1, 0.1);
-        assert_eq!(grade_from_gates(&g, &[]), PassGrade::OkParentheses);
+        assert_eq!(grade_from_gates(&g, &[], None), PassGrade::OkParentheses);
     }
 
     #[test]
     fn test_slight_gs_high_threshold_is_0_5() {
         // 0.9° high GS: still between GS_SLIGHT_HIGH and GS_SIGNIFICANT → (OK), not --.
         let g = gates_deg(0.9, 0.0, 0.0, 0.0, 0.0, 0.0);
-        assert_eq!(grade_from_gates(&g, &[]), PassGrade::OkParentheses);
+        assert_eq!(grade_from_gates(&g, &[], None), PassGrade::OkParentheses);
     }
 
     #[test]
     fn test_catobar_slight_gs_low_threshold_is_0_5() {
         // The boundary is inclusive: 0.5° low GS is (OK).
         let g = gates_deg(-0.5, 0.0, 0.0, 0.0, 0.0, 0.0);
-        assert_eq!(grade_from_gates(&g, &[]), PassGrade::OkParentheses);
+        assert_eq!(grade_from_gates(&g, &[], None), PassGrade::OkParentheses);
     }
 
     #[test]
     fn test_gs_high_below_new_threshold_is_ok() {
         // 0.4° high GS: below GS_SLIGHT_HIGH (0.5°) → OK.
         let g = gates_deg(0.4, 0.0, 0.0, 0.0, 0.0, 0.0);
-        assert_eq!(grade_from_gates(&g, &[]), PassGrade::Ok);
+        assert_eq!(grade_from_gates(&g, &[], None), PassGrade::Ok);
     }
 
     #[test]
     fn test_slight_lu_deviation_is_ok_parentheses() {
         // 1.1° LU at half nm: exceeds LU_SLIGHT (1.0°) → (OK).
         let g = gates_deg(0.2, 0.3, 0.1, 1.1, 0.1, 0.1);
-        assert_eq!(grade_from_gates(&g, &[]), PassGrade::OkParentheses);
+        assert_eq!(grade_from_gates(&g, &[], None), PassGrade::OkParentheses);
     }
 
     #[test]
     fn test_catobar_significant_gs_threshold_is_1_0() {
         // The boundary is inclusive: 1.0° high GS is no-grade.
         let g = gates_deg(1.0, 0.3, 0.1, 0.2, 0.1, 0.1);
-        assert_eq!(grade_from_gates(&g, &[]), PassGrade::NoGrade);
+        assert_eq!(grade_from_gates(&g, &[], None), PassGrade::NoGrade);
     }
 
     #[test]
     fn test_significant_lu_deviation_is_no_grade() {
         // 3.1° LU at 1/4 nm: exceeds LU_SIGNIFICANT (3.0°) → --.
         let g = gates_deg(0.2, 0.3, 0.1, 0.2, 0.1, 3.1);
-        assert_eq!(grade_from_gates(&g, &[]), PassGrade::NoGrade);
+        assert_eq!(grade_from_gates(&g, &[], None), PassGrade::NoGrade);
     }
 
     #[test]
     fn test_medium_lu_deviation_is_no_grade() {
         // 2.1° LU at 3/4 nm: exceeds LU_MEDIUM (2.0°) → --.
         let g = gates_deg(0.0, 2.1, 0.0, 0.0, 0.0, 0.0);
-        assert_eq!(grade_from_gates(&g, &[]), PassGrade::NoGrade);
+        assert_eq!(grade_from_gates(&g, &[], None), PassGrade::NoGrade);
     }
 
     #[test]
     fn test_below_medium_lu_is_ok_parentheses() {
         // 1.9° LU: above LU_SLIGHT but below LU_MEDIUM → (OK).
         let g = gates_deg(0.0, 1.9, 0.0, 0.0, 0.0, 0.0);
-        assert_eq!(grade_from_gates(&g, &[]), PassGrade::OkParentheses);
+        assert_eq!(grade_from_gates(&g, &[], None), PassGrade::OkParentheses);
     }
 
     #[test]
     fn test_dangerously_low_at_quarter_nm_is_cut() {
         // −2.6° GS at 1/4 nm: below GS_CUT_LOW_DEG (−2.5°) → Cut.
         let g = gates_deg(0.0, 0.0, 0.0, 0.0, -2.6, 0.0);
-        assert_eq!(grade_from_gates(&g, &[]), PassGrade::Cut);
+        assert_eq!(grade_from_gates(&g, &[], None), PassGrade::Cut);
     }
 
     #[test]
     fn test_low_at_earlier_gates_not_cut() {
         // −2.6° GS only at 3/4 nm (not at 1/4 nm) → NoGrade, not Cut.
         let g = gates_deg(-2.6, 0.0, 0.0, 0.0, 0.0, 0.0);
-        assert_eq!(grade_from_gates(&g, &[]), PassGrade::NoGrade);
+        assert_eq!(grade_from_gates(&g, &[], None), PassGrade::NoGrade);
     }
 
     fn trajectory_point(
@@ -777,8 +926,8 @@ mod tests {
             trajectory_point(710.0, 1.2, 0.0),
             trajectory_point(700.0, 1.2, 0.0),
         ];
-        assert_eq!(grade_from_gates(&g, &[]), PassGrade::Ok);
-        assert_eq!(grade_from_gates(&g, &trajectory), PassGrade::NoGrade);
+        assert_eq!(grade_from_gates(&g, &[], None), PassGrade::Ok);
+        assert_eq!(grade_from_gates(&g, &trajectory, None), PassGrade::NoGrade);
     }
 
     #[test]
@@ -789,7 +938,7 @@ mod tests {
         // clean approach — see `PERSISTENCE_MIN_CONSECUTIVE_SAMPLES`.
         let g = gates_deg(0.1, 0.1, 0.1, 0.1, 0.1, 0.1);
         let trajectory = [trajectory_point(700.0, 1.2, 0.0)];
-        assert_eq!(grade_from_gates(&g, &trajectory), PassGrade::Ok);
+        assert_eq!(grade_from_gates(&g, &trajectory, None), PassGrade::Ok);
     }
 
     #[test]
@@ -799,7 +948,10 @@ mod tests {
             trajectory_point(710.0, 0.0, 1.5),
             trajectory_point(700.0, 0.0, 1.5),
         ];
-        assert_eq!(grade_from_gates(&g, &trajectory), PassGrade::OkParentheses);
+        assert_eq!(
+            grade_from_gates(&g, &trajectory, None),
+            PassGrade::OkParentheses
+        );
     }
 
     #[test]
@@ -807,7 +959,10 @@ mod tests {
         // A trajectory sample milder than the worst gate must never pull the grade back up.
         let g = gates_deg(1.2, 0.0, 0.0, 0.0, 0.0, 0.0);
         let trajectory = [trajectory_point(700.0, 0.1, 0.0)];
-        assert_eq!(grade_from_gates(&g, &trajectory), grade_from_gates(&g, &[]));
+        assert_eq!(
+            grade_from_gates(&g, &trajectory, None),
+            grade_from_gates(&g, &[], None)
+        );
     }
 
     #[test]
@@ -818,7 +973,7 @@ mod tests {
         // alone would miss.
         let g = gates_deg(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         let trajectory = [trajectory_point(400.0, -2.6, 0.0)];
-        assert_eq!(grade_from_gates(&g, &trajectory), PassGrade::Cut);
+        assert_eq!(grade_from_gates(&g, &trajectory, None), PassGrade::Cut);
     }
 
     #[test]
@@ -832,7 +987,84 @@ mod tests {
             trajectory_point(710.0, -2.6, 0.0),
             trajectory_point(700.0, -2.6, 0.0),
         ];
-        assert_eq!(grade_from_gates(&g, &trajectory), PassGrade::NoGrade);
+        assert_eq!(grade_from_gates(&g, &trajectory, None), PassGrade::NoGrade);
+    }
+
+    fn danger_point(distance_m: f64, sink_rate_mps: f64, bank_deg: f64) -> TrajectoryDeviation {
+        TrajectoryDeviation {
+            timestamp_dcs: 0.0,
+            distance_m,
+            gs_deviation_deg: 0.0,
+            lineup_deg: 0.0,
+            alt_m: 0.0,
+            bank_deg,
+            sink_rate_mps,
+        }
+    }
+
+    #[test]
+    fn sustained_excessive_sink_rate_near_the_ramp_is_a_cut() {
+        // Otherwise-clean gates and GS/lineup, but the aircraft is descending at
+        // SINK_RATE_CUT_MPS (8.0 m/s, roughly double the nominal ~3-4 m/s no-flare CATOBAR
+        // approach rate) for DANGER_CUT_MIN_CONSECUTIVE_SAMPLES (3) consecutive samples inside
+        // the quarter-NM gate: graded the same as a dangerously low glideslope.
+        let g = gates_deg(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let trajectory = [
+            danger_point(400.0, 8.0, 0.0),
+            danger_point(380.0, 8.5, 0.0),
+            danger_point(360.0, 8.2, 0.0),
+        ];
+        assert_eq!(grade_from_gates(&g, &trajectory, None), PassGrade::Cut);
+    }
+
+    #[test]
+    fn momentary_sink_rate_spike_near_the_ramp_is_not_a_cut() {
+        // Same magnitude as the sustained case above, but only two consecutive samples: below
+        // DANGER_CUT_MIN_CONSECUTIVE_SAMPLES (3), so a single noisy telemetry bump must not cut
+        // an otherwise clean pass.
+        let g = gates_deg(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let trajectory = [danger_point(400.0, 8.5, 0.0), danger_point(380.0, 8.5, 0.0)];
+        assert_eq!(grade_from_gates(&g, &trajectory, None), PassGrade::Ok);
+    }
+
+    #[test]
+    fn excessive_sink_rate_outside_quarter_nm_is_not_a_cut() {
+        // Same sustained excessive sink rate, but entirely outside the quarter-NM danger zone
+        // (700 m): the Cut rule only ever applies "at the ramp", same scoping as GS_CUT_LOW_DEG.
+        let g = gates_deg(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let trajectory = [
+            danger_point(720.0, 9.0, 0.0),
+            danger_point(710.0, 9.0, 0.0),
+            danger_point(700.0, 9.0, 0.0),
+        ];
+        assert_eq!(grade_from_gates(&g, &trajectory, None), PassGrade::Ok);
+    }
+
+    #[test]
+    fn sustained_excessive_bank_angle_near_the_ramp_is_a_cut() {
+        // Same mechanism as the sink-rate danger cut, but for BANK_ANGLE_CUT_DEG (30 deg,
+        // double the CATOBAR groove roll-out "wings level" threshold): a sustained hard bank
+        // this close to the ramp is graded as a Cut regardless of otherwise-clean GS/lineup.
+        let g = gates_deg(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let trajectory = [
+            danger_point(400.0, 0.0, -32.0),
+            danger_point(380.0, 0.0, -31.0),
+            danger_point(360.0, 0.0, -33.0),
+        ];
+        assert_eq!(grade_from_gates(&g, &trajectory, None), PassGrade::Cut);
+    }
+
+    #[test]
+    fn ordinary_groove_correction_bank_is_not_a_cut() {
+        // 12 deg is a realistic lineup-correction bank, well under BANK_ANGLE_CUT_DEG (30 deg):
+        // must never cut an otherwise clean pass.
+        let g = gates_deg(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let trajectory = [
+            danger_point(400.0, 0.0, 12.0),
+            danger_point(380.0, 0.0, 12.0),
+            danger_point(360.0, 0.0, 12.0),
+        ];
+        assert_eq!(grade_from_gates(&g, &trajectory, None), PassGrade::Ok);
     }
 
     #[test]
@@ -847,7 +1079,10 @@ mod tests {
             trajectory_point_at(0.0, 900.0, 0.05, 0.0),
             trajectory_point_at(4.0, 500.0, 0.45, 0.0),
         ];
-        assert_eq!(grade_from_gates(&g, &trajectory), PassGrade::OkParentheses);
+        assert_eq!(
+            grade_from_gates(&g, &trajectory, None),
+            PassGrade::OkParentheses
+        );
     }
 
     #[test]
@@ -860,7 +1095,7 @@ mod tests {
             trajectory_point_at(0.0, 900.0, 0.45, 0.0),
             trajectory_point_at(4.0, 500.0, 0.05, 0.0),
         ];
-        assert_eq!(grade_from_gates(&g, &trajectory), PassGrade::Ok);
+        assert_eq!(grade_from_gates(&g, &trajectory, None), PassGrade::Ok);
     }
 
     #[test]
@@ -872,7 +1107,7 @@ mod tests {
             trajectory_point_at(0.0, 900.0, 0.10, 0.0),
             trajectory_point_at(4.0, 500.0, 0.15, 0.0),
         ];
-        assert_eq!(grade_from_gates(&g, &trajectory), PassGrade::Ok);
+        assert_eq!(grade_from_gates(&g, &trajectory, None), PassGrade::Ok);
     }
 
     #[test]
@@ -887,7 +1122,10 @@ mod tests {
             trajectory_point_at(17.0, 700.0, 0.05, 0.0),
             trajectory_point_at(21.0, 500.0, 0.40, 0.0),
         ];
-        assert_eq!(grade_from_gates(&g, &trajectory), PassGrade::OkParentheses);
+        assert_eq!(
+            grade_from_gates(&g, &trajectory, None),
+            PassGrade::OkParentheses
+        );
     }
 
     #[test]
@@ -899,7 +1137,10 @@ mod tests {
             trajectory_point_at(0.0, 900.0, 0.05, 0.0),
             trajectory_point_at(4.0, 500.0, 0.45, 0.0),
         ];
-        assert_eq!(grade_from_gates(&g, &trajectory), PassGrade::OkParentheses);
+        assert_eq!(
+            grade_from_gates(&g, &trajectory, None),
+            PassGrade::OkParentheses
+        );
     }
 
     #[test]
@@ -908,7 +1149,7 @@ mod tests {
         // rather than panic or divide by zero.
         let g = gates_deg(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         let trajectory = [trajectory_point_at(0.0, 700.0, 0.05, 0.0)];
-        assert_eq!(grade_from_gates(&g, &trajectory), PassGrade::Ok);
+        assert_eq!(grade_from_gates(&g, &trajectory, None), PassGrade::Ok);
     }
 
     #[test]
@@ -924,7 +1165,10 @@ mod tests {
             trajectory_point_at(2.0, 700.0, 0.4, 0.0),
             trajectory_point_at(3.0, 600.0, -0.4, 0.0),
         ];
-        assert_eq!(grade_from_gates(&g, &trajectory), PassGrade::OkParentheses);
+        assert_eq!(
+            grade_from_gates(&g, &trajectory, None),
+            PassGrade::OkParentheses
+        );
     }
 
     #[test]
@@ -938,7 +1182,7 @@ mod tests {
             trajectory_point_at(1.0, 800.0, 0.4, 0.0),
             trajectory_point_at(2.0, 700.0, 0.1, 0.0),
         ];
-        assert_eq!(grade_from_gates(&g, &trajectory), PassGrade::Ok);
+        assert_eq!(grade_from_gates(&g, &trajectory, None), PassGrade::Ok);
     }
 
     #[test]
@@ -952,7 +1196,7 @@ mod tests {
             trajectory_point_at(2.0, 700.0, 0.0, 0.1),
             trajectory_point_at(3.0, 600.0, 0.0, -0.1),
         ];
-        assert_eq!(grade_from_gates(&g, &trajectory), PassGrade::Ok);
+        assert_eq!(grade_from_gates(&g, &trajectory, None), PassGrade::Ok);
     }
 
     #[test]
@@ -962,7 +1206,7 @@ mod tests {
         // LATE_WINDOW_DISTANCE_M, with no room left to correct -- caps it at NoGrade instead.
         let g = gates_deg(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         let trajectory = [trajectory_point(100.0, 0.9, 0.0)];
-        assert_eq!(grade_from_gates(&g, &trajectory), PassGrade::NoGrade);
+        assert_eq!(grade_from_gates(&g, &trajectory, None), PassGrade::NoGrade);
     }
 
     #[test]
@@ -971,7 +1215,7 @@ mod tests {
         // LU_MEDIUM (2.0).
         let g = gates_deg(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         let trajectory = [trajectory_point(100.0, 0.0, 1.6)];
-        assert_eq!(grade_from_gates(&g, &trajectory), PassGrade::NoGrade);
+        assert_eq!(grade_from_gates(&g, &trajectory, None), PassGrade::NoGrade);
     }
 
     #[test]
@@ -986,7 +1230,10 @@ mod tests {
             trajectory_point(710.0, 0.9, 0.0),
             trajectory_point(700.0, 0.9, 0.0),
         ];
-        assert_eq!(grade_from_gates(&g, &trajectory), PassGrade::OkParentheses);
+        assert_eq!(
+            grade_from_gates(&g, &trajectory, None),
+            PassGrade::OkParentheses
+        );
     }
 
     #[test]
@@ -1000,7 +1247,10 @@ mod tests {
             trajectory_point(110.0, 0.6, 0.0),
             trajectory_point(100.0, 0.6, 0.0),
         ];
-        assert_eq!(grade_from_gates(&g, &trajectory), PassGrade::OkParentheses);
+        assert_eq!(
+            grade_from_gates(&g, &trajectory, None),
+            PassGrade::OkParentheses
+        );
     }
 
     #[test]
@@ -1009,7 +1259,7 @@ mod tests {
         // late-window check only ever holds back Ok/(OK), like trend does for Ok alone.
         let g = gates_deg(1.2, 0.0, 0.0, 0.0, 0.0, 0.0);
         let trajectory = [trajectory_point(100.0, 0.9, 0.0)];
-        assert_eq!(grade_from_gates(&g, &trajectory), PassGrade::NoGrade);
+        assert_eq!(grade_from_gates(&g, &trajectory, None), PassGrade::NoGrade);
     }
 
     #[test]
@@ -1019,7 +1269,7 @@ mod tests {
         // must not somehow soften that to NoGrade.
         let g = gates_deg(0.0, 0.0, 0.0, 0.0, -2.6, 0.0);
         let trajectory = [trajectory_point(100.0, 0.9, 0.0)];
-        assert_eq!(grade_from_gates(&g, &trajectory), PassGrade::Cut);
+        assert_eq!(grade_from_gates(&g, &trajectory, None), PassGrade::Cut);
     }
 
     #[test]
@@ -1041,9 +1291,101 @@ mod tests {
     }
 
     #[test]
-    fn legacy_wire3_time_window_does_not_upgrade_to_perfect() {
-        // Former legacy trigger: it must remain OK, not become Perfect.
+    fn clean_pass_with_groove_time_in_window_reaches_perfect_regardless_of_wire() {
+        // `_OK_` depends only on amplitude (`OK_PERFECT_*`) and groove time
+        // (`OK_PERFECT_GROOVE_TIME_MIN_S..=OK_PERFECT_GROOVE_TIME_MAX_S`), never on which wire
+        // is caught. The historical "wire 3 + 15-18.99 s" Unicorn coupling this module's own
+        // thresholds descend from was deliberately not revived (see docs/GRADING_REFERENCE.md).
+        // Wire 3 here plays no special role -- see the next test for wire 4 producing the same
+        // result.
         let g = gates_deg(0.1, 0.1, 0.1, 0.1, 0.1, 0.1);
+        let grading = Grading::Recovered {
+            cable: Some(3),
+            cable_estimated: Some(3),
+        };
+        assert_eq!(
+            compute_pass_grade(&grading, &g, &[], Some(16.5)),
+            PassGrade::Perfect
+        );
+    }
+
+    #[test]
+    fn clean_wire4_pass_also_reaches_perfect() {
+        // Same clean amplitude and in-window groove time as the wire-3 case above, but a
+        // different wire: proves wire number plays no role at all in `_OK_`, exactly as
+        // documented (docs/GRADING_REFERENCE.md: "Groove time and estimated wire cannot produce
+        // `_OK_`" refers to the *disabled coupling*, not to groove time or wire individually --
+        // groove time alone genuinely does gate `_OK_`, per NAVAIR 00-80T-105 §6.2.4.3).
+        let g = gates_deg(0.1, 0.1, 0.1, 0.1, 0.1, 0.1);
+        let grading = Grading::Recovered {
+            cable: Some(4),
+            cable_estimated: Some(4),
+        };
+        assert_eq!(
+            compute_pass_grade(&grading, &g, &[], Some(16.5)),
+            PassGrade::Perfect
+        );
+    }
+
+    #[test]
+    fn groove_time_exactly_at_either_boundary_still_reaches_perfect() {
+        // NAVAIR 00-80T-105 §6.2.4.3's "15 - 18 second groove" is inclusive at both ends in this
+        // module's implementation (`OK_PERFECT_GROOVE_TIME_MIN_S..=OK_PERFECT_GROOVE_TIME_MAX_S`).
+        let g = gates_deg(0.1, 0.1, 0.1, 0.1, 0.1, 0.1);
+        let grading = Grading::Recovered {
+            cable: Some(3),
+            cable_estimated: Some(3),
+        };
+        assert_eq!(
+            compute_pass_grade(&grading, &g, &[], Some(15.0)),
+            PassGrade::Perfect
+        );
+        assert_eq!(
+            compute_pass_grade(&grading, &g, &[], Some(18.0)),
+            PassGrade::Perfect
+        );
+    }
+
+    #[test]
+    fn groove_time_just_outside_either_boundary_denies_perfect() {
+        let g = gates_deg(0.1, 0.1, 0.1, 0.1, 0.1, 0.1);
+        let grading = Grading::Recovered {
+            cable: Some(3),
+            cable_estimated: Some(3),
+        };
+        assert_eq!(
+            compute_pass_grade(&grading, &g, &[], Some(14.99)),
+            PassGrade::Ok
+        );
+        assert_eq!(
+            compute_pass_grade(&grading, &g, &[], Some(18.01)),
+            PassGrade::Ok
+        );
+    }
+
+    #[test]
+    fn touch_and_go_never_reaches_perfect_even_with_perfect_amplitude_and_groove_time() {
+        // docs/GRADING_REFERENCE.md: "A touch-and-go cannot receive `_OK_` or points" -- a
+        // touch-and-go is a deliberate hook-up qualification pass, never a full stop, so even a
+        // textbook-perfect approach caps at `Ok`, one tier below what a real trap would earn
+        // with identical numbers (see `clean_pass_with_groove_time_in_window_reaches_perfect_regardless_of_wire`).
+        let g = gates_deg(0.1, 0.1, 0.1, 0.1, 0.1, 0.1);
+        let grading = Grading::TouchAndGo {
+            cable_estimated: Some(3),
+        };
+        assert_eq!(
+            compute_pass_grade(&grading, &g, &[], Some(16.5)),
+            PassGrade::Ok
+        );
+    }
+
+    #[test]
+    fn a_single_gate_reading_outside_the_perfect_band_denies_perfect_without_affecting_ok() {
+        // Gates are trusted, bracket/skew-validated single points -- unlike the continuous
+        // trajectory, a gate reading gets no noise pardon. 0.45 deg is inside the ordinary `Ok`
+        // slight-threshold (0.5 deg, so the base tier is unaffected) but outside the tighter
+        // `_OK_` band (`OK_PERFECT_GS_HIGH_DEG` = 0.4 deg).
+        let g = gates_deg(0.45, 0.1, 0.1, 0.1, 0.1, 0.1);
         let grading = Grading::Recovered {
             cable: Some(3),
             cable_estimated: Some(3),
@@ -1055,15 +1397,45 @@ mod tests {
     }
 
     #[test]
-    fn clean_wire4_pass_remains_ok() {
-        // Zero deviations but wire 4: cable selection cannot emit Perfect.
+    fn a_single_isolated_trajectory_spike_outside_the_perfect_band_is_pardoned() {
+        // Same noise pardon requested for `_OK_` as everywhere else in this module: one
+        // non-repeating frame outside the tight `_OK_` band, surrounded by perfectly clean
+        // samples, must not by itself cost a real perfect pass its `_OK_`.
         let g = gates_deg(0.1, 0.1, 0.1, 0.1, 0.1, 0.1);
         let grading = Grading::Recovered {
-            cable: Some(4),
-            cable_estimated: Some(4),
+            cable: Some(3),
+            cable_estimated: Some(3),
         };
+        let trajectory = [
+            trajectory_point(700.0, 0.1, 0.1),
+            trajectory_point(650.0, 0.45, 0.1), // isolated: outside _OK_ band, inside Ok band
+            trajectory_point(600.0, 0.1, 0.1),
+        ];
         assert_eq!(
-            compute_pass_grade(&grading, &g, &[], Some(16.5)),
+            compute_pass_grade(&grading, &g, &trajectory, Some(16.5)),
+            PassGrade::Perfect
+        );
+    }
+
+    #[test]
+    fn two_consecutive_trajectory_samples_outside_the_perfect_band_deny_perfect_but_not_ok() {
+        // Same magnitude as the isolated-spike test above, but sustained over
+        // PERSISTENCE_MIN_CONSECUTIVE_SAMPLES (2) samples: no longer pardoned for `_OK_`. Still
+        // inside the ordinary `Ok` slight threshold (0.5 deg), so the base tier is unaffected --
+        // only `_OK_` is denied.
+        let g = gates_deg(0.1, 0.1, 0.1, 0.1, 0.1, 0.1);
+        let grading = Grading::Recovered {
+            cable: Some(3),
+            cable_estimated: Some(3),
+        };
+        let trajectory = [
+            trajectory_point(700.0, 0.1, 0.1),
+            trajectory_point(650.0, 0.45, 0.1),
+            trajectory_point(600.0, 0.45, 0.1),
+            trajectory_point(550.0, 0.1, 0.1),
+        ];
+        assert_eq!(
+            compute_pass_grade(&grading, &g, &trajectory, Some(16.5)),
             PassGrade::Ok
         );
     }

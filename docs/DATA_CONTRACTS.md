@@ -31,6 +31,13 @@ compatible meanings. Additive fields include:
 - `wind_reference_established`: whether a wind reference was captured to correct the `aoa` field in
   `datums`/`pattern_datums` (see `docs/GRADING_REFERENCE.md`, "AoA"). `false` means every `aoa`
   value in this report is the raw, wind-uncorrected geometric approximation;
+- `groove_time_secs`: seconds spent in the groove before touchdown (`entered_groove` to
+  `touchdown_time_dcs`), `null` when either timestamp was never recorded (always `null` for a
+  `cadence-ab` replay, which never replays touchdown detection). One of the two conditions for
+  automatic `_OK_` (see `docs/GRADING_REFERENCE.md`, "Automatic `_OK_`"). Added 2026-09-05: this
+  value was already computed but, before this date, only ever surfaced in the optional Discord
+  embed — a live report with Discord disabled had no way to audit `_OK_` eligibility after the
+  fact;
 - ordered event evidence, raw hook observation and first-contact horizontal speed.
 - `event_correlation`, with stream status (`available`, `unavailable` or intentionally `disabled`),
   detailed end/failure information, whether outcome evidence preceded the outage, and an independent

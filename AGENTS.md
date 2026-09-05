@@ -2,11 +2,20 @@
 
 > Document de continuité, à tenir à jour à chaque changement significatif de code ou de contrat.
 > Dépôt `E:\DCS stuffs\Initiative ESG\DCS-gRPC-lso`, branche `feature/refonte-v3-lua-buffer`.
-> Dernier état vérifié : HEAD `108ffa1` ("Correct AoA for wind instead of chasing a nonexistent
-> draw argument") plus des modifications non committées sur `src/track.rs`, `src/grading.rs` et
-> `src/commands/cadence_ab.rs` (correctif du bug remise-de-gaz-en-survol classée `Bolter`, et
-> implémentation des pistes de notation A.1 persistance/A.4 surcorrection/sink rate/bank angle —
-> voir [tasking-roadmap.md](tasking-roadmap.md)). Crate `lso` 0.2.0, Rust 2021 ; les changements
+> Dernier état vérifié : HEAD `96fd52e` ("Corrections/Améliorations/Optimisations suite tests
+> 04/09/2026") plus des modifications non committées sur `src/track.rs`, `src/grading.rs`,
+> `src/data.rs` et `src/tasks/record_recovery.rs` (raffinement CATOBAR de l'entrée en groove par
+> confirmation de roulis/route, correctif de la désynchronisation `wire_estimated`/
+> `wire_estimation`, plancher de distance sous lequel `trajectory_deviations` n'est plus poussé pour
+> éviter l'explosion `atan2` près du toucher, nouveau Cut sink-rate/bank-angle soutenu près du pont,
+> `_OK_` automatique (amplitude MOOSE-inspirée + temps de groove NATOPS 15-18 s), calibration de
+> la position de crosse (T&G vs Bolter) étendue au T-45 et aux F-14 via leurs propres index de draw
+> argument, `groove_time_secs` désormais exposé dans le JSON (auparavant calculé mais uniquement
+> visible dans l'embed Discord, donc invisible sans Discord configuré), et un second plancher
+> `NEAR_TOUCHDOWN_ANGLE_REFERENCE_M` (75 m) empêchant un flare/écart quasi constant dans les
+> derniers mètres d'être amplifié en un angle de plusieurs dizaines de degrés par la seule
+> réduction de la distance restante — voir [tasking-roadmap.md](tasking-roadmap.md)). Crate `lso`
+> 0.2.0, Rust 2021 ; les changements
 > postérieurs au tag `0.2.0` sont sous `Unreleased` dans [CHANGES.md](CHANGES.md).
 
 Pour un résumé humain, vulgarisé, du fonctionnement du module : voir [primer.md](primer.md).
@@ -28,14 +37,19 @@ privée, ou déplacer silencieusement le métier dans Lua.
 
 ## État exécutable vérifié
 
-Dernière validation locale complète (même session que ce document, après le correctif
-remise-de-gaz-en-survol et les pistes de notation A.1/A.4/sink rate/bank angle) :
+Dernière validation locale complète (5 septembre 2026, après le raffinement CATOBAR de l'entrée en
+groove par roulis/route, les deux correctifs P0 confirmés en live le même jour — désynchronisation
+`wire_estimated`/`wire_estimation` et explosion numérique `atan2` de `trajectory_deviations` près du
+toucher —, le Cut sink-rate/bank-angle, l'automatisation de `_OK_`, l'extension de la calibration
+de crosse au T-45/F-14, l'exposition de `groove_time_secs` dans le JSON et le second plancher
+`NEAR_TOUCHDOWN_ANGLE_REFERENCE_M` suite à un nouveau test live CVN-72 le même jour, voir
+[tasking-roadmap.md](tasking-roadmap.md)) :
 
-- `cargo test --locked --no-fail-fast` : **180 réussis, 0 échec** (178 tests du binaire + 2 tests
+- `cargo test --locked --no-fail-fast` : **196 réussis, 0 échec** (194 tests du binaire + 2 tests
   de provenance de build) ;
 - `cargo fmt --check` et `cargo clippy --locked --all-targets -- -D warnings` propres ;
-- Working tree non propre : `src/track.rs`, `src/grading.rs`, `src/commands/cadence_ab.rs` modifiés
-  et non committés (voir ci-dessus).
+- Working tree non propre : `src/track.rs`, `src/grading.rs`, `src/data.rs` et
+  `src/tasks/record_recovery.rs` modifiés et non committés (voir ci-dessus).
 
 Aucune preuve DCS live n'est revendiquée pour l'état courant : seuls les tests automatisés et un
 examen manuel du code valident les derniers changements. Voir
@@ -57,10 +71,13 @@ débrief (JSON, PNG, ACMI, SQLite, Discord, board HTTP).
   diagnostic hors-ligne, ne rejoue rien en live.
 
 Le grade est un score **PROJECT-DERIVED** `project-derived-v4`, jamais une certification
-USN/USMC. Puissance moteur, sink rate réel, mouvement du pont, et auteur réel du waveoff ne sont
-pas notés. AoA et vent sont désormais persistés dans le rapport (contexte uniquement, jamais
-notés). Ne pas modifier les règles CATOBAR/V/STOL sans demande dédiée — voir
-[docs/GRADING_REFERENCE.md](docs/GRADING_REFERENCE.md) pour la spécification exacte à jour.
+USN/USMC. Puissance moteur, mouvement du pont, et auteur réel du waveoff ne sont pas notés. AoA et
+vent sont persistés dans le rapport (contexte uniquement, jamais notés). Sink rate (`sink_rate_mps`)
+et gîte (`bank_deg`), calculés depuis la télémétrie continue, restent contexte uniquement sur leur
+amplitude/tendance générale, mais alimentent chacun un Cut dédié en cas d'excès soutenu près du pont
+(voir "Gates, outcomes et câble" plus bas). Ne pas modifier les règles CATOBAR/V/STOL sans demande
+dédiée — voir [docs/GRADING_REFERENCE.md](docs/GRADING_REFERENCE.md) pour la spécification exacte à
+jour.
 
 ## DCS-gRPC et dépendances
 
@@ -154,11 +171,42 @@ Aucune baseline live récente n'est revalidée dans ce document — voir
   phase/altitude admissibles.
 - Trois gates valides et ordonnées sont obligatoires pour une note favorable.
 - Démarrage à l'intérieur : `Late`, jamais de donnée inventée.
+- Entrée en groove CATOBAR (`entered_groove`) : la boîte géométrique historique (`x <= 3/4 NM`,
+  `alt <= 300 ft`, lineup `<= ±10°`) est nécessaire mais plus suffisante. Elle est empruntée à la
+  distance de transition au contrôle LSO du **Case III** (NAVAIR 00-80T-104 §6.6.3.1), pas à un
+  seuil Case I ; NAVAIR 00-80T-105 §6.2.4.2/6.2.4.3 définit le début du groove Case I comme un
+  événement ("roll wings level on centerline with a centered ball"), jamais une distance/altitude
+  fixe. `is_rolled_out()` (`src/track.rs`) ajoute donc deux proxies observables de cet événement,
+  vérifiés sur `GROOVE_ROLLOUT_MIN_CONSECUTIVE_SAMPLES = 2` échantillons consécutifs une fois déjà
+  dans la boîte : roulis quasi nul (`GROOVE_ROLLOUT_MAX_BANK_DEG = 15°`) et route sol déjà pointée
+  dans l'axe du groove (`GROOVE_ROLLOUT_MAX_TRACK_ANGLE_DEG = 15°`, calculée sur la fenêtre
+  `gate_samples` déjà bufferisée pour les gates, sans nouveau champ de télémétrie). Seuils
+  `PROJECT-DERIVED`, non chiffrés par NATOPS, jamais revalidés en live. **CATOBAR uniquement** :
+  V/STOL (Tarawa AV-8B) garde la boîte seule, son profil d'approche (hover/cross/VL, voir
+  VSTOL.md) n'ayant pas de virage final CATOBAR à distinguer d'un survol transitoire de la boîte.
+  Cette même géométrie de boîte reste, comme avant, non revue pour un éventuel Case II/III (non
+  modélisé par ce projet — voir README.md, "Case I pattern") : n'étendre le raisonnement ci-dessus
+  à Case II/III ou à un futur Case I V/STOL/LHA sans le revalider séparément contre leur propre
+  doctrine.
 - Franchissement du seuil de pont (`crossed_deck_threshold`, distingue `Bolter` de `WO?`) : ne se
   déclenche que si l'avion est proche du niveau du pont au moment du franchissement
   (`DECK_CROSSING_ALT_CAP_FT = 50 ft`, relatif au pont, crosse comprise) — sinon `WaveoffUnknown`.
   Corrige un bug confirmé live où une remise de gaz haute (~460 ft au franchissement) était classée
   `Bolter` ; voir [tasking-roadmap.md](tasking-roadmap.md).
+- Touch-and-go (CQ, crosse relevée volontairement) vs `Bolter` (`Track::calibrated_hook_state`,
+  `src/track.rs`) : distingués par la position de crosse lue depuis DCS
+  (`UnitService.GetDrawArgumentValue`, `AirplaneInfo::hook_draw_argument`), jamais déduits du
+  comportement seul. Index par type : F/A-18C et VNAO T-45 = 25, F-14A/F-14B/F-14B(U) = 1305
+  (`F14_HOOK_DRAW_ARGUMENT`, `src/data.rs`) ; AV-8B = aucun (pas de crosse pour ce workflow). Seuils
+  d'interprétation `<= 0.2` = up, `>= 0.8` = down, avec stabilité exigée (3 échantillons/0,4 s pour
+  "up", 2/0,2 s pour "down" — barre plus haute pour "up" car c'est cette conclusion qui transforme
+  le verdict par défaut `Bolter` en `TouchAndGo`), uniquement sur des échantillons pris dans le
+  dernier 1/4 NM et avant l'enregistrement du toucher. **Seule la polarité 0,2/0,8 du F/A-18C a été
+  confirmée empiriquement** (`HookObservation::polarity = "fa18c_zero_up_one_down_test_corpus"`) ;
+  celle du T-45/F-14 est une extension non vérifiée de la même convention, fournie par
+  l'utilisateur avec l'index mais pas la confirmation de polarité
+  (`"assumed_zero_up_one_down_pending_live_validation"`). Sans index connu pour un type (ou lecture
+  ambiguë/instable), le résultat reste `Unknown` → `Bolter` par défaut, jamais `TouchAndGo` inventé.
 - Grading v4 (`project-derived-v4`) : en plus des trois gates ponctuelles, la trajectoire continue
   du groove au touchdown (`trajectory_deviations`) peut dégrader — jamais améliorer — l'amplitude
   retenue, sous réserve d'un garde de persistance (une seule frame aberrante isolée ne compte plus,
@@ -168,18 +216,65 @@ Aucune baseline live récente n'est revalidée dans ce document — voir
   au lieu de `OK` ; une détection de surcorrection (NATOPS `OC`) plafonne de la même façon une passe
   montrant au moins 2 inversions de direction (écart net proche de zéro mais oscillation réelle,
   invisible au facteur de tendance seul) ; une pondération temporelle plafonne à `--` un écart
-  modéré situé dans les 150 derniers mètres avant la coupe. `trajectory_deviations` porte aussi
-  `alt_m`/`bank_deg`/`sink_rate_mps` (contexte uniquement, jamais notés — taux de descente et gîte
-  restent hors notation, voir plus haut). Détail complet dans
-  [docs/GRADING_REFERENCE.md](docs/GRADING_REFERENCE.md).
+  modéré situé dans les 150 derniers mètres avant la coupe ; un Cut dédié (seuils
+  `PROJECT-DERIVED`, **non chiffrés par NATOPS** — les deux NATOPS de référence ne codifient
+  `TMRD`/`W`/`TMA`/`DLW`/`DRW` que comme codes de commentaire qualitatifs, jamais un nombre)
+  sanctionne un sink rate (`SINK_RATE_CUT_MPS = 8.0 m/s`, environ le double du régime nominal de
+  poser CATOBAR sans flare ~600-800 ft/min) ou une gîte (`BANK_ANGLE_CUT_DEG = 30°`, le double du
+  seuil de roll-out `GROOVE_ROLLOUT_MAX_BANK_DEG`) soutenus (au moins 3 échantillons consécutifs,
+  garde renforcée par rapport aux 2 échantillons habituels) à l'intérieur du 1/4 NM — même zone que
+  le Cut GS. `trajectory_deviations` porte aussi `alt_m`/`bank_deg`/`sink_rate_mps` en contexte sur
+  le reste de leur amplitude/tendance (non notée en dehors de ce Cut). Un échantillon n'est plus
+  poussé sous
+  `TRAJECTORY_MIN_DISTANCE_M` (3 m, `src/track.rs`) : `gs_deviation_deg`/`lineup_deg` sont
+  `atan2(écart_m, x)`, et sous ce plancher un flare réaliste de quelques décimètres produisait un
+  angle de plusieurs dizaines de degrés sans signification géométrique (bug confirmé live le 5
+  septembre 2026, corrigé le même jour). Au-dessus de ce plancher mais en dessous de
+  `NEAR_TOUCHDOWN_ANGLE_REFERENCE_M` (75 m, ajouté le 5 septembre 2026 suite à un second test live
+  le même jour), le même effet existait sous une forme plus modérée mais tout aussi trompeuse : un
+  écart quasi constant de quelques décimètres (confirmé présent dès 50 m sur les cinq appontages du
+  second test, appontages propres comme Cut) grossissait mécaniquement jusqu'à des dizaines de
+  degrés dans les derniers mètres, faisant retomber à `NoGrade` deux passes par ailleurs
+  irréprochables — dont une notée `_OK_` par DCS lui-même. Corrigé en substituant cette distance de
+  référence fixe à `x` dans le calcul d'angle une fois `x` sous ce seuil
+  (`trajectory_deviation_angles_deg`, partagée par `Track::next` et `replay_gate_and_trajectory`) :
+  un écart réel et important continue de dégrader la note comme avant, seul l'arrondi normal et
+  attendu près du pont n'explose plus artificiellement. Voir
+  [tasking-roadmap.md](tasking-roadmap.md) pour le détail des deux bugs et
+  [docs/GRADING_REFERENCE.md](docs/GRADING_REFERENCE.md), "Near-touchdown geometry", pour la
+  spécification complète.
 
-CATOBAR conserve les règles projet existantes (`OK`, `(OK)`, `--`, `C`, `B`, `WO?`, `NC`). `_OK_`
-automatique reste désactivé. Contact sans arrest confirmé : `UnconfirmedArrest`, aucun point. Le
+CATOBAR conserve les règles projet existantes (`OK`, `(OK)`, `--`, `C`, `B`, `WO?`, `NC`), plus
+désormais `_OK_` automatique (5 septembre 2026, `is_amplitude_perfect`/`grade_from_gates`,
+`src/grading.rs`) : uniquement depuis une passe déjà `Ok` par toutes les règles ci-dessus, si en
+plus (1) chaque porte et chaque échantillon continu reste dans `OK_PERFECT_GS_HIGH_DEG`/
+`OK_PERFECT_GS_LOW_DEG` (+0,4°/-0,3°) et `OK_PERFECT_LU_ABS_DEG` (0,5°) — gardes sans pardon sur les
+portes (preuves déjà validées bracket/skew), avec le même pardon anti-bruit qu'ailleurs
+(`PERSISTENCE_MIN_CONSECUTIVE_SAMPLES`, 2) sur la trajectoire continue — et (2) le temps de groove
+(`groove_time_secs`) est connu et tombe dans `15,0..=18,0` s (`OK_PERFECT_GROOVE_TIME_MIN_S`/
+`_MAX_S`). Seuil de temps `OFFICIAL` (NAVAIR 00-80T-105 §6.2.4.3, "a 15 - 18 second groove"),
+appliqué identiquement à tous les CATOBAR (F-14/F-18/T-45) malgré la pente différente du T-45,
+faute de référence de vitesse d'approche par type — limite connue, non résolue. Bande d'amplitude
+`PROJECT-DERIVED`, empruntée telle quelle au mod open-source MOOSE `Ops.Airboss`
+(`AIRBOSS.GLE`/`AIRBOSS.LUE` `_max`/`_min`), même filiation historique que `GS_SLIGHT_*`/
+`LU_SLIGHT`. Jamais lié au brin (l'ancien couplage MOOSE "brin 3 + 15-18,99 s" reste désactivé, aucun
+NATOPS ne relie brin et note) ; un touch-and-go plafonne systématiquement un tier sous
+`grade_from_gates`, jamais `_OK_`. `lso.exe cadence-ab` ne rejoue pas la détection de toucher, donc
+`groove_time_secs` y vaut toujours `None` : `_OK_` n'apparaît jamais dans une note rejouée, seul
+l'usage live peut l'émettre. Non revalidé en mission live. Détail complet dans
+[docs/GRADING_REFERENCE.md](docs/GRADING_REFERENCE.md), "Automatic `_OK_`".
+
+Contact sans arrest confirmé : `UnconfirmedArrest`, aucun point. Le
 câble DCS/LQM confirme seulement une valeur strictement comprise entre 1 et 4 ; 0, >4, overflow,
 négatif ou format mal formé sont rejetés. Câble Rust et DCS restent séparés avec
 provenance/divergence/confiance ; les surfaces pilote (Discord, PNG, SQLite/board) n'affichent
 jamais l'estimation Rust si elle diverge du câble DCS/LQM affiché — seul le JSON complet garde les
-deux valeurs pour diagnostic.
+deux valeurs pour diagnostic. `cable_estimated`/`wire_estimated` (grading) est désormais toujours
+dérivé de `wire_estimation` (diagnostic JSON), calculé une seule fois dans `Track::finish()` contre
+l'historique complet des franchissements de brin, plutôt que capturé séparément au moment du
+toucher : les deux champs pouvaient diverger sur un même rapport selon que la corrélation
+événementielle du `Land` tombait avant ou après le tick positionnel ayant ajouté le franchissement
+correspondant (bug confirmé live le 5 septembre 2026, corrigé le même jour).
 
 V/STOL reste AV-8B/Tarawa, spot intentionnel 7.5, formule locale expérimentale décrite dans
 [VSTOL.md](VSTOL.md). Intended spot, nearest active spot et distance sont séparés. Jamais de note
@@ -273,9 +368,14 @@ JSON reste `schema_version: 3`, évolution additive : aucun ancien champ supprim
 reste l'alias primaire ; `causes` contient primaire/secondaires ; `event_correlation`,
 `wind_heading_deg`/`wind_speed_mps`, `wind_reference_established` et `trajectory_deviations` sont
 des ajouts récents ; `trajectory_deviations[].alt_m`/`bank_deg`/`sink_rate_mps` et
-`datums[].roll_deg` sont des ajouts additifs plus récents encore (contexte uniquement, jamais
-notés) ; diagnostics possibles `event_stream_unavailable` ; `grading_availability` peut valoir
-`unavailable_event_outcome`. Détail exhaustif dans
+`datums[].roll_deg` sont des ajouts additifs plus récents encore (contexte sur leur
+amplitude/tendance générale, mais `bank_deg`/`sink_rate_mps` alimentent chacun le Cut dédié
+sink-rate/bank — voir "Gates, outcomes et câble") ; diagnostics possibles
+`event_stream_unavailable` ; `grading_availability` peut valoir
+`unavailable_event_outcome` ; `groove_time_secs` (ajout du 5 septembre 2026) sérialise désormais
+dans le JSON la donnée déjà utilisée pour `_OK_` automatique, auparavant calculée mais visible
+seulement dans l'embed Discord — un rapport live sans Discord configuré ne permettait alors aucune
+vérification a posteriori de l'éligibilité `_OK_`. Détail exhaustif dans
 [docs/DATA_CONTRACTS.md](docs/DATA_CONTRACTS.md).
 
 SQLite utilise le vocabulaire snake_case du JSON. L'absence d'un nouveau champ signifie
@@ -298,6 +398,10 @@ Ne jamais modifier silencieusement `.cargo/audit.toml`.
   [docs/RELIABILITY_ARCHITECTURE.md](docs/RELIABILITY_ARCHITECTURE.md),
   [docs/LSO_ANALYSIS.md](docs/LSO_ANALYSIS.md) : spécifications techniques actuelles, tenues à jour
   indépendamment de ce document.
+- [docs/NOTATION-LOGIQUE.md](docs/NOTATION-LOGIQUE.md) : résumé pédagogique, sans jargon de
+  programmation, du raisonnement de notation CATOBAR Case I — un extrait ciblé de
+  [docs/GRADING_REFERENCE.md](docs/GRADING_REFERENCE.md) (qui fait foi en cas de différence), pour
+  qui veut comprendre la logique de note sans lire la spécification technique complète.
 - [VSTOL.md](VSTOL.md) : spécification V/STOL AV-8B/Tarawa.
 
 Les anciens documents `.ignore/*.md` et `.agents/agents.md` qui ont servi de brouillon à ce

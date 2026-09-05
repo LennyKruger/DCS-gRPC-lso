@@ -92,10 +92,91 @@ const PATTERN_DATUM_STRIDE: u32 = 4;
 /// series. A groove is a few tens of seconds at 10-20 Hz, so this is a defensive cap, not
 /// an expected limit.
 const MAX_TRAJECTORY_SAMPLES: usize = 4_000;
+/// Minimum horizontal distance-to-ship (`x`, metres) below which a `trajectory_deviations`
+/// sample is no longer pushed. `gs_deviation_deg`/`lineup_deg` are `atan2(offset_m, x)`: as `x`
+/// approaches 0 in the final metres before touchdown, an ordinary few-decimetre flare produces
+/// an angle of several tens of degrees with no geometric meaning (confirmed live: 70.3 deg at
+/// x=0.30 m, 32.5 deg at x=1.47 m, neither reflecting a real deviation). PROJECT-DERIVED: a few
+/// metres comfortably clears that blow-up region while still covering the in-flight approach
+/// down to just short of the ramp.
+const TRAJECTORY_MIN_DISTANCE_M: f64 = 3.0;
+/// Fixed reference distance (metres) substituted for the real, shrinking `x` when computing
+/// `gs_deviation_deg`/`lineup_deg` for a `trajectory_deviations` sample closer to the ship than
+/// this. `TRAJECTORY_MIN_DISTANCE_M` above stops the outright blow-up as `x -> 0`, but it does not
+/// stop a much more moderate, still-misleading version of the same effect between that floor and
+/// several tens of metres out: an ordinary, essentially constant flare offset of a few
+/// decimetres — confirmed live on 5 September 2026 to be a near-constant few tenths of a metre,
+/// both vertically and laterally, from at least 50 m out to touchdown across every recovery
+/// observed, on clean and Cut passes alike — produces a rapidly growing angle purely because the
+/// denominator `x` keeps shrinking, not because the underlying offset is getting worse. Holding
+/// the denominator at this reference distance for any sample closer than it (`x.max(this)`)
+/// removes that purely geometric growth while leaving every sample farther out untouched (`x`
+/// already exceeds it there, so `max` is a no-op) and leaving a genuinely large offset just as
+/// able to cross a tier or Cut threshold as before — it just takes a real number of metres to do
+/// it, not merely a small number of metres of remaining distance. PROJECT-DERIVED, chosen as
+/// roughly one second of flight at a typical CATOBAR approach speed (~75 m/s): comfortably larger
+/// than the confirmed-live flare offsets divided by the Ok/Cut angular thresholds (see
+/// docs/GRADING_REFERENCE.md, "Continuous trajectory, near-touchdown geometry" for the derivation
+/// and live numbers), while short enough to still evaluate a deviation that only develops in the
+/// final seconds using its own reasonably real geometry rather than one held all the way back to
+/// a gate distance.
+const NEAR_TOUCHDOWN_ANGLE_REFERENCE_M: f64 = 75.0;
 const MAX_EVENT_EVIDENCE: usize = 256;
 const MAX_HOOK_EVIDENCE: usize = 512;
 const GATE_BUFFER_WINDOW_S: f64 = 2.0;
 const HEALTH_WINDOW_S: f64 = 10.0;
+
+// ---------------------------------------------------------------------------
+// CATOBAR (Case I, CVN) groove-entry roll-out refinement.
+//
+// SOURCE: NAVAIR 00-80T-105 (CV NATOPS) 6.2.4.2/6.2.4.3 defines Case I groove entry as an
+// event, not a geometric threshold: after the 180-to-90-to-start approach turn, "the aircraft
+// should roll wings level on centerline with a centered ball" before a 15-18 second groove to
+// touchdown. NAVAIR 00-80T-104 (LSO NATOPS) 6.6.3.1 separately states that "3/4 nm" is the
+// LSO-control transition distance for a *Case III* precision approach, not a Case I groove
+// distance -- the box below (GATE_THREE_QUARTER_NM / 300 ft / +/-10 deg lineup) already
+// documented itself as an engineering proxy, but that proxy borrows its radius from a
+// different Case entirely, and cannot by itself distinguish a real roll-out from the aircraft
+// transiently sweeping through the box mid-turn (e.g., cutting inside the corner from the 90).
+//
+// PROJECT-DERIVED thresholds below add two directly-observable proxies for "wings level on
+// centerline": near-zero bank (`is_rolled_out`'s bank check) and a ground track already
+// pointed down the groove axis rather than still sweeping across it (`is_rolled_out`'s track
+// check, computed from the same `gate_samples` window already buffered for gate interpolation
+// -- no new telemetry field needed). Neither threshold is NAVAIR-specified; NATOPS gives no
+// numerical bank or track-angle criterion for "wings level."
+//
+// CATOBAR only. V/STOL (Tarawa AV-8B) keeps the box-only behaviour unchanged: its approach
+// profile (hover/cross/VL, see VSTOL.md) has no CATOBAR-style final turn to distinguish from,
+// and this refinement was designed and reasoned about against CATOBAR Case I geometry only.
+
+/// Bank angle (degrees, either sign) above which the aircraft is treated as still turning
+/// rather than "wings level." PROJECT-DERIVED: the Case I approach turn (180 to the start) is
+/// typically flown at a noticeably higher angle of bank than this, while ordinary lineup
+/// corrections once established in the groove rarely need more than a few degrees -- 15 deg
+/// sits comfortably between the two without being so tight that ordinary correction banking
+/// would ever suppress a real groove entry indefinitely.
+const GROOVE_ROLLOUT_MAX_BANK_DEG: f64 = 15.0;
+/// Ground-track heading error (degrees) relative to the deck's landing-course axis, above
+/// which the aircraft is treated as still sweeping through the detection box rather than
+/// tracking down the groove. PROJECT-DERIVED, deliberately the same magnitude as
+/// `GROOVE_ROLLOUT_MAX_BANK_DEG`: loose enough to tolerate a stabilized crab into a stiff
+/// crosswind (wind-over-deck is standard procedure), tight enough to exclude a track that is
+/// still curving across the centerline mid-turn.
+const GROOVE_ROLLOUT_MAX_TRACK_ANGLE_DEG: f64 = 15.0;
+/// Minimum time span (seconds) the buffered `gate_samples` window must already cover before
+/// the ground-track angle above is trusted at all. PROJECT-DERIVED: half of
+/// `GATE_BUFFER_WINDOW_S`, chosen so a too-short, noise-dominated baseline (e.g., the first
+/// sample right after crossing into the detection box) never manufactures a false track-angle
+/// reading -- errs toward waiting one more sample rather than inventing a signal, the same
+/// posture `trend_worsening` takes in `grading.rs` when it lacks enough data.
+const GROOVE_ROLLOUT_MIN_TRACK_WINDOW_S: f64 = GATE_BUFFER_WINDOW_S / 2.0;
+/// How many consecutive samples must show both "wings level" and "tracking down the groove"
+/// before groove entry is marked. PROJECT-DERIVED, the same value and rationale as
+/// `PERSISTENCE_MIN_CONSECUTIVE_SAMPLES` in `grading.rs`: the smallest value that rules out a
+/// single aberrant/noisy telemetry frame (1 would accept a lone spike) while still confirming
+/// within a fraction of a second at scoring cadence.
+const GROOVE_ROLLOUT_MIN_CONSECUTIVE_SAMPLES: u32 = 2;
 /// PROJECT-DERIVED provisional observation radius. It is informational only
 /// until the Tarawa spot geometry is validated against the future live corpus.
 const VSTOL_SPOT_OBSERVATION_RADIUS_M: f64 = 15.0;
@@ -311,8 +392,15 @@ pub struct Track {
     /// Cleared on each fresh groove entry, alongside `wire_crossings`, so an earlier bolter's
     /// trajectory never leaks into the scored attempt.
     trajectory_deviations: Vec<TrajectoryDeviation>,
-    /// Set to `true` once the aircraft enters inside 3/4 nm and below 300 ft AGL.
+    /// Set to `true` once the aircraft enters inside 3/4 nm, below 300 ft AGL, and lined up
+    /// within +/-10 deg of the extended deck centerline. CATOBAR additionally requires the
+    /// roll-out confirmation below (`groove_rollout_confirm_count`); V/STOL uses the box alone.
     entered_groove: bool,
+    /// CATOBAR-only counter of consecutive samples (while already inside the box above) that
+    /// also pass `is_rolled_out` ("wings level, tracking down the groove"). Reset to 0 on any
+    /// sample that fails either the box or the roll-out check; once it reaches
+    /// `GROOVE_ROLLOUT_MIN_CONSECUTIVE_SAMPLES`, `entered_groove` is set. Unused for V/STOL.
+    groove_rollout_confirm_count: u32,
     /// DCS simulation time (seconds since scenario start) when groove entry was first detected.
     groove_entry_time: Option<f64>,
     /// DCS simulation time (seconds since scenario start) when touchdown was recorded.
@@ -709,6 +797,32 @@ struct ApproachSample {
     skew_ms: f64,
 }
 
+/// CATOBAR groove-entry roll-out check (see the constants block above for the doctrinal
+/// rationale): whether the aircraft is both "wings level" (`bank_deg` near zero) and already
+/// tracking down the groove axis rather than still sweeping across it, using the same buffered
+/// window (`gate_samples`) already kept for gate interpolation. Shared by `Track::next` and
+/// `replay_gate_and_trajectory` so the live path and the `cadence-ab` replay path apply exactly
+/// the same rule.
+fn is_rolled_out(gate_samples: &VecDeque<ApproachSample>, bank_deg: f64) -> bool {
+    if bank_deg.abs() > GROOVE_ROLLOUT_MAX_BANK_DEG {
+        return false;
+    }
+    let (Some(oldest), Some(newest)) = (gate_samples.front(), gate_samples.back()) else {
+        return false;
+    };
+    if newest.time - oldest.time < GROOVE_ROLLOUT_MIN_TRACK_WINDOW_S {
+        // Not enough buffered history yet to trust a track angle -- wait for more samples
+        // rather than inventing a signal from noise.
+        return false;
+    }
+    // Track angle relative to the groove axis: 0 deg when travel over the window is straight
+    // down -x (inbound, toward the ship) with no lateral (y) drift.
+    let track_angle_deg = (newest.y - oldest.y)
+        .atan2(oldest.x - newest.x)
+        .to_degrees();
+    track_angle_deg.abs() <= GROOVE_ROLLOUT_MAX_TRACK_ANGLE_DEG
+}
+
 #[derive(Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub enum Grading {
     #[default]
@@ -717,7 +831,8 @@ pub enum Grading {
     TouchAndGo {
         cable_estimated: Option<u8>,
     },
-    /// Pilot broke off the approach after entering the groove (inside 3/4 nm, below 300 ft).
+    /// Pilot broke off the approach after entering the groove (inside 3/4 nm, below 300 ft,
+    /// lined up within +/-10 deg).
     WaveoffUnknown,
     Recovered {
         cable: Option<u8>,
@@ -820,6 +935,7 @@ impl Track {
             gate_deviations: GateDeviations::default(),
             trajectory_deviations: Default::default(),
             entered_groove: false,
+            groove_rollout_confirm_count: 0,
             groove_entry_time: None,
             landing_time: None,
             grading: None,
@@ -831,10 +947,17 @@ impl Track {
             min_distance_state: None,
             smoothed_carrier_pos: None,
             hook_observation: HookObservation {
-                polarity: if plane_info.name == "F/A-18C Hornet" {
-                    "fa18c_zero_up_one_down_test_corpus"
-                } else {
-                    "unknown_pending_live_validation"
+                // "test_corpus" for the F/A-18C only: its `<= 0.2` up / `>= 0.8` down mapping was
+                // empirically confirmed. The T-45 and F-14 share the same draw-argument
+                // convention (a single 0..1 hook animation) and are interpreted with the same
+                // thresholds, but that specific polarity has not itself been independently
+                // confirmed for either -- "assumed", not "confirmed", until it is.
+                polarity: match plane_info.hook_draw_argument {
+                    Some(_) if plane_info.name == "F/A-18C Hornet" => {
+                        "fa18c_zero_up_one_down_test_corpus"
+                    }
+                    Some(_) => "assumed_zero_up_one_down_pending_live_validation",
+                    None => "unknown_pending_live_validation",
                 },
                 interpreted_state: "unknown",
                 ..HookObservation::default()
@@ -1131,9 +1254,14 @@ impl Track {
                     // until polarity is validated for the deployed modules.
                     if self.crossed_deck_threshold && self.min_distance_state.is_some() {
                         if self.calibrated_hook_state() == CalibratedHookState::Up {
-                            let cable_estimated = self.wire_estimate_at(plane.time).wire;
                             tracing::debug!("qualification touch-and-go detected");
-                            self.grading = Some(Grading::TouchAndGo { cable_estimated });
+                            // `cable_estimated` is reconciled once in `finish()` from
+                            // `wire_estimation`, against the complete wire-crossing history
+                            // rather than a snapshot that may still be missing a crossing the
+                            // current position tick has not observed yet.
+                            self.grading = Some(Grading::TouchAndGo {
+                                cable_estimated: None,
+                            });
                             return false;
                         }
                         tracing::debug!(
@@ -1334,14 +1462,34 @@ impl Track {
             {
                 self.gate_samples.pop_front();
             }
-            // Mark groove entry: inside 3/4 nm, below 300 ft AGL, and lined up (±10°).
-            // The lateral constraint prevents the timer from starting prematurely while the
+            // Mark groove entry: inside 3/4 nm, below 300 ft AGL, and lined up (±10°). The
+            // lateral constraint prevents the timer from starting prematurely while the
             // aircraft is still performing a wide turn to final on the base leg.
+            //
+            // CATOBAR additionally requires `is_rolled_out` confirmation (see the groove-entry
+            // roll-out constants block above) before latching `entered_groove`, so a transient
+            // sweep through this box mid-turn is not mistaken for the real "wings level on
+            // centerline" roll-out. V/STOL keeps the box alone: it has no CATOBAR-style final
+            // turn to distinguish from.
             if x <= GATE_THREE_QUARTER_NM && m_to_ft(alt) <= 300.0 && lineup_deg.abs() <= 10.0 {
-                if !self.entered_groove {
-                    self.mark_fresh_groove_entry(plane.time);
+                if self.carrier_info.is_vstol() {
+                    if !self.entered_groove {
+                        self.mark_fresh_groove_entry(plane.time);
+                    }
+                    self.entered_groove = true;
+                } else if !self.entered_groove {
+                    if is_rolled_out(&self.gate_samples, plane.roll) {
+                        self.groove_rollout_confirm_count += 1;
+                    } else {
+                        self.groove_rollout_confirm_count = 0;
+                    }
+                    if self.groove_rollout_confirm_count >= GROOVE_ROLLOUT_MIN_CONSECUTIVE_SAMPLES {
+                        self.mark_fresh_groove_entry(plane.time);
+                        self.entered_groove = true;
+                    }
                 }
-                self.entered_groove = true;
+            } else if !self.carrier_info.is_vstol() {
+                self.groove_rollout_confirm_count = 0;
             }
 
             // Continuous GS/lineup series, from groove entry to touchdown, using the same
@@ -1353,17 +1501,20 @@ impl Track {
                 && is_inbound
                 && in_approach
                 && gate_lined_up
+                && x >= TRAJECTORY_MIN_DISTANCE_M
                 && self.trajectory_deviations.len() < MAX_TRAJECTORY_SAMPLES
             {
                 let ideal_alt = ideal_base_alt + x * self.plane_info.glide_slope.to_radians().tan();
                 let gs_deviation_m = alt - ideal_alt;
+                let (gs_deviation_deg, trajectory_lineup_deg) =
+                    trajectory_deviation_angles_deg(gs_deviation_m, y, x);
                 let sink_rate_mps =
                     sink_rate_since(self.trajectory_deviations.last(), alt, plane.time);
                 self.trajectory_deviations.push(TrajectoryDeviation {
                     timestamp_dcs: plane.time,
                     distance_m: x,
-                    gs_deviation_deg: gs_deviation_m.atan2(x).to_degrees(),
-                    lineup_deg,
+                    gs_deviation_deg,
+                    lineup_deg: trajectory_lineup_deg,
                     alt_m: alt,
                     bank_deg: plane.roll,
                     sink_rate_mps,
@@ -1527,20 +1678,22 @@ impl Track {
             }
         }
 
-        let cable = match &self.carrier_info.recovery {
-            CarrierRecovery::Arrested => self.wire_estimate_at(plane.time).wire,
-            CarrierRecovery::Vstol { .. } => None,
-        };
         if !matches!(self.grading, Some(Grading::Recovered { .. })) {
             self.grading = Some(Grading::Recovered {
                 cable: None,
-                cable_estimated: cable,
+                // Left unset here on purpose: reconciled once in `finish()` from
+                // `wire_estimation`, against the complete wire-crossing history, rather than
+                // computed here against whatever crossings the position-tick path has managed
+                // to observe by the time this event-correlated `Land` fires. The two paths are
+                // independent and can race, which previously let this diverge from
+                // `wire_estimation.wire` in the same report.
+                cable_estimated: None,
             });
             self.landing_time = Some(plane.time);
             self.touchdown_horizontal_speed_mps = Some(
                 (plane.velocity.x * plane.velocity.x + plane.velocity.z * plane.velocity.z).sqrt(),
             );
-            tracing::debug!(?cable, "first correlated touchdown recorded");
+            tracing::debug!("first correlated touchdown recorded");
         } else {
             tracing::warn!(at = plane.time, "duplicate touchdown ignored");
             return false;
@@ -1594,6 +1747,27 @@ impl Track {
             self.grading.unwrap_or_default()
         };
         let grading = normalize_grading_for_recovery(grading, &self.carrier_info.recovery);
+
+        // Reconcile `cable_estimated` with `wire_estimation`: both must describe the same
+        // wire-crossing evidence, and `wire_estimation` above is the single, complete-history
+        // computation (unlike the touchdown/deck-crossing call sites earlier in `Track::next`,
+        // which could see a not-yet-complete `self.wire_crossings` depending on event/position
+        // race ordering). Never overrides a DCS-confirmed `cable` above; only the independent
+        // Rust estimate.
+        let grading = if matches!(self.carrier_info.recovery, CarrierRecovery::Arrested) {
+            match grading {
+                Grading::Recovered { cable, .. } => Grading::Recovered {
+                    cable,
+                    cable_estimated: wire_estimation.wire,
+                },
+                Grading::TouchAndGo { .. } => Grading::TouchAndGo {
+                    cable_estimated: wire_estimation.wire,
+                },
+                other => other,
+            }
+        } else {
+            grading
+        };
 
         let groove_time_secs = match (self.groove_entry_time, self.landing_time) {
             (Some(entry), Some(land)) if land > entry => Some(land - entry),
@@ -1893,7 +2067,12 @@ impl Track {
     }
 
     fn calibrated_hook_state(&self) -> CalibratedHookState {
-        if self.plane_info.name != "F/A-18C Hornet" {
+        // Only a type with a known hook draw-argument index (`AirplaneInfo::hook_draw_argument`)
+        // is ever interpreted; every other type (or a future type added without one) stays
+        // `Unknown`, never inferred. The up/down thresholds below (`<= 0.2`/`>= 0.8`) were only
+        // empirically confirmed for the F/A-18C -- see `HookObservation::polarity` (`Track::new`)
+        // for which types are still an unverified assumption of the same convention.
+        if self.plane_info.hook_draw_argument.is_none() {
             return CalibratedHookState::Unknown;
         }
         let valid = self
@@ -2110,6 +2289,23 @@ fn sink_rate_since(previous: Option<&TrajectoryDeviation>, alt_m: f64, time: f64
         .unwrap_or(0.0)
 }
 
+/// `gs_deviation_deg`/`lineup_deg` for a `trajectory_deviations` sample, converting the raw
+/// vertical (`gs_deviation_m`) and lateral (`lateral_offset_m`) offsets to angles with
+/// `NEAR_TOUCHDOWN_ANGLE_REFERENCE_M` substituted for `x` once `x` drops below it (see that
+/// constant). Shared by `Track::next` and `replay_gate_and_trajectory` so a persisted report's
+/// angles can always be reconstructed identically from either path.
+fn trajectory_deviation_angles_deg(
+    gs_deviation_m: f64,
+    lateral_offset_m: f64,
+    x: f64,
+) -> (f64, f64) {
+    let denominator = x.max(NEAR_TOUCHDOWN_ANGLE_REFERENCE_M);
+    (
+        gs_deviation_m.atan2(denominator).to_degrees(),
+        lateral_offset_m.atan2(denominator).to_degrees(),
+    )
+}
+
 fn capture_gate_from_window(
     samples: &VecDeque<ApproachSample>,
     current: &ApproachSample,
@@ -2251,8 +2447,9 @@ pub(crate) struct ReplaySample {
 /// artificially reduced sampling cadence against a corpus of already-recorded runs (JSON
 /// `datums`) — see B.2 of the notation/cadence work plan.
 ///
-/// This mirrors the gate/groove/trajectory section of `Track::next` line for line (as of this
-/// writing); keep the two in sync if that section changes. It intentionally does not replay
+/// This mirrors the gate/groove/trajectory logic of `Track::next` (as of this writing,
+/// including the CATOBAR groove-entry roll-out check via the shared `is_rolled_out` helper);
+/// keep the two in sync if that section changes. It intentionally does not replay
 /// telemetry-quality bookkeeping, wire estimation or touchdown detection — the diagnostic only
 /// ever needs gate/trajectory geometry, not a full recovery outcome.
 pub(crate) fn replay_gate_and_trajectory(
@@ -2266,6 +2463,7 @@ pub(crate) fn replay_gate_and_trajectory(
     let mut gate_samples: VecDeque<ApproachSample> = VecDeque::new();
     let mut previous_x = f64::MAX;
     let mut entered_groove = false;
+    let mut groove_rollout_confirm_count: u32 = 0;
 
     for ReplaySample {
         time,
@@ -2357,11 +2555,28 @@ pub(crate) fn replay_gate_and_trajectory(
             gate_samples.pop_front();
         }
 
+        // Mirrors the CATOBAR roll-out refinement in `Track::next` (see the groove-entry
+        // constants block): V/STOL keeps the box alone, CATOBAR also requires
+        // `is_rolled_out` confirmation over `GROOVE_ROLLOUT_MIN_CONSECUTIVE_SAMPLES`.
         if x <= GATE_THREE_QUARTER_NM && m_to_ft(alt) <= 300.0 && lineup_deg.abs() <= 10.0 {
-            if !entered_groove {
-                trajectory_deviations.clear();
+            if carrier_is_vstol {
+                if !entered_groove {
+                    trajectory_deviations.clear();
+                }
+                entered_groove = true;
+            } else if !entered_groove {
+                if is_rolled_out(&gate_samples, roll_deg) {
+                    groove_rollout_confirm_count += 1;
+                } else {
+                    groove_rollout_confirm_count = 0;
+                }
+                if groove_rollout_confirm_count >= GROOVE_ROLLOUT_MIN_CONSECUTIVE_SAMPLES {
+                    trajectory_deviations.clear();
+                    entered_groove = true;
+                }
             }
-            entered_groove = true;
+        } else if !carrier_is_vstol {
+            groove_rollout_confirm_count = 0;
         }
 
         if entered_groove
@@ -2369,16 +2584,19 @@ pub(crate) fn replay_gate_and_trajectory(
             && is_inbound
             && in_approach
             && gate_lined_up
+            && x >= TRAJECTORY_MIN_DISTANCE_M
             && trajectory_deviations.len() < MAX_TRAJECTORY_SAMPLES
         {
             let ideal_alt = ideal_base_alt + x * glide_slope_deg.to_radians().tan();
             let gs_deviation_m = alt - ideal_alt;
+            let (gs_deviation_deg, trajectory_lineup_deg) =
+                trajectory_deviation_angles_deg(gs_deviation_m, y, x);
             let sink_rate_mps = sink_rate_since(trajectory_deviations.last(), alt, time);
             trajectory_deviations.push(TrajectoryDeviation {
                 timestamp_dcs: time,
                 distance_m: x,
-                gs_deviation_deg: gs_deviation_m.atan2(x).to_degrees(),
-                lineup_deg,
+                gs_deviation_deg,
+                lineup_deg: trajectory_lineup_deg,
                 alt_m: alt,
                 bank_deg: roll_deg,
                 sink_rate_mps,
@@ -2853,16 +3071,222 @@ mod tests {
             track.next(&carrier_frame, &plane, Some(1.0));
         };
 
-        // 25 m stays under the 300 ft groove-entry altitude ceiling at 800 m while still
-        // producing a clearly significant (~1.8°) GS deviation.
+        // Wings-level, on-centerline warm-up (lateral offset stays 0 throughout via `fly`'s own
+        // geometry) so the CATOBAR roll-out check (`is_rolled_out`, see the groove-entry
+        // constants block) has enough buffered history and two consecutive confirming samples
+        // before the aircraft is close enough to also satisfy the box (see below).
+        fly(&mut track, 0.0, 1450.0, 25.0);
         fly(&mut track, 1.0, 1200.0, 25.0);
-        fly(&mut track, 1.1, 800.0, 25.0);
+        // 25 m stays under the 300 ft groove-entry altitude ceiling at 900/800 m while still
+        // producing a clearly significant (~1.8°) GS deviation. Two consecutive in-box samples
+        // are needed to confirm roll-out (`GROOVE_ROLLOUT_MIN_CONSECUTIVE_SAMPLES`).
+        fly(&mut track, 1.6, 900.0, 25.0);
+        fly(&mut track, 1.7, 800.0, 25.0);
         assert!(
             track
                 .trajectory_deviations
                 .iter()
                 .any(|d| d.gs_deviation_deg >= 1.5),
             "noisy approach should have recorded a significant deviation, found: {:?}",
+            track.trajectory_deviations
+        );
+    }
+
+    #[test]
+    fn trajectory_deviations_stop_before_the_atan2_blow_up_near_touchdown() {
+        // Regression for the confirmed live bug: `gs_deviation_deg`/`lineup_deg` are
+        // `atan2(offset_m, x)`, so as `x` (distance-to-ship) approaches 0 in the final metres
+        // before contact, an ordinary few-decimetre flare produces an angle of several tens of
+        // degrees with no geometric meaning (live repro: 70.3 deg at x=0.30 m). No pushed
+        // sample should have `distance_m` below `TRAJECTORY_MIN_DISTANCE_M`, and none should
+        // show a manufactured huge-angle deviation from a tiny, realistic vertical offset.
+        let carrier_info = CarrierInfo::by_type("CVN_71").unwrap();
+        let plane_info = AirplaneInfo::by_type("FA-18C_hornet").unwrap();
+        let carrier = Transform {
+            forward: DVec3::unit_z(),
+            ..Transform::default()
+        };
+        let landing = carrier_info.approach_reference_offset(plane_info);
+        let fb = DVec3::unit_z().rotated_by(DRotor3::from_rotation_xz(
+            carrier_info.deck_angle.to_radians(),
+        ));
+        let mut track = Track::new("pilot", carrier_info, plane_info);
+        let on_glideslope_bias = carrier_info.deck_altitude - plane_info.hook.y;
+        let fly = |track: &mut Track, time: f64, distance: f64, alt_offset_m: f64| {
+            let mut carrier_frame = carrier.clone();
+            carrier_frame.time = time;
+            let ideal_alt =
+                distance * plane_info.glide_slope.to_radians().tan() + on_glideslope_bias;
+            let plane = Transform {
+                time,
+                position: landing - fb * distance,
+                alt: ideal_alt + alt_offset_m,
+                ..Transform::default()
+            };
+            track.next(&carrier_frame, &plane, Some(1.0));
+        };
+
+        // Wings-level, on-centerline warm-up so the CATOBAR roll-out check confirms groove
+        // entry (see `groove_entry_populates_a_continuous_trajectory_series` for the same
+        // pattern), then fly a clean approach all the way down to a realistic touchdown flare
+        // (a small, few-decimetre vertical offset at the last, sub-3-m samples).
+        fly(&mut track, 0.0, 1450.0, 0.0);
+        fly(&mut track, 1.0, 1200.0, 0.0);
+        fly(&mut track, 1.6, 900.0, 0.0);
+        fly(&mut track, 1.7, 800.0, 0.0);
+        fly(&mut track, 2.0, 300.0, 0.0);
+        fly(&mut track, 2.5, 100.0, 0.0);
+        fly(&mut track, 2.9, 10.0, 0.0);
+        fly(&mut track, 3.0, 3.0, 0.1);
+        fly(&mut track, 3.1, 1.47, 0.3);
+        fly(&mut track, 3.2, 0.30, 0.3);
+
+        assert!(
+            !track.trajectory_deviations.is_empty(),
+            "clean approach should still have recorded trajectory samples"
+        );
+        for deviation in &track.trajectory_deviations {
+            assert!(
+                deviation.distance_m >= TRAJECTORY_MIN_DISTANCE_M,
+                "sample below the distance floor should never have been pushed: {deviation:?}"
+            );
+            assert!(
+                deviation.gs_deviation_deg.abs() < 45.0,
+                "a realistic offset must never produce a manufactured huge angle: {deviation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn near_touchdown_flare_offset_no_longer_manufactures_a_large_angle() {
+        // Regression for the confirmed-live-on-5-September-2026 near-touchdown geometry defect
+        // (distinct from the atan2 blow-up above, which only guards `x < TRAJECTORY_MIN_DISTANCE_M`):
+        // between that floor and several tens of metres out, an ordinary, essentially constant
+        // flare/reference offset (confirmed live at ~0.75-1.1 m, both vertically and laterally,
+        // on otherwise-clean passes) was still amplified into a double-digit-degree deviation
+        // purely because `x` shrinks, pushing a pass three clean gates would have graded `Ok`/
+        // `(Ok)` down to `NoGrade`. With `NEAR_TOUCHDOWN_ANGLE_REFERENCE_M` substituted for `x`
+        // in this zone, the same constant 0.8 m offset held from 50 m down to 4 m must stay a
+        // small, stable angle throughout, never approaching the old atan2(0.8, 4) ~= 11.3 deg.
+        let carrier_info = CarrierInfo::by_type("CVN_71").unwrap();
+        let plane_info = AirplaneInfo::by_type("FA-18C_hornet").unwrap();
+        let carrier = Transform {
+            forward: DVec3::unit_z(),
+            ..Transform::default()
+        };
+        let landing = carrier_info.approach_reference_offset(plane_info);
+        let fb_rot = DRotor3::from_rotation_xz(carrier_info.deck_angle.to_radians());
+        let fb = DVec3::unit_z().rotated_by(fb_rot);
+        let lateral_axis = DVec3::unit_x().rotated_by(fb_rot);
+        let mut track = Track::new("pilot", carrier_info, plane_info);
+        let on_glideslope_bias = carrier_info.deck_altitude - plane_info.hook.y;
+        let fly = |track: &mut Track,
+                   time: f64,
+                   distance: f64,
+                   vertical_offset_m: f64,
+                   lateral_offset_m: f64| {
+            let mut carrier_frame = carrier.clone();
+            carrier_frame.time = time;
+            let ideal_alt =
+                distance * plane_info.glide_slope.to_radians().tan() + on_glideslope_bias;
+            let plane = Transform {
+                time,
+                position: landing - fb * distance + lateral_axis * lateral_offset_m,
+                alt: ideal_alt + vertical_offset_m,
+                ..Transform::default()
+            };
+            track.next(&carrier_frame, &plane, Some(1.0));
+        };
+
+        // Wings-level, on-centerline warm-up so the CATOBAR roll-out check confirms groove entry,
+        // then hold a small, constant vertical+lateral offset from 50 m down to 4 m — the same
+        // shape observed live (a roughly constant few-decimetre offset, not a growing one).
+        fly(&mut track, 0.0, 1450.0, 0.0, 0.0);
+        fly(&mut track, 1.0, 1200.0, 0.0, 0.0);
+        fly(&mut track, 1.6, 900.0, 0.0, 0.0);
+        fly(&mut track, 1.7, 800.0, 0.0, 0.0);
+        fly(&mut track, 2.0, 300.0, 0.0, 0.0);
+        fly(&mut track, 2.5, 100.0, 0.0, 0.0);
+        fly(&mut track, 3.0, 50.0, 0.8, 0.8);
+        fly(&mut track, 3.1, 30.0, 0.8, 0.8);
+        fly(&mut track, 3.2, 15.0, 0.8, 0.8);
+        fly(&mut track, 3.3, 8.0, 0.8, 0.8);
+        fly(&mut track, 3.4, 4.0, 0.8, 0.8);
+
+        let near_touchdown: Vec<_> = track
+            .trajectory_deviations
+            .iter()
+            .filter(|d| d.distance_m <= 50.0)
+            .collect();
+        assert!(
+            !near_touchdown.is_empty(),
+            "the near-touchdown offset samples should have been recorded"
+        );
+        for deviation in &near_touchdown {
+            assert!(
+                deviation.gs_deviation_deg.abs() < 1.0,
+                "a constant, realistic flare offset must not be amplified into a large angle \
+                 purely by a shrinking x: {deviation:?}"
+            );
+            assert!(
+                deviation.lineup_deg.abs() < 2.0,
+                "a constant, realistic lateral offset must not be amplified into a large angle \
+                 purely by a shrinking x: {deviation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn near_touchdown_large_offset_still_crosses_the_cut_threshold() {
+        // Companion to the test above: the fixed reference distance must not blind the module to
+        // a genuinely large, sustained low excursion near the ramp — it should still be able to
+        // cross the -2.5 deg GS Cut threshold, just from a real number of metres of deviation
+        // (with `NEAR_TOUCHDOWN_ANGLE_REFERENCE_M = 75`, atan2(-3.5, 75) ~= -2.67 deg) rather than
+        // from an ordinary flare's decimetres divided by an almost-zero remaining distance.
+        let carrier_info = CarrierInfo::by_type("CVN_71").unwrap();
+        let plane_info = AirplaneInfo::by_type("FA-18C_hornet").unwrap();
+        let carrier = Transform {
+            forward: DVec3::unit_z(),
+            ..Transform::default()
+        };
+        let landing = carrier_info.approach_reference_offset(plane_info);
+        let fb_rot = DRotor3::from_rotation_xz(carrier_info.deck_angle.to_radians());
+        let fb = DVec3::unit_z().rotated_by(fb_rot);
+        let mut track = Track::new("pilot", carrier_info, plane_info);
+        let on_glideslope_bias = carrier_info.deck_altitude - plane_info.hook.y;
+        let fly = |track: &mut Track, time: f64, distance: f64, vertical_offset_m: f64| {
+            let mut carrier_frame = carrier.clone();
+            carrier_frame.time = time;
+            let ideal_alt =
+                distance * plane_info.glide_slope.to_radians().tan() + on_glideslope_bias;
+            let plane = Transform {
+                time,
+                position: landing - fb * distance,
+                alt: ideal_alt + vertical_offset_m,
+                ..Transform::default()
+            };
+            track.next(&carrier_frame, &plane, Some(1.0));
+        };
+
+        fly(&mut track, 0.0, 1450.0, 0.0);
+        fly(&mut track, 1.0, 1200.0, 0.0);
+        fly(&mut track, 1.6, 900.0, 0.0);
+        fly(&mut track, 1.7, 800.0, 0.0);
+        fly(&mut track, 2.0, 300.0, 0.0);
+        fly(&mut track, 2.5, 100.0, 0.0);
+        fly(&mut track, 3.0, 50.0, -3.5);
+        fly(&mut track, 3.1, 30.0, -3.5);
+        fly(&mut track, 3.2, 15.0, -3.5);
+        fly(&mut track, 3.3, 8.0, -3.5);
+        fly(&mut track, 3.4, 4.0, -3.5);
+
+        assert!(
+            track
+                .trajectory_deviations
+                .iter()
+                .any(|d| d.distance_m <= 50.0 && d.gs_deviation_deg <= -2.5),
+            "a genuinely large, sustained low excursion must still cross the Cut threshold \
+             near touchdown: {:?}",
             track.trajectory_deviations
         );
     }
@@ -2900,8 +3324,16 @@ mod tests {
             track.next(&carrier_frame, &plane, Some(1.0));
         };
 
-        fly(&mut track, 1.0, 800.0, 3.0);
-        fly(&mut track, 1.1, 700.0, -12.5);
+        // Wings-level, on-centerline warm-up so the CATOBAR roll-out check (`is_rolled_out`)
+        // has enough buffered history and one confirming sample before the two samples this
+        // test actually cares about (see the groove-entry constants block). The warm-up itself
+        // is never recorded: `entered_groove` only flips true (and starts recording) on the
+        // second of two consecutive confirming samples, which is the roll=3.0 sample below.
+        fly(&mut track, 0.0, 1450.0, 0.0);
+        fly(&mut track, 1.1, 900.0, 0.0);
+
+        fly(&mut track, 1.2, 800.0, 3.0);
+        fly(&mut track, 1.3, 700.0, -12.5);
 
         assert_eq!(
             track.trajectory_deviations.len(),
@@ -3474,6 +3906,71 @@ mod tests {
     }
 
     #[test]
+    fn wire_estimated_matches_wire_estimation_even_when_the_event_path_races_ahead_of_the_crossing()
+    {
+        // Regression for the confirmed live desync: the event-correlated `Land` (here
+        // simulated by setting `grading`/`landing_time` directly, as `landed()` would) can be
+        // processed before the position-tick path (`observe_wire_crossings`) has recorded the
+        // corresponding wire crossing. `cable_estimated` must never freeze that incomplete
+        // snapshot -- it has to agree with `wire_estimation.wire`, which `finish()` computes
+        // once against the complete crossing history.
+        let carrier_info = CarrierInfo::by_type("CVN_71").unwrap();
+        let plane_info = AirplaneInfo::by_type("FA-18C_hornet").unwrap();
+        let carrier = Transform {
+            forward: DVec3::unit_z(),
+            ..Transform::default()
+        };
+        let midpoint = (carrier_info.cable3.0 + carrier_info.cable3.1) / 2.0;
+        let hook_offset = plane_info.hook;
+        let mut track = Track::new("pilot", carrier_info, plane_info);
+
+        // Position path observes the "before" sample (still short of the wire).
+        track.observe_wire_crossings(
+            &carrier,
+            &Transform {
+                position: midpoint - hook_offset - DVec3::unit_z(),
+                time: 1.0,
+                ..Transform::default()
+            },
+            100.0,
+        );
+
+        // Event path correlates `Land` right here, with `wire_crossings` still empty --
+        // exactly the race from the live report: no fresh crossing yet, same as `landed()`
+        // would leave it with the eager-computation removed.
+        track.grading = Some(Grading::Recovered {
+            cable: None,
+            cable_estimated: None,
+        });
+        track.landing_time = Some(1.05);
+
+        // Position path only now observes the "after" sample that completes the crossing.
+        track.observe_wire_crossings(
+            &carrier,
+            &Transform {
+                position: midpoint - hook_offset + DVec3::unit_z(),
+                time: 1.1,
+                ..Transform::default()
+            },
+            100.0,
+        );
+
+        let result = track.finish();
+        assert_eq!(result.wire_estimation.wire, Some(3));
+        match result.grading {
+            Grading::Recovered {
+                cable_estimated, ..
+            } => {
+                assert_eq!(
+                    cable_estimated, result.wire_estimation.wire,
+                    "cable_estimated must match wire_estimation.wire, not an earlier snapshot"
+                );
+            }
+            other => panic!("expected Grading::Recovered, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn replay_and_live_paths_share_geometry_and_outcome_for_common_data() {
         let carrier_info = CarrierInfo::by_type("CVN_71").unwrap();
         let plane_info = AirplaneInfo::by_type("FA-18C_hornet").unwrap();
@@ -3560,10 +4057,15 @@ mod tests {
         let hook_offset_y = plane_info.hook.y;
         let mut track = Track::new("pilot", carrier_info, plane_info);
 
-        // Groove entry: descending inbound on glideslope. Carrier time is kept in step with the
-        // plane's so skew stays within the telemetry-valid window.
-        for (index, distance) in [700.0, 300.0, 100.0].into_iter().enumerate() {
-            let time = 1.0 + index as f64 * 0.2;
+        // Groove entry: descending inbound on glideslope, wings level and on centerline
+        // throughout, so the CATOBAR roll-out check (`is_rolled_out`) confirms `entered_groove`
+        // well before the deck crossing below -- the timings give the buffered `gate_samples`
+        // window enough span (see `GROOVE_ROLLOUT_MIN_TRACK_WINDOW_S`) and two consecutive
+        // confirming samples (`GROOVE_ROLLOUT_MIN_CONSECUTIVE_SAMPLES`) before x reaches 0.
+        // Carrier time is kept in step with the plane's so skew stays within the
+        // telemetry-valid window.
+        for (index, distance) in [1400.0, 700.0, 300.0, 100.0].into_iter().enumerate() {
+            let time = [0.0, 1.0, 1.1, 1.2][index];
             let mut carrier_frame = carrier.clone();
             carrier_frame.time = time;
             let altitude = distance * plane_info.glide_slope.to_radians().tan()
@@ -3577,6 +4079,10 @@ mod tests {
             };
             assert!(track.next(&carrier_frame, &plane, None));
         }
+        assert!(
+            track.entered_groove,
+            "warm-up should have confirmed groove entry before the deck crossing"
+        );
 
         // Crosses x=0 (deck threshold) at ~140 m relative altitude: a high fly-over, not a touch.
         let crossing_alt = carrier_info.deck_altitude - hook_offset_y + 140.0;
@@ -3619,8 +4125,15 @@ mod tests {
         let hook_offset_y = plane_info.hook.y;
         let mut track = Track::new("pilot", carrier_info, plane_info);
 
-        for (index, distance) in [700.0, 300.0, 100.0].into_iter().enumerate() {
-            let time = 1.0 + index as f64 * 0.2;
+        // Groove entry: descending inbound on glideslope, wings level and on centerline
+        // throughout, so the CATOBAR roll-out check (`is_rolled_out`) confirms `entered_groove`
+        // well before the deck crossing below -- the timings give the buffered `gate_samples`
+        // window enough span (see `GROOVE_ROLLOUT_MIN_TRACK_WINDOW_S`) and two consecutive
+        // confirming samples (`GROOVE_ROLLOUT_MIN_CONSECUTIVE_SAMPLES`) before x reaches 0.
+        // Carrier time is kept in step with the plane's so skew stays within the
+        // telemetry-valid window.
+        for (index, distance) in [1400.0, 700.0, 300.0, 100.0].into_iter().enumerate() {
+            let time = [0.0, 1.0, 1.1, 1.2][index];
             let mut carrier_frame = carrier.clone();
             carrier_frame.time = time;
             let altitude = distance * plane_info.glide_slope.to_radians().tan()
@@ -3634,6 +4147,10 @@ mod tests {
             };
             assert!(track.next(&carrier_frame, &plane, None));
         }
+        assert!(
+            track.entered_groove,
+            "warm-up should have confirmed groove entry before the deck crossing"
+        );
 
         // Crosses x=0 essentially at deck level (relative alt ~= 0).
         let crossing_alt = carrier_info.deck_altitude - hook_offset_y;
@@ -3741,10 +4258,55 @@ mod tests {
     }
 
     #[test]
-    fn uncalibrated_f14_hook_values_remain_unknown() {
+    fn f14_hook_is_calibrated_via_its_own_draw_argument() {
+        // Regression for the user-supplied calibration: the F-14 (all variants) uses draw
+        // argument 1305, distinct from the F/A-18C and T-45's 25
+        // (`F14_HOOK_DRAW_ARGUMENT`, `src/data.rs`) -- but once a raw value is captured, it is
+        // interpreted with the same up/down thresholds, since no different polarity was
+        // supplied. `calibrated_hook_state` itself never touches which index was polled (that
+        // happens upstream, in `src/tasks/record_recovery.rs`); this only confirms the F-14 is
+        // no longer forced to `Unknown` the way it was before this calibration was supplied.
         let carrier = CarrierInfo::by_type("CVN_71").unwrap();
         let tomcat = AirplaneInfo::by_type("F-14B").unwrap();
         let mut track = Track::new("pilot", carrier, tomcat);
+        track.entered_groove = true;
+        track.previous_x = 400.0;
+        for index in 0..4 {
+            track.observe_hook_sample(
+                10.0 + index as f64 * 0.25,
+                index,
+                0.0,
+                Some(0.0),
+                HookSampleStatus::Success,
+            );
+        }
+        assert_eq!(track.calibrated_hook_state(), CalibratedHookState::Up);
+    }
+
+    #[test]
+    fn type_without_a_known_hook_draw_argument_remains_unknown() {
+        // A type with no `hook_draw_argument` at all (e.g. AV-8B, or any future type added
+        // before its index is known) must never have a raw value interpreted, no matter how
+        // clean the readings look -- `calibrated_hook_state` gates on the index being known,
+        // not on the readings themselves.
+        static UNCALIBRATED: AirplaneInfo = AirplaneInfo {
+            name: "Future Type",
+            hook: DVec3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            landing_reference: DVec3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            glide_slope: 3.5,
+            hook_draw_argument: None,
+            aoa_rating: |_| crate::data::Aoa::OnSpeed,
+        };
+        let carrier = CarrierInfo::by_type("CVN_71").unwrap();
+        let mut track = Track::new("pilot", carrier, &UNCALIBRATED);
         track.entered_groove = true;
         track.previous_x = 400.0;
         for index in 0..4 {

@@ -262,11 +262,36 @@ les positions brutes nécessaires ont déjà été récupérées à l'étape 2-3
 verdict, note, fichiers — se déroule entièrement à l'intérieur de **DCS-gRPC-lso**, sans nouvelle
 question posée à DCS.
 
+> **Un bug corrigé à cette étape** (voir `tasking-roadmap.md`) : l'écart vertical et l'écart
+> latéral sont calculés à partir de la distance restante jusqu'au pont — un calcul qui devient
+> instable quand cette distance approche de zéro, juste avant le toucher. Un flare tout à fait
+> normal de quelques dizaines de centimètres, à un mètre du pont, pouvait alors ressortir comme un
+> écart de plusieurs dizaines de degrés, sans aucun sens réel. Le programme n'enregistre désormais
+> plus d'écart continu à moins de 3 mètres du pont — largement avant que ce calcul ne devienne
+> instable, et bien après que l'essentiel de l'approche ait déjà été mesuré. Corrigé et testé, pas
+> encore revalidé sur un enregistrement live.
+
 ---
 
-## Étape 5 — Les trois photos : ¾ NM, ½ NM et ¼ NM *(entièrement DCS-gRPC-lso)*
+## Étape 5 — Trois repères précis dans cette trajectoire déjà continue : ¾ NM, ½ NM et ¼ NM *(entièrement DCS-gRPC-lso)*
 
-Sur cette trajectoire convertie, le programme surveille trois distances précises :
+Depuis l'étape 4, le programme dispose déjà, à chaque instant du groove, de l'écart vertical et de
+l'écart latéral de l'avion — ce n'est pas une donnée qui apparaît seulement à cette étape. En plus
+de cette lecture continue, il retient trois instants particuliers, quand l'avion franchit des
+distances précises et traditionnellement utilisées en doctrine LSO :
+
+> **Comment le programme sait-il que le groove commence ?** Dans la vraie doctrine (CASE I), le
+> groove commence quand le pilote "roule les ailes à plat, aligné sur l'axe du pont, avec la boule
+> centrée" — un **geste du pilote**, pas une distance ou une altitude précise. Le programme ne peut
+> pas voir ce geste directement (DCS ne l'expose pas), donc il doit s'en approcher autrement. Une
+> première version se contentait d'une boîte géométrique large (avion à moins de ¾ NM, moins de
+> 300 ft, à peu près dans l'axe) — simple, mais capable de se déclencher un instant trop tôt, par
+> exemple si l'avion traverse cette boîte en coupant son virage final avant de vraiment se
+> stabiliser. Le programme vérifie désormais, en plus de cette boîte, que l'avion vole déjà à
+> peu près à plat (pas en plein virage) et que sa trajectoire réelle des dernières secondes pointe
+> déjà vers le pont — sur deux mesures consécutives, pour ignorer un signal isolé. Ce
+> raffinement ne s'applique qu'aux porte-avions CATOBAR (Nimitz/Forrestal) : l'AV-8B sur le
+> Tarawa n'a pas ce virage final à distinguer, donc garde l'ancienne boîte seule.
 
 | Repère | Distance | Équivalent |
 |---|---:|---|
@@ -275,8 +300,8 @@ Sur cette trajectoire convertie, le programme surveille trois distances précise
 | ¼ NM | 463 m | juste avant le pont |
 
 À l'instant exact où l'avion franchit chacune de ces trois distances, le programme "prend une
-photo" : il regarde l'écart vertical et l'écart latéral à ce moment précis, et les convertit en
-degrés (l'unité que la doctrine LSO utilise habituellement, plutôt que des mètres).
+photo" de la valeur déjà mesurée en continu, et la convertit en degrés (l'unité que la doctrine
+LSO utilise habituellement, plutôt que des mètres).
 
 **Exemple fictif des trois photos pour l'appontage de Wolf 1-1 :**
 
@@ -286,13 +311,19 @@ degrés (l'unité que la doctrine LSO utilise habituellement, plutôt que des m�
 | ½ NM | -0.1° (quasi parfait) | +0.3° |
 | ¼ NM | 0.0° (parfait) | +0.1° |
 
-Le programme ne prend cette photo que si les mesures autour de ce moment sont fiables (pas de
+Le programme ne retient cette photo que si les mesures autour de ce moment sont fiables (pas de
 trou de données, pas de décalage temporel suspect entre avion et bateau, avion bien en
 approche et pas trop désaxé). Si les conditions ne sont pas réunies, la photo est marquée
 "invalide" plutôt que d'inventer un chiffre approximatif.
 
-**Ces trois photos ne sont plus les seules données utilisées pour la note** — voir l'étape 7 : le
-programme garde désormais aussi le fil complet entre les trois photos.
+**Pourquoi ces trois photos précises comptent encore, alors que la trajectoire est déjà
+enregistrée en continu ?** Parce que ce sont elles, avec cette exigence de fiabilité renforcée
+(et elles seules), qui décident si l'appontage est *notable* du tout : il faut les **trois**
+valides et dans l'ordre pour qu'une note favorable soit possible. Sans ça, l'appontage est classé
+"non noté" (`NC`), quelle que soit la qualité du reste de la trajectoire continue. Une fois cette
+condition remplie, en revanche, ce ne sont plus les trois photos seules qui fixent l'amplitude
+retenue pour la note — voir l'étape 7 : le programme combine les trois photos avec le fil complet
+de la trajectoire continue entre elles.
 
 ---
 
@@ -317,7 +348,23 @@ l'étape 3, le programme détermine l'issue :
 - **Bolter** : le train a touché le pont mais l'avion a continué et a redécollé sans s'arrêter
   (aucun brin accroché).
 - **Touch-and-go** : comme un bolter en apparence, mais la crosse était en position "up" par
-  intention (un touch-and-go volontaire d'entraînement, pas un vrai bolter).
+  intention (un touch-and-go volontaire d'entraînement, pas un vrai bolter). Le programme ne
+  devine jamais cette intention à partir du comportement de vol : il lit directement, depuis DCS,
+  la position réelle de la crosse au moment où l'avion repart, et exige que cette lecture reste
+  stable sur plusieurs instants d'affilée avant de conclure "crosse levée" (une lecture isolée ou
+  ambiguë ne suffit pas). Cette lecture n'est possible que pour les avions dont le programme
+  connaît le bon canal d'information dans DCS — actuellement le F/A-18C, le T-45 et le F-14 (dans
+  ses variantes) ; pour tout autre type, ou si la lecture est ambiguë, le programme retombe sur
+  `Bolter` par défaut, jamais l'inverse.
+
+> **Une extension apportée à cette étape (5 septembre 2026)** : cette lecture de la crosse n'était
+> jusqu'ici fiable que pour le F/A-18C — le T-45 et le F-14 obtenaient toujours `Bolter`, même
+> pour un vrai touch-and-go volontaire, faute de connaître le bon canal DCS à interroger pour ces
+> deux types. Les deux canaux ont été fournis et ajoutés (le T-45 partage celui du F/A-18C ; le
+> F-14, dans ses trois variantes, en utilise un différent). Un avertissement subsiste : seule la
+> lecture du F/A-18C a été vérifiée comme fiable sur des données réelles ; celle du T-45/F-14
+> suppose la même convention sans l'avoir encore confirmée séparément — voir
+> `tasking-roadmap.md`.
 - **Remise de gaz ("Wave off")** : l'avion s'est écarté sans jamais toucher le pont. Le
   programme ne sait pas dire, à partir des données brutes, si c'est le pilote qui a décidé de
   remettre les gaz ou un ordre du LSO/de sécurité — donc il l'affiche comme "remise de gaz",
@@ -334,6 +381,19 @@ l'étape 3, le programme détermine l'issue :
 > jamais en avant à côté d'un chiffre DCS qu'il contredirait. DCS reste la seule autorité pour
 > tout ce que vous voyez sans creuser.
 
+> **Un bug corrigé à cette étape** (voir `tasking-roadmap.md`) : le calcul géométrique du brin
+> pouvait, sur de rares appontages, être fait deux fois avec un historique différent — une fois au
+> moment précis où DCS confirme le toucher, une deuxième fois à la toute fin du rapport, une fois
+> toute la trajectoire connue. Si le franchissement du brin n'était pas encore enregistré au tout
+> premier calcul, le champ principal du rapport (celui que vous voyez en premier) pouvait afficher
+> "estimation indisponible" alors que le champ de diagnostic, plus bas dans le même fichier JSON,
+> contenait bien une valeur fiable — deux nombres qui auraient dû être identiques et ne l'étaient
+> pas toujours. Confirmé sur 2 appontages sur 6 lors d'un test live. Le programme ne calcule
+> désormais plus qu'une seule fois, à la toute fin, avec l'historique complet — les deux champs
+> sont donc garantis identiques. N'a jamais affecté la note elle-même, seulement l'affichage du
+> brin et le niveau de confiance associé. Corrigé et testé, pas encore revalidé sur les
+> enregistrements live où le problème avait été observé.
+
 > **Un bug corrigé à cette étape** (voir `tasking-roadmap.md`) : une remise de gaz "en survol", où
 > l'avion passe très haut au-dessus du pont sans y toucher puis remonte, était auparavant mal
 > classée `Bolter` au lieu de `WO?` — le franchissement du seuil du pont ne vérifiait que la
@@ -346,14 +406,16 @@ l'étape 3, le programme détermine l'issue :
 
 ## Étape 7 — La notation : de la trajectoire complète à une lettre *(entièrement DCS-gRPC-lso)*
 
-C'est ici que la trajectoire de l'étape 4 et les trois photos de l'étape 5 deviennent une note
-lisible. Le principe a évolué : il ne se limite plus à "regarder le pire écart parmi les trois
-photos".
+C'est ici que la trajectoire continue de l'étape 4 et les trois photos de l'étape 5 deviennent une
+note lisible. Les trois photos ont déjà tranché une question préalable — l'appontage est-il
+notable du tout (étape 5) ? — mais une fois cette question réglée, le calcul ne se limite pas à
+"regarder le pire écart parmi les trois photos".
 
-1. **L'amplitude** reste d'abord jugée sur le pire écart (vertical ou latéral) observé, mais
-   **sur toute la trajectoire du groove au touchdown**, pas seulement aux trois instants ¾/½/¼
-   NM — un écart significatif *entre* deux portes, invisible avant, peut désormais dégrader la
-   note. Un seul instantané isolé au-dessus du seuil ne suffit toutefois plus : il faut qu'au moins
+1. **L'amplitude** est jugée sur le pire écart (vertical ou latéral) observé, en combinant les
+   trois photos avec **toute la trajectoire du groove au touchdown** — un écart significatif
+   *entre* deux portes, invisible aux trois photos seules, peut ainsi dégrader la note, mais
+   jamais l'améliorer par rapport à ce que les trois photos indiquaient déjà. Un seul instantané
+   isolé au-dessus du seuil, dans la trajectoire continue, ne suffit pas : il faut qu'au moins
    deux mesures consécutives confirment l'écart, pour qu'une simple frame de télémétrie aberrante ne
    pénalise pas à tort une approche par ailleurs propre. Cette exigence ne s'applique jamais à un
    écart vraiment dangereux tout près du pont (voir `C` (Cut) plus bas) ni à la règle "proximité du
@@ -371,20 +433,32 @@ photos".
    franchement dangereux) situé dans les 150 derniers mètres avant la coupe plafonne la note à
    `--` au lieu de `OK`/`(OK)`, parce qu'il ne reste quasiment plus de temps pour le corriger à cet
    endroit. Le même écart, plus tôt dans l'approche, est noté normalement.
+4. **`_OK_`, la passe parfaite (nouveau, 5 septembre 2026).** Une fois qu'une passe a déjà mérité
+   `OK` par les trois points ci-dessus, le programme regarde s'il ne s'agit pas d'une passe
+   carrément parfaite. Il faut alors, en plus, que **chaque** photo et **chaque** instant de la
+   trajectoire continue soit resté dans une fenêtre encore plus étroite (à peu près deux fois plus
+   stricte que pour `OK` simple — le pardon habituel pour une frame de télémétrie isolée
+   s'applique quand même), **et** que le temps passé dans le groove soit tombé entre 15 et 18
+   secondes, la durée que le manuel officiel décrit pour un groove standard. `_OK_` ne dépend
+   jamais du brin accroché (1, 2, 3 ou 4, ça ne change rien) ni d'un touch-and-go volontaire (qui
+   ne peut jamais l'obtenir, seulement `OK` au mieux) : c'est une note d'approche parfaite, pas une
+   récompense pour un brin en particulier.
 
 | Le résultat de cette analyse | Note | Points |
 |---|---|---:|
+| Approche parfaite (voir point 4) et temps de groove 15-18 s | `_OK_` | 5.0 |
 | Très proche de zéro partout, aucune dégradation en fin de trajectoire | `OK` | 4.0 |
 | Écart modéré, ou trajectoire encore en train de se dégrader en fin d'approche | `(OK)` | 3.0 |
 | Écart important, ou écart modéré trop proche du pont pour être corrigé | `--` | 2.0 |
-| Très bas et dangereux à la toute dernière photo (¼ NM) | `C` (Cut) | 0.0 |
+| Très bas et dangereux à la toute dernière photo (¼ NM), ou taux de descente/gîte franchement dangereux et soutenu à ce même endroit | `C` (Cut) | 0.0 |
 | Bolter confirmé (voir étape 6) | `B` | 2.5 |
 | Remise de gaz | `WO?` | pas de points |
 | Preuve insuffisante pour juger | `NC` | pas de points |
 
 **Exemple fictif :** pour Wolf 1-1, le pire écart relevé sur toute la trajectoire était 0.4° (à ¾
 NM), la tendance était stable et rien d'anormal ne s'est produit dans les 150 derniers mètres. Le
-programme sort donc **`OK`, 4.0 points**.
+programme sort donc **`OK`, 4.0 points** — 0.4° dépasse la fenêtre encore plus étroite exigée pour
+`_OK_`, donc cette passe, déjà très propre, n'atteint pas la perfection.
 
 > Important à savoir : cette grille de seuils reste une règle **du projet**
 > (`PROJECT-DERIVED`, version `project-derived-v4`), pas une reconstruction certifiée de la
@@ -392,6 +466,16 @@ programme sort donc **`OK`, 4.0 points**.
 > systématiquement. Le vrai LSO humain juge aussi l'AoA, la puissance, l'assiette, le mouvement du
 > pont et bien d'autres dimensions qui ne sont, pour l'instant, ni mesurables de façon fiable ni
 > intégrées au calcul de la note dans ce projet.
+
+> **Sur `_OK_` précisément :** le symbole `_OK_` et son sens ("passe parfaite") sont bien officiels
+> (manuel LSO américain, section 11.4.1). La durée de groove 15-18 s citée au point 4 est aussi un
+> vrai texte officiel (manuel des procédures porte-avions, section 6.2.4.3) — mais aucun des deux
+> manuels ne dit comment transformer ces deux informations en une règle de calcul automatique. La
+> fenêtre d'amplitude resserrée, elle, vient d'ailleurs : un mod de notation LSO open-source
+> existant, utilisé par d'autres dans la communauté de simulation, qui a d'ailleurs déjà inspiré
+> plusieurs autres seuils de ce document. Une ancienne version locale de cette règle liait aussi
+> `_OK_` à un brin précis (le brin 3) — ce lien a été délibérément écarté : rien dans les manuels ne
+> justifie qu'un brin précis mérite une meilleure note qu'un autre.
 
 ### Le vent et l'incidence (AoA), affichés mais jamais notés
 
@@ -407,11 +491,22 @@ une piste explorée pour la lire directement depuis le modèle 3D de l'avion (le
 `tasking-roadmap.md`. L'AoA reste affichée à titre informatif uniquement ; elle n'entre jamais dans
 le calcul de la note.
 
-Le rapport garde aussi désormais, pour chaque instant de la trajectoire continue (étape 4), le taux
-de descente et l'angle de gîte (bank) de l'avion — deux éléments qu'un vrai LSO commente à l'oral
-(un fort taux de chute près du pont, une gîte excessive en corrigeant), mais que le programme se
-contente d'enregistrer sans les noter : aucune règle validée n'existe encore pour les traduire en
-points.
+Le rapport garde aussi, pour chaque instant de la trajectoire continue (étape 4), le taux de
+descente et l'angle de gîte (bank) de l'avion — deux éléments qu'un vrai LSO commente à l'oral (un
+fort taux de chute près du pont, une gîte excessive en corrigeant). Sur leur amplitude générale,
+tout le long de l'approche, ils restent purement informatifs, comme le vent et l'AoA : aucune règle
+validée n'existe pour les traduire en points de la même façon que l'écart de pente ou d'alignement.
+
+**Une exception, ajoutée le 5 septembre 2026** : si le taux de descente ou la gîte deviennent
+franchement dangereux — un taux de chute environ le double de celui d'un poser normal, ou une
+inclinaison de plus de 30°, l'un ou l'autre soutenu sur plusieurs mesures d'affilée (pas un seul
+pic isolé) — et que ça se produit tout près du pont (même zone que le `Cut` de pente), la note
+tombe directement à `C`, exactement comme pour un écart de pente dangereux. Contrairement à
+presque tous les autres seuils de ce document, celui-ci n'a **aucune base chiffrée** dans la
+doctrine officielle : les documents LSO officiels mentionnent bien un taux de descente ou une
+gîte excessifs comme des dangers réels, mais ne donnent jamais de nombre précis — c'est un choix
+du projet, assumé comme tel, pas encore éprouvé sur un vrai cas dangereux en mission (voir
+`tasking-roadmap.md`).
 
 ### Pistes encore envisagées, non codées
 
@@ -497,16 +592,17 @@ Vous approchez du porte-avions
 [3] Écoute des événements DCS (contact, note LSO du jeu...)  ◄─────────┘
         │
         ▼
-[4] Conversion en "écart par rapport à l'axe du pont" à chaque instant
+[4] Conversion en "écart par rapport à l'axe du pont", en continu, à chaque instant du groove
         │
         ▼
-[5] Trois photos figées : écarts à ¾ NM, ½ NM, ¼ NM
+[5] Trois photos figées dans ce flux continu (¾ NM, ½ NM, ¼ NM) : décident si c'est notable du tout
         │
         ▼
 [6] Verdict : posé / bolter / touch-and-go / remise de gaz + quel brin
         │
         ▼
-[7] Note calculée sur toute la trajectoire (amplitude + tendance + proximité du pont)
+[7] Note calculée sur trois photos + trajectoire continue (amplitude + tendance + proximité du
+    pont + sécurité sink-rate/gîte près du pont + _OK_ si passe parfaite et 15-18 s de groove)
         │
         ▼
 [8] Rapport JSON + rejeu ACMI + image + base de données + Discord

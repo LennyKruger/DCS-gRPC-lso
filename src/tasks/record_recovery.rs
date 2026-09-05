@@ -87,6 +87,12 @@ struct RecoveryReport<'a> {
     recording_started_at: &'a str,
     completed_at: &'a str,
     touchdown_time_dcs: Option<f64>,
+    /// Seconds spent in the groove before touchdown (`entered_groove` to `touchdown_time_dcs`),
+    /// `None` when either timestamp was never recorded. One of the two conditions for automatic
+    /// `_OK_` (see docs/GRADING_REFERENCE.md, "Automatic `_OK_`") — previously computed but only
+    /// ever surfaced in the Discord embed, making it impossible to audit `_OK_` eligibility from
+    /// the JSON report alone when Discord is not configured.
+    groove_time_secs: Option<f64>,
     lso_version: &'static str,
     lso_commit: &'static str,
     lso_dirty: bool,
@@ -187,6 +193,7 @@ impl Drop for PriorityCollectorGuard {
 async fn sample_hook(
     channel: crate::client::GrpcChannel,
     plane_name: String,
+    draw_argument: u32,
     config: super::HookSamplingConfig,
     tx: mpsc::Sender<HookPoll>,
 ) {
@@ -197,7 +204,7 @@ async fn sample_hook(
     loop {
         interval.tick().await;
         let (raw, status, grpc_code) = match client
-            .get_draw_argument_value_with_timeout(&plane_name, 25, config.timeout)
+            .get_draw_argument_value_with_timeout(&plane_name, draw_argument, config.timeout)
             .await
         {
             Ok(raw) if raw.is_finite() => (Some(raw), HookSampleStatus::Success, None),
@@ -473,21 +480,25 @@ pub async fn record_recovery(params: TaskParams<'_>) -> Result<(), crate::error:
     };
     let _event_stream_guard =
         (!params.positions_only).then(|| crate::metrics::RUNTIME_METRICS.stream());
-    let (mut hook_rx, _hook_sampler) = if !params.carrier_info.is_vstol()
-        && params.hook_sampling.mode == super::HookSamplingMode::Independent
-    {
-        let (hook_tx, hook_rx) = mpsc::channel(64);
-        (
-            Some(hook_rx),
-            Some(AbortOnDrop(tokio::spawn(sample_hook(
-                params.ch.clone(),
-                params.plane_name.to_string(),
-                params.hook_sampling,
-                hook_tx,
-            )))),
-        )
-    } else {
-        (None, None)
+    let (mut hook_rx, _hook_sampler) = match (
+        params.carrier_info.is_vstol(),
+        params.hook_sampling.mode == super::HookSamplingMode::Independent,
+        params.plane_info.hook_draw_argument,
+    ) {
+        (false, true, Some(draw_argument)) => {
+            let (hook_tx, hook_rx) = mpsc::channel(64);
+            (
+                Some(hook_rx),
+                Some(AbortOnDrop(tokio::spawn(sample_hook(
+                    params.ch.clone(),
+                    params.plane_name.to_string(),
+                    draw_argument,
+                    params.hook_sampling,
+                    hook_tx,
+                )))),
+            )
+        }
+        _ => (None, None),
     };
 
     let mut known_carrier_coords = None;
@@ -602,17 +613,18 @@ pub async fn record_recovery(params: TaskParams<'_>) -> Result<(), crate::error:
                     }
                     let carrier = &sample.carrier;
                     let plane = &sample.plane;
-                    let hook_state = if !params.carrier_info.is_vstol()
-                        && params.hook_sampling.mode == super::HookSamplingMode::LegacyInline
-                    {
-                        legacy_hook_client
+                    let hook_state = match (
+                        params.carrier_info.is_vstol(),
+                        params.hook_sampling.mode == super::HookSamplingMode::LegacyInline,
+                        params.plane_info.hook_draw_argument,
+                    ) {
+                        (false, true, Some(draw_argument)) => legacy_hook_client
                             .as_mut()
                             .expect("legacy hook client enabled")
-                            .get_draw_argument_value(params.plane_name, 25)
+                            .get_draw_argument_value(params.plane_name, draw_argument)
                             .await
-                            .ok()
-                    } else {
-                        None
+                            .ok(),
+                        _ => None,
                     };
 
                     if params.record_acmi {
@@ -1211,6 +1223,7 @@ pub async fn record_recovery(params: TaskParams<'_>) -> Result<(), crate::error:
         recording_started_at: &recovery_timestamp,
         completed_at: &completed_at,
         touchdown_time_dcs: track.touchdown_time_dcs,
+        groove_time_secs: track.groove_time_secs,
         lso_version: env!("CARGO_PKG_VERSION"),
         lso_commit: option_env!("GIT_COMMIT_HASH").unwrap_or("unknown"),
         lso_dirty: option_env!("GIT_DIRTY") == Some("true"),
