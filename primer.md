@@ -5,9 +5,9 @@
 > (positions, distances, timestamps...) sont **inventées** pour illustrer le principe — ce ne sont
 > pas des vraies données extraites d'un vol.
 >
-> Pour le détail technique exact et à jour, voir [AGENTS.md](AGENTS.md) et
-> [docs/GRADING_REFERENCE.md](docs/GRADING_REFERENCE.md). Pour la liste des chantiers en cours ou
-> à venir, voir [tasking-roadmap.md](tasking-roadmap.md).
+> Pour le détail technique exact et à jour, voir [AGENTS.md](AGENTS.md), "Gates, outcomes et
+> câble". Pour la liste des chantiers en cours ou à venir, voir
+> [tasking-roadmap.md](tasking-roadmap.md).
 
 ## L'idée en une phrase
 

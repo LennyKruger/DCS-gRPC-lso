@@ -30,7 +30,7 @@ or through Discord.
 
 The pass grade is a `PROJECT-DERIVED` training score, never an official USN/USMC certification. It
 uses glideslope and lineup deviations at three gates; AoA colours the charts but does not change the grade. See
-[the grading reference](docs/GRADING_REFERENCE.md) for the exact behavior.
+[AGENTS.md](AGENTS.md), "Gates, outcomes et câble", for the exact behavior.
 
 ## Requirements
 
@@ -162,20 +162,10 @@ pilot names to Discord numeric user IDs; it is optional.
 
 ## Documentation
 
-- [Installation and administration](docs/ADMIN_GUIDE.md)
-- [Technical architecture](docs/LSO_ANALYSIS.md)
-- [Reliability model](docs/RELIABILITY_ARCHITECTURE.md)
-- [Grading behavior](docs/GRADING_REFERENCE.md)
-- [Data contracts and migrations](docs/DATA_CONTRACTS.md)
-- [Benchmark protocol](docs/BENCHMARK_PROTOCOL.md)
-- [Live validation and version manifest](docs/LIVE_VALIDATION.md)
-- [Deployment and rollback](docs/DEPLOYMENT_ROLLBACK.md)
-- [DCS-gRPC fork migration](docs/DCS_GRPC_FORK_MIGRATION.md)
+- [Full technical reference](AGENTS.md) — architecture, contracts, grading, build, deployment, benchmark
+- [Project overview and grading logic for non-developers](primer.md) (French)
 - [Contributing](CONTRIBUTING.md)
 - [Changelog](CHANGES.md)
-
-`docs/DCS-gRPC-0.9.0/` is a historical bundled upstream/fork reference snapshot and is not maintained as LSO
-documentation.
 
 ## License
 

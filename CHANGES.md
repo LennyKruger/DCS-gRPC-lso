@@ -7,22 +7,55 @@ This file records user-visible changes. The crate version remains `0.2.0`; chang
 
 ### Added
 
+- `groove_time_secs`: the recovery report now serializes the groove duration (previously computed
+  but visible only in the Discord embed), so `_OK_` eligibility can be checked without Discord
+  configured.
+- Automatic `_OK_` grade (`is_amplitude_perfect`/`grade_from_gates`, `project-derived-v4`): a pass
+  already `Ok` by every existing rule is upgraded to `_OK_` (5.0 points) when every gate and every
+  continuous sample stays inside a tighter GS/lineup band (`PROJECT-DERIVED`, borrowed from the
+  MOOSE `Ops.Airboss` mod) and `groove_time_secs` falls within the NATOPS-documented 15-18 s groove
+  window (NAVAIR 00-80T-105 §6.2.4.3). Independent of the wire number caught; never available to a
+  touch-and-go.
+- Hook-position calibration (touch-and-go vs bolter) extended from the F/A-18C to the VNAO T-45
+  (draw argument index 25, shared with the F/A-18C) and the F-14A/B/B(U) (index 1305), via new
+  `AirplaneInfo::hook_draw_argument`. Only the F/A-18C's `<=0.2`=up/`>=0.8`=down polarity is
+  empirically confirmed; T-45/F-14 reuse it as an unverified assumption pending live confirmation.
+- A dedicated sink-rate/bank-angle Cut (`dangerous_sink_rate_or_bank`, `src/grading.rs`): a
+  sustained (>=3 consecutive samples) sink rate >=8.0 m/s or bank >=30 degrees inside the
+  quarter-NM grades the pass `C`. `PROJECT-DERIVED`; NATOPS documents sink rate and bank as
+  waveoff-judgment factors but codifies no numeric threshold for either.
+- CATOBAR groove-entry refinement (`is_rolled_out`, `src/track.rs`): in addition to the existing
+  distance/altitude/lineup box, `entered_groove` now also requires near-level bank
+  (`GROOVE_ROLLOUT_MAX_BANK_DEG = 15°`) and a ground track already aligned with the groove axis
+  (`GROOVE_ROLLOUT_MAX_TRACK_ANGLE_DEG = 15°`), confirmed over 2 consecutive samples — an observable
+  proxy for the NATOPS Case I "roll wings level on centerline with a centered ball" event that the
+  box alone could not distinguish from a transient pass through it during the final turn. CATOBAR
+  only; V/STOL keeps the box alone.
+- A persistence guard on continuous-trajectory amplitude (`PERSISTENCE_MIN_CONSECUTIVE_SAMPLES =
+  2`): an isolated frame above the slight/significant threshold no longer counts alone. Never
+  applied to the Cut threshold or the late-approach weighting, which stay sensitive to a single
+  sample. An overcorrection/oscillation check (`OSCILLATION_MIN_REVERSALS`/
+  `OSCILLATION_MIN_SWING_DEG`) also caps a pass at `(OK)` when GS/lineup shows repeated direction
+  reversals over the same 4-second window used by the correction-trend check, even when the net
+  deviation is near zero.
+- `sink_rate_mps`/`bank_deg` in `trajectory_deviations`, and `roll_deg` in `datums`: contextual
+  telemetry, scored only through the dedicated Cut above.
 - `trajectory_deviations`: a continuous GS/lineup series computed from groove entry to touchdown
   (additive JSON field alongside `gate_deviations`), and used as a second, continuous source of
   amplitude for `PassGrade` next to the three point-in-time gates (`PROJECT-DERIVED`; see
-  `docs/GRADING_REFERENCE.md`).
+  `AGENTS.md`).
 - A correction-trend check on that same trajectory: a pass whose GS/lineup deviation is still
   measurably worsening in the final 4 seconds before touchdown is capped at `(OK)` instead of
   `Ok`, matching NATOPS' own OK ("reasonable deviations with good corrections") vs (OK) ("fair —
   reasonable deviations") distinction. Never used to raise a grade amplitude placed lower, and
   never checked once a pass is already below `Ok` (`PROJECT-DERIVED`; see
-  `docs/GRADING_REFERENCE.md`, "Correction trend").
+  `AGENTS.md`, "Gates, outcomes et câble").
 - A late-approach severity check: a moderate GS/lineup deviation (above `LATE_WINDOW_GS_DEG`/
   `LATE_WINDOW_LU_DEG`, between the general slight/significant thresholds) found inside the last
   150 m before the ramp caps an otherwise-`Ok`/`(OK)` pass at `--` instead, since there is no
   distance left to correct it there. The identical deviation earlier in the approach is graded
   normally. Never raises a grade, never affects an already-`NoGrade`/`Cut` result, never touches
-  Cut itself (`PROJECT-DERIVED`; see `docs/GRADING_REFERENCE.md`, "Late-approach weighting").
+  Cut itself (`PROJECT-DERIVED`; see `AGENTS.md`, "Gates, outcomes et câble").
 - `wind_heading_deg`/`wind_speed_mps`: contextual wind at the carrier's position, in the JSON
   report for every recovery (previously queried only for the Discord embed, and not persisted).
   Never affects `pass_grade`/`grade_points`; absent in `--positions-only`.
@@ -33,7 +66,7 @@ This file records user-visible changes. The crate version remains `0.2.0`; chang
   during carrier ops) and mixed sideslip/crab into a single always-positive value. New additive
   `wind_reference_established` field records whether the correction applied; falls back to the raw
   approximation, never a fabricated value, when it did not (`PROJECT-DERIVED`; see
-  `docs/GRADING_REFERENCE.md`, "AoA"). Still chart/report context only, never scored.
+  `AGENTS.md`, "Gates, outcomes et câble"). Still chart/report context only, never scored.
 - `lso.exe cadence-ab`: an offline diagnostic that replays already-recorded JSON reports'
   `datums` with an artificially reduced pre-groove sampling cadence and compares the resulting
   gates/trajectory/grade to the full cadence actually recorded, over a file or a directory
@@ -82,6 +115,19 @@ This file records user-visible changes. The crate version remains `0.2.0`; chang
 
 ### Fixed
 
+- `wire_estimated` could diverge from the diagnostic `wire_estimation` when the `Land` event
+  correlation raced ahead of the positional wire-crossing update that produced the same value;
+  `cable_estimated` is now always reconciled once, in `Track::finish()`, against the full
+  wire-crossing history.
+- `trajectory_deviations`' `atan2`-based GS/lineup angles could explode as the remaining distance
+  to the deck approached zero: samples below `TRAJECTORY_MIN_DISTANCE_M = 3 m` are no longer pushed
+  at all, and below `NEAR_TOUCHDOWN_ANGLE_REFERENCE_M = 75 m` the angle is computed against that
+  fixed reference distance instead of the shrinking true distance — an ordinary few-decimetre
+  flare/reference offset near the ramp no longer manufactures a many-degree deviation, while a real,
+  larger offset still degrades the grade or trips the Cut as before.
+- A go-around that overflew the deck well above deck level was classified `Bolter` instead of
+  `WaveoffUnknown`; `crossed_deck_threshold` now also requires the aircraft to be near deck level
+  (`DECK_CROSSING_ALT_CAP_FT = 50 ft`) at the moment of crossing.
 - Event-stream errors and clean closure no longer become positional `telemetry_gap`; existing gates
   remain intact while outcome availability is assessed separately.
 - Plane/carrier respawns with a changed ID abort every stale same-name task within the current
@@ -117,6 +163,21 @@ This file records user-visible changes. The crate version remains `0.2.0`; chang
   a legacy-inline A/B switch; per-RPC and loop/tick latency percentiles; live telemetry health.
 - Schema-v3 report evidence for hook freshness, component versions, grading availability and
   continuous wire-plane crossings; additive SQLite migration version 5.
+- Recovery-monitor tasks for respawned units replace stale tasks instead of accumulating duplicate
+  recordings after mission changes.
+- Recording ends when a plane exits the 3.5 nm / 1,100 ft pattern envelope, preventing indefinite
+  ACMI capture after a missed approach or mission change.
+- Carrier-position smoothing reduces periodic sawtooth artifacts in final-approach charts and gate
+  measurements.
+- CATOBAR charts select the latest continuous inbound branch, preventing earlier overhead-pattern
+  points from joining the real final as a false vertical drop.
+- F-14B(U) identification and trap-sheet naming.
+- Gate brackets use only their actual endpoint interval and can recover from an isolated degraded
+  sample without crossing a real cut; frozen DCS timestamps now age and trip the watchdog.
+- Pattern-only gaps no longer invalidate the scored groove, while gate/groove gaps remain blocking.
+- Fragmented CATOBAR grooves render as separate labelled fragments instead of disappearing or being
+  connected artificially. A late RunwayTouch transform can no longer manufacture a wire-4 crossing;
+  an estimate now requires a continuous crossing correlated within 300 ms of the event.
 
 ### Changed
 
@@ -134,8 +195,9 @@ This file records user-visible changes. The crate version remains `0.2.0`; chang
   grading are unaffected, only the pattern/break portion of the report shrinks.
 - DCS-gRPC client stubs are aligned with the sibling `0.10.0` server checkout while its commit is
   unpublished; release packaging must replace the local path with a reviewed immutable remote pin.
-- The former automatic wire-3/groove-time `_OK_` rule is disabled. `_OK_` is reserved for an
-  explicit official/manual grade; incomplete passes and touch-and-go outcomes receive no points.
+- The original MOOSE-style automatic `_OK_` rule (wire-3 plus a 15-18.99 s groove-time window) was
+  disabled; `_OK_` was reserved for an explicit official/manual grade for a time. A different,
+  wire-independent automatic `_OK_` rule was later added — see "Added" above.
 - PNG rendering and SQLite work run outside latency-sensitive sampling tasks. Atomic artifact names
   include session/generation/unit identity and database inserts are idempotent.
 - The HTTP dashboard now binds to `127.0.0.1` and returns HTTP 500 on database failure.
@@ -152,30 +214,12 @@ This file records user-visible changes. The crate version remains `0.2.0`; chang
 - F/A-18C CQ touch-and-go recognition now requires stable, timestamped pre-touch hook evidence;
   uncalibrated modules remain unknown. Technical unavailability is separate from pilot performance.
 
-### Fixed
-
-- Recovery-monitor tasks for respawned units replace stale tasks instead of accumulating duplicate
-  recordings after mission changes.
-- Recording ends when a plane exits the 3.5 nm / 1,100 ft pattern envelope, preventing indefinite
-  ACMI capture after a missed approach or mission change.
-- Carrier-position smoothing reduces periodic sawtooth artifacts in final-approach charts and gate
-  measurements.
-- CATOBAR charts select the latest continuous inbound branch, preventing earlier overhead-pattern
-  points from joining the real final as a false vertical drop.
-- F-14B(U) identification and trap-sheet naming.
-- Gate brackets use only their actual endpoint interval and can recover from an isolated degraded
-  sample without crossing a real cut; frozen DCS timestamps now age and trip the watchdog.
-- Pattern-only gaps no longer invalidate the scored groove, while gate/groove gaps remain blocking.
-- Fragmented CATOBAR grooves render as separate labelled fragments instead of disappearing or being
-  connected artificially. A late RunwayTouch transform can no longer manufacture a wire-4 crossing;
-  an estimate now requires a continuous crossing correlated within 300 ms of the event.
-
 ### Security and dependencies
 
 - The lockfile was refreshed for DCS-gRPC 0.9.0 and its gRPC stack.
-- Known vulnerable transitive versions identified during the migration were updated. The recorded
-  audit result and remaining allowed maintenance warning are documented in
-  [DCS_GRPC_FORK_MIGRATION.md](docs/DCS_GRPC_FORK_MIGRATION.md).
+- Known vulnerable transitive versions identified during the migration were updated; the audit was
+  clean at that time. Current `cargo audit` allowances are tracked directly in `.cargo/audit.toml`,
+  not duplicated here since they change independently of this migration.
 
 ## 0.2.0 - 2024-11-10
 
