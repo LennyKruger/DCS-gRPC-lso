@@ -4,7 +4,7 @@ version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-axum = "0.7"
+axum = "0.8"
 backoff = { version = "0.4", features = ["tokio"] }
 clap = { version = "4.0", features = ["derive"] }
 futures-util = "0.3"
@@ -28,7 +28,7 @@ tokio = { version = "1.2", features = [
     "fs",
     "sync",
 ] }
-tonic = "0.11"
+tonic = "0.13"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 ultraviolet = { version = "0.9", features = ["f64"] }
@@ -36,8 +36,7 @@ zip = "2.2"
 
 [dependencies.stubs]
 package = "dcs-grpc-stubs"
-git = "https://github.com/DCS-gRPC/rust-server.git"
-rev = "0.8.1"
+path = "../DCS-gRPC/stubs"
 features = ["client"]
 
 [dev-dependencies]

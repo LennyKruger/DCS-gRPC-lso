@@ -34,10 +34,14 @@ build/
 coverage/
 
 # Generated analysis output
-graphify-out/
+
 
 # ACMI files
-*.acmi
 
-# conception files
-/.ignore/
+
+# custom ignore rules
+.ignore/
+modelviewer/
+trap_records/
+docs/analys-codex-justice/
+NATOPS/

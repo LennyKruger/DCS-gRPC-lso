@@ -6,7 +6,9 @@ mod draw;
 mod error;
 mod grading;
 mod lso_notation;
+mod metrics;
 mod tasks;
+mod telemetry;
 #[cfg(test)]
 mod tests;
 mod track;
@@ -36,11 +38,16 @@ struct Opts {
 #[derive(clap::Parser)]
 enum Command {
     /// Connect to DCS-gRPC to track carrier recoveries.
-    Run(commands::run::Opts),
+    Run(Box<commands::run::Opts>),
 
     /// Extract carrier recoveries from ACMI recordings (must be recordings created by the LSO;
     /// recordings directly from TacView will not work).
     File(commands::file::Opts),
+
+    /// Offline diagnostic: replay already-recorded JSON reports with an artificially reduced
+    /// pre-groove sampling cadence and compare the resulting gates/grade to the full cadence
+    /// actually recorded. Never affects live recording or the fork.
+    CadenceAb(commands::cadence_ab::Opts),
 }
 
 #[tokio::main]
@@ -62,13 +69,19 @@ async fn main() {
     let shutdown = Shutdown::new();
     let shutdown_handle = shutdown.handle();
     tokio::task::spawn(async {
-        tokio::signal::ctrl_c().await.unwrap();
-        shutdown.shutdown().await;
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => shutdown.shutdown().await,
+            Err(err) => tracing::error!(?err, "failed to install Ctrl-C handler"),
+        }
     });
 
-    match opts.command {
-        Command::Run(opts) => commands::run::execute(opts, shutdown_handle).await.unwrap(),
-        // TODO: better error report than unwrap?
-        Command::File(opts) => commands::file::execute(opts).unwrap(),
+    let result = match opts.command {
+        Command::Run(opts) => commands::run::execute(*opts, shutdown_handle).await,
+        Command::File(opts) => commands::file::execute(opts),
+        Command::CadenceAb(opts) => commands::cadence_ab::execute(opts),
+    };
+    if let Err(err) = result {
+        tracing::error!(error = %err, error_chain = ?err, "LSO terminated with an error");
+        std::process::exit(1);
     }
 }
