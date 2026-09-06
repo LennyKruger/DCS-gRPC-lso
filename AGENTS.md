@@ -17,8 +17,18 @@
 > cinquième change la précision de cette détection de roll-out elle-même sans toucher sa doctrine :
 > `is_rolled_out` compare désormais une régression linéaire sur toute la fenêtre `gate_samples`
 > plutôt que les deux seuls échantillons aux extrémités du buffer, moins sensible à un échantillon
-> isolé bruité sur un bord. Voir "Gates, outcomes et câble" plus bas pour le détail complet des
-> cinq changements, et [CHANGES.md](CHANGES.md)
+> isolé bruité sur un bord. Un sixième corrige partiellement le biais de brin confirmé le même soir
+> (voir P1 dans [tasking-roadmap.md](tasking-roadmap.md)) : `wire_estimate_at` n'accorde plus jamais
+> `confidence: "high"` sans un brin confirmé par DCS (`WIRE#` du LQM) ; l'autre moitié du biais
+> (sélection du brin lui-même, systématiquement trop haut quand l'événement DCS est en retard) a été
+> tentée via le premier contact géométrique puis abandonnée (casse le fixture `wire_4_01_FA18C`) et
+> reste ouverte. Un septième, purement diagnostique et sans impact sur la notation, instrumente la
+> référence de vent (P1, "référence de vent incohérente") : les deux réponses `GetWind` de l'entrée
+> en groove sont désormais loggées individuellement en DEBUG et exposées dans le JSON
+> (`wind_reference_probes`), et la requête `GetWind` séparée de fin de rapport logue de même sa
+> réponse — objectif : tracer, sur le prochain test live, laquelle des trois requêtes produit la
+> valeur `180°/0,0 m/s` aberrante déjà observée. Voir "Gates, outcomes et câble" plus bas pour le
+> détail complet des sept changements, et [CHANGES.md](CHANGES.md)
 > (`Unreleased`) pour la version changelog. Le commit `5f52e13` contenait par ailleurs, entre
 > autres, le raffinement CATOBAR de l'entrée en groove par confirmation de roulis/route, le
 > correctif de la désynchronisation `wire_estimated`/`wire_estimation`, le plancher de distance sous
@@ -104,13 +114,14 @@ Dernière validation locale complète au commit `5f52e13` (5 septembre 2026) :
 - `cargo fmt --check` et `cargo clippy --locked --all-targets -- -D warnings` propres ;
 - Working tree propre à ce commit (aucune modification de code en attente).
 
-Sur le working tree courant (non committé, voir en tête de document pour le détail des cinq
-changements) : `cargo test --locked --no-fail-fast` **206 réussis, 0 échec** (204 tests du binaire
+Sur le working tree courant (non committé, voir en tête de document pour le détail des sept
+changements) : `cargo test --locked --no-fail-fast` **208 réussis, 0 échec** (206 tests du binaire
 + 2 tests de provenance de build, dont 4 nouveaux tests pour les correctifs P0, 6 nouveaux tests
-pour le changement de règle 3/4 NM et 2 nouveaux tests pour la régression linéaire de
-`is_rolled_out`), `cargo fmt --check` et `cargo clippy --locked --all-targets -- -D warnings`
-propres. Rien de tout cela n'a encore été revalidé en mission live (voir
-[tasking-roadmap.md](tasking-roadmap.md)).
+pour le changement de règle 3/4 NM, 2 nouveaux tests pour la régression linéaire de
+`is_rolled_out`, 1 nouveau test pour le plafonnement de confiance `wire_estimate_at` et 1 nouveau
+test pour `wind_reference_probes`), `cargo fmt --check` et
+`cargo clippy --locked --all-targets -- -D warnings` propres. Rien de tout cela n'a encore été
+revalidé en mission live (voir [tasking-roadmap.md](tasking-roadmap.md)).
 
 Un test live CVN-72 (4×F-14 + 4×F-18 IA) a été mené le 5 septembre 2026 au soir sur ce commit et a
 confirmé l'absence de régression sur les correctifs déjà en place à ce moment-là, mais chacun des
@@ -496,6 +507,14 @@ l'historique complet des franchissements de brin, plutôt que capturé séparém
 toucher : les deux champs pouvaient diverger sur un même rapport selon que la corrélation
 événementielle du `Land` tombait avant ou après le tick positionnel ayant ajouté le franchissement
 correspondant (bug confirmé live le 5 septembre 2026, corrigé le même jour).
+`wire_estimate_at` (`src/track.rs`) ne retourne plus jamais `confidence: "high"` sans un brin
+confirmé par DCS (`WIRE#` du LQM parsé) : une fenêtre de corrélation serrée prouve seulement que le
+franchissement a été mesuré précisément, jamais que l'avion s'est réellement arrêté à ce brin, ce qui
+produisait une confiance « high » sémantiquement fausse sur un survol/bolter sans aucun accrochage
+(confirmé live 5 septembre 2026, corrigé le 6 septembre 2026). Le biais de fond distinct (brin retenu
+systématiquement trop haut quand l'événement DCS est en retard, la crosse étant entraînée
+au-delà de son brin réel par l'élongation du câble) reste non corrigé — voir
+[tasking-roadmap.md](tasking-roadmap.md), P1, pour l'analyse et la piste de décélération envisagée.
 
 V/STOL reste AV-8B/Tarawa, spot intentionnel 7.5, formule locale expérimentale décrite dans
 [VSTOL.md](VSTOL.md). Intended spot, nearest active spot et distance sont séparés. Jamais de note
@@ -511,7 +530,17 @@ fiabilité des événements DCS réels côté Tarawa — voir [tasking-roadmap.m
 AoA dans `datums`/`pattern_datums` est corrigé du vent une fois une référence de vent établie
 (deux appels `AtmosphereService.GetWind` à l'entrée du groove, interpolés par altitude), sinon
 retombe sur l'approximation brute (jamais une valeur fabriquée) ; `wind_reference_established`
-enregistre lequel des deux cas s'est produit. AoA reste affiché/loggé uniquement, jamais noté. Les
+enregistre lequel des deux cas s'est produit. Purement diagnostique (6 septembre 2026, ajouté suite à
+une incohérence confirmée live — voir [tasking-roadmap.md](tasking-roadmap.md), P1) : les deux
+réponses brutes de ces appels sont désormais loggées individuellement en DEBUG (`probe = "high"/
+"low"`, avant toute agrégation) et exposées dans le JSON sous `wind_reference_probes` (`altitude`/
+`heading_deg`/`speed_mps` de chacune) quand la référence a été établie ; l'appel `GetWind` séparé fait
+au moment de la finalisation du rapport (`wind_heading_deg`/`wind_speed_mps`, indépendant de la
+référence AoA) logue de même sa réponse en DEBUG désormais. Rien de tout cela ne change la logique de
+correction elle-même ni n'introduit de nouveau seuil — objectif unique : donner, sur le prochain test
+live, la preuve nécessaire pour savoir laquelle des trois requêtes (haute altitude, basse altitude, ou
+requête de rapport) produit la valeur `180°/0,0 m/s` aberrante déjà observée sur 2 rapports/8. AoA
+reste affiché/loggé uniquement, jamais noté. Les
 tables `aoa_rating` par type (`src/data.rs`) viennent de documentation publique : bracket indexeur
 VRS pour le F/A-18C, manuel Heatblur pour le F-14 (conversion `degrees=((units/1.0989)-3.01)`),
 DisplayElectronicsUnit décompilé pour le VNAO T-45 v1.0.2 — ces tables classent la valeur AoA déjà
@@ -760,7 +789,10 @@ sink-rate/bank — voir "Gates, outcomes et câble") ; diagnostics possibles
 `unavailable_event_outcome` ; `groove_time_secs` (ajout du 5 septembre 2026) sérialise désormais
 dans le JSON la donnée déjà utilisée pour `_OK_` automatique, auparavant calculée mais visible
 seulement dans l'embed Discord — un rapport live sans Discord configuré ne permettait alors aucune
-vérification a posteriori de l'éligibilité `_OK_`.
+vérification a posteriori de l'éligibilité `_OK_`. `wind_reference_probes` (ajout du 6 septembre
+2026, absent si la référence de vent n'a jamais été établie) : les deux réponses brutes
+`GetWind` (altitude/heading/speed) derrière `wind_reference_established`, purement diagnostique — voir
+"Gates, outcomes et câble" ci-dessus.
 
 SQLite utilise le vocabulaire snake_case du JSON. L'absence d'un nouveau champ signifie
 legacy/unknown, jamais favorable. `points_awarded` (`src/db.rs`, booléen) distingue explicitement

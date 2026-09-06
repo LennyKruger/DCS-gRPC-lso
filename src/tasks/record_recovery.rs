@@ -80,6 +80,12 @@ struct RecoveryReport<'a> {
     /// `pattern_datums` (see docs/GRADING_REFERENCE.md, "AoA"). `false` means every recorded
     /// `aoa` value is the raw, wind-uncorrected geometric approximation for this recovery.
     wind_reference_established: bool,
+    /// Raw `GetWind` probes behind `wind_reference_established`, kept for live diagnosis of a
+    /// confirmed anomaly (two reports out of eight reading `180deg/0.0 m/s` against a consistent
+    /// `95deg/0.99-1.42 m/s` on the other six, same ship/mission/timeframe) — see
+    /// `tasking-roadmap.md`. Never used for grading.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wind_reference_probes: Option<crate::track::WindReferenceProbes>,
     datums: &'a [Datum],
     /// In-mission date/time from the DCS scenario clock (ISO-8601).
     #[serde(skip_serializing_if = "str::is_empty")]
@@ -351,9 +357,22 @@ fn completeness_cause(completeness: crate::track::Completeness) -> &'static str 
     fields(carrier_name = params.carrier_name, plane_name = params.plane_name)
 )]
 pub async fn record_recovery(params: TaskParams<'_>) -> Result<(), crate::error::Error> {
+    let recording_started = Instant::now();
     let _recovery_guard = crate::metrics::RUNTIME_METRICS.recovery();
     let _priority_guard = PriorityCollectorGuard::new(&params);
     tracing::debug!("started recording");
+    if params.suspend_detectors_during_recovery {
+        let concurrent = params.active_priority_planes.active_count();
+        if concurrent > 1 {
+            // Never observed live before (tasking-roadmap.md, "Robustesse multi-recoveries
+            // simultanées"): two or more aircraft are being recorded at the same instant,
+            // possibly on different carriers -- this pass is not tracked in isolation.
+            tracing::info!(
+                concurrent_recoveries = concurrent,
+                "recovery overlap: another aircraft is already being recorded"
+            );
+        }
+    }
 
     // Identity was resolved against the occupied network slot when the task was
     // created. Re-resolving by display name here would mix homonyms or a pilot
@@ -705,16 +724,44 @@ pub async fn record_recovery(params: TaskParams<'_>) -> Result<(), crate::error:
                     {
                         wind_reference_queried = true;
                         let mut atmo = crate::client::AtmosphereClient::new(params.ch.clone());
-                        match (
-                            atmo.get_wind(plane.lat, plane.lon, plane.alt).await,
-                            atmo.get_wind(plane.lat, plane.lon, carrier.alt).await,
-                        ) {
+                        // Logged individually, on both success and failure, so a live anomaly
+                        // (`AGENTS.md`/`tasking-roadmap.md`: two reports out of eight reading
+                        // `180deg/0.0 m/s` against a consistent `95deg/0.99-1.42 m/s` on the other
+                        // six) can be traced to a specific probe rather than only the combined
+                        // outcome below.
+                        let high = atmo.get_wind(plane.lat, plane.lon, plane.alt).await;
+                        tracing::debug!(
+                            probe = "high",
+                            alt_m = plane.alt,
+                            result = ?high,
+                            "wind reference probe for AoA correction"
+                        );
+                        let low = atmo.get_wind(plane.lat, plane.lon, carrier.alt).await;
+                        tracing::debug!(
+                            probe = "low",
+                            alt_m = carrier.alt,
+                            result = ?low,
+                            "wind reference probe for AoA correction"
+                        );
+                        match (high, low) {
                             (Ok((high_dir, high_speed)), Ok((low_dir, low_speed))) => {
                                 datums.set_wind_reference(
                                     plane.alt,
                                     crate::track::wind_velocity_vector(high_dir, high_speed),
                                     carrier.alt,
                                     crate::track::wind_velocity_vector(low_dir, low_speed),
+                                );
+                                datums.set_wind_reference_probes(
+                                    crate::track::WindProbe {
+                                        alt_m: plane.alt,
+                                        heading_deg: high_dir,
+                                        speed_mps: high_speed,
+                                    },
+                                    crate::track::WindProbe {
+                                        alt_m: carrier.alt,
+                                        heading_deg: low_dir,
+                                        speed_mps: low_speed,
+                                    },
                                 );
                             }
                             (high, low) => {
@@ -993,7 +1040,15 @@ pub async fn record_recovery(params: TaskParams<'_>) -> Result<(), crate::error:
     // If the plane was never below 100 m MSL, discard as a non-attempt.
     // Waveoffs and bolters still pass this check since they require being in the groove.
     if lowest_altitude > 100.0 {
-        tracing::debug!("discard as plane was never below 100m MSL");
+        // Promoted from DEBUG to INFO (tasking-roadmap.md P2, "tentatives d'approche avorties
+        // avant le groove, invisibles hors logs DEBUG"): this is the abandon path a false-start
+        // detection takes, and its cost (open stream time, hook sampler start/stop) was only
+        // visible in DEBUG before.
+        tracing::info!(
+            elapsed_secs = recording_started.elapsed().as_secs_f64(),
+            lowest_altitude_m = lowest_altitude,
+            "discard as plane was never below 100m MSL"
+        );
         return Ok(());
     }
 
@@ -1023,7 +1078,13 @@ pub async fn record_recovery(params: TaskParams<'_>) -> Result<(), crate::error:
     // Discard if no recognisable outcome was established (e.g. plane flew through the zone
     // without ever entering the groove).
     if track.grading == Grading::Unknown {
-        tracing::debug!("discard: no recovery outcome (Unknown grading)");
+        // Same rationale as the 100m-MSL discard above: this is a false-start abandon, promoted
+        // to INFO for the same reason (tasking-roadmap.md P2).
+        tracing::info!(
+            elapsed_secs = recording_started.elapsed().as_secs_f64(),
+            lowest_altitude_m = lowest_altitude,
+            "discard: no recovery outcome (Unknown grading)"
+        );
         return Ok(());
     }
 
@@ -1174,7 +1235,15 @@ pub async fn record_recovery(params: TaskParams<'_>) -> Result<(), crate::error:
             .get_wind(last_carrier_lat, last_carrier_lon, last_carrier_alt)
             .await
         {
-            Ok(w) => Some(w),
+            Ok(w) => {
+                tracing::debug!(
+                    heading_deg = w.0,
+                    speed_mps = w.1,
+                    alt_m = last_carrier_alt,
+                    "report-time wind query at carrier position"
+                );
+                Some(w)
+            }
             Err(err) => {
                 tracing::warn!(?err, "failed to query wind at carrier position");
                 None
@@ -1218,6 +1287,7 @@ pub async fn record_recovery(params: TaskParams<'_>) -> Result<(), crate::error:
         wind_heading_deg: wind_mps.map(|(heading, _)| heading),
         wind_speed_mps: wind_mps.map(|(_, speed)| speed),
         wind_reference_established: track.wind_reference_established,
+        wind_reference_probes: track.wind_reference_probes,
         datums: &track.datums,
         mission_datetime: &mission_datetime,
         recording_started_at: &recovery_timestamp,
@@ -1496,7 +1566,7 @@ pub async fn record_recovery(params: TaskParams<'_>) -> Result<(), crate::error:
                     {
                         let fmt = |g: Option<&crate::track::GateDatum>| match g {
                             Some(d) => {
-                                format!("{:+.0}ft / {:+.0}ft", d.gs_deviation_ft, d.lineup_ft)
+                                format!("{:+.1}° / {:+.1}°", d.gs_deviation_deg, d.lineup_deg)
                             }
                             None => "-".to_string(),
                         };
@@ -1510,16 +1580,20 @@ pub async fn record_recovery(params: TaskParams<'_>) -> Result<(), crate::error:
                     false,
                 );
 
-            if track.telemetry_quality.completeness != crate::track::Completeness::Complete {
-                embed = embed.field(
-                    "Technical status",
+            // Succinct, transparent explanation of the grade -- or, when grading itself was
+            // unavailable, why (that takes priority: `grade_reason` still describes whatever
+            // amplitude/etc. rule the code path reached internally, but `pass_grade` was
+            // overridden to `Incomplete` regardless, so showing it here would be misleading).
+            let why_this_grade =
+                if track.telemetry_quality.completeness != crate::track::Completeness::Complete {
                     format!(
                         "Grading unavailable: {:?}. This is a measurement limitation, not a pilot failure.",
                         track.telemetry_quality.completeness
-                    ),
-                    false,
-                );
-            }
+                    )
+                } else {
+                    track.grade_reason.clone()
+                };
+            embed = embed.field("Why This Grade", why_this_grade, false);
 
             if track.carrier_info.is_vstol() {
                 if let (Some(spot_grade), Some(distance_m)) =
@@ -1538,12 +1612,23 @@ pub async fn record_recovery(params: TaskParams<'_>) -> Result<(), crate::error:
                 }
             }
 
-            // LSO notation and plain-English notes from DCS grading string.
+            // LSO notation and plain-English notes from DCS grading string. DCS never emits this
+            // for a touch-and-go (only for an arrested pass), so fall back to a plain-language
+            // summary of our own measured deviations -- explicitly labelled as such, never
+            // presented as a DCS/NATOPS comment (see `describe_measured_deviations`, src/grading.rs).
             if let Some(ref notation) = track.dcs_grading {
                 embed = embed.field("LSO Notation", notation.as_str(), false);
                 let notes = crate::lso_notation::to_english(notation);
                 if !notes.is_empty() {
                     embed = embed.field("LSO Notes", notes, false);
+                }
+            } else {
+                let notes = crate::grading::describe_measured_deviations(
+                    &track.gate_deviations,
+                    &track.trajectory_deviations,
+                );
+                if !notes.is_empty() {
+                    embed = embed.field("LSO Notes (measured by LSO, not a DCS comment)", notes, false);
                 }
             }
 

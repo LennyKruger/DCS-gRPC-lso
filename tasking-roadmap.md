@@ -16,37 +16,113 @@
 > deux points), tous implémentés et testés unitairement le 6 septembre 2026 (working tree non
 > committé au moment de cette mise à jour — voir
 > [AGENTS.md](AGENTS.md) en tête de document).
+>
+> Mise à jour du 6 septembre 2026 (après-midi) : troisième test live CVN-72, entièrement IA cette
+> fois (4×F-14B(U) + 4×F/A-18C, vent 5 nds/360° vrai), 8 recoveries capturées avant arrêt volontaire
+> du test (dossier `test-runs/20260906T123251Z-cvn72-8ai-wind360-5kt/`, commit de ce document
+> dirty). Journalisation DEBUG/TRACE enrichie pour l'occasion (décision `wire_estimate_at`,
+> éligibilité porte 3/4 NM, résumé timing groove/toucher, check roll-out, refus `Bolter`/`GRADE:WO`,
+> compteur de recoveries concurrentes, abandons de détection promus INFO) — `cargo test` (208),
+> `cargo fmt --check`, `cargo clippy -D warnings` propres avant le test, working tree toujours non
+> committé. Apporte des preuves nouvelles sur six points ci-dessous (vent, estimation de brin, temps
+> de groove, écart latéral constant, chevauchement multi-recoveries, faux départs/`hook_history_truncated`)
+> et une reconfirmation d'un point opérationnel déjà documenté (foul deck suspecté, `WOFDIC`).
+>
+> Mise à jour du 6 septembre 2026 (fin d'après-midi) : 4 passes humaines supplémentaires (pilote
+> `Justice`, 3 touch-and-go + 1 arrestation, code/commit identique au test IA du même après-midi,
+> dossier `.ignore/json-human-test/Justice-20260906/`, hors dépôt Git). Deux apports majeurs : (1)
+> confirmation live que le code actuel peut produire `(OK)` (une des 4 passes) — répond à la question
+> ouverte plus haut ; (2) le signe du lineup à 1/4 NM diffère d'une passe à l'autre pour ce même
+> pilote/navire, ce qui affaiblit l'hypothèse d'un bug géométrique partagé (`deck_angle`) évoquée pour
+> expliquer le biais unanime du test IA. Révèle aussi un nouveau problème, promu P0 : une dégradation
+> sévère du cadencement position sur cette session précise (absente du test IA de la veille sur le
+> même commit) a fait perdre sa note à un trap réellement accroché (`TelemetryGap`).
 
 ## À faire en priorité (P0)
 
-Aucun point P0 ouvert. Les trois bugs de classification confirmés lors du test live CVN-72 du 5
-septembre 2026 (soir, pilotes humains) ont été corrigés le 6 septembre 2026 — `cargo test`
-(200 réussis, 0 échec, dont 4 nouveaux tests dédiés), `cargo fmt --check` et
-`cargo clippy --locked --all-targets -- -D warnings` propres ; voir [CHANGES.md](CHANGES.md)
-(`Unreleased`) pour le détail de chaque correctif et [AGENTS.md](AGENTS.md), "Gates, outcomes et
-câble", pour l'état factuel courant. Aucun des trois n'a encore de preuve DCS live confirmant
-l'absence d'effet de bord — voir les trois entrées correspondantes dans "Décisions encore ouvertes"
-ci-dessous.
+- **Dégradation sévère et systémique du cadencement position pendant le test humain du 6 septembre
+  après-midi (`Justice-20260906`, 4 passes, code/commit actuel, `--position-source buffered`) —
+  a coûté sa note à un trap réel confirmé par DCS.** Sur les 4 rapports (mêmes session/génération/
+  porte-avions, ~11 minutes), `position_poll_p95_latency_ms` vaut 857-880 ms et
+  `position_poll_p99_latency_ms` 911-922 ms **sur les 4 passes sans exception**, `gap_p50_ms` autour
+  de 180-200 ms (cible 20 Hz = 50 ms), et `position_poll_max_latency_ms` frôle ou dépasse 1000 ms sur
+  chacune (969, 934, 943, **1000** ms). C'est très au-dessus de ce qu'un test IA sur le même commit,
+  la veille (6 septembre, mêmes seuils de contrat), avait mesuré (`max_sample_gap_ms` ~120-160 ms,
+  `gap_p99_ms` ~120 ms) — la dégradation n'est donc pas un trait normal du build, mais propre à cette
+  session précise (machine/charge différente ? DCS piloté en client sur la même machine que le
+  serveur, contrairement au test IA ?). Conséquence concrète : sur 2 des 4 passes (la 1ʳᵉ et la
+  **4ᵉ, un poser réellement accroché brin 3 confirmé par le LQM DCS**), un échantillon a dépassé le
+  seuil dur de 1000 ms *à l'intérieur du segment noté*, déclenchant `TelemetryGap` /
+  `grading_availability: unavailable_technical` — message pilote Discord "Grading unavailable:
+  TelemetryGap. This is a measurement limitation, not a pilot failure." Comportement conforme au
+  contrat de télémétrie (voir AGENTS.md, "Contrat de télémétrie" : jamais inventer un point sous un
+  gap >1 000 ms), donc **pas un bug de règle de notation** — mais l'obtention réelle de ce gap coûte
+  la note d'un vrai trap, ce qui en fait une régression de disponibilité prioritaire à instrumenter.
+  Signal corroborant déjà noté en P2 ci-dessous : `recovery_telemetry.overflow_count` vaut 2962/2661
+  sur ces deux rapports (`snapshots_received - 600` exactement, `high_water_mark` à 600/600,
+  `lost_snapshots: 0`) — le ring source ne perd rien côté DCS-gRPC, ce qui pointe le doigt vers le
+  **consommateur LSO** (boucle de lecture par lots `after_sequence`, ou contention Tokio/CPU sur la
+  machine de ce test) plutôt que vers le fork ou le réseau. **Topologie confirmée par l'utilisateur
+  (6 septembre 2026)** : `lso.exe` tournait sur le serveur DCS dédié lui-même (boucle locale
+  `127.0.0.1:50051`, comme pour le test IA de la veille) ; le client de Justice était sur un poste
+  distinct, connecté au serveur par le réseau. Le canal gRPC `lso.exe`↔serveur était donc en boucle
+  locale dans les deux tests (IA et humain) — **le réseau client DCS↔serveur est hors de cause pour
+  ce canal**, ce qui élimine une piste et recentre l'hypothèse sur une charge serveur dédié plus
+  lourde avec un vrai client humain connecté (plus de trafic réseau/état à répliquer côté DCS
+  qu'avec des IA seules) qu'avec le test IA de la veille, faisant concourir `lso.exe` pour du CPU sur
+  la même machine. **À faire en priorité** : rejouer un test humain équivalent avec `-vv` actif
+  (RPC/tick-lag/queue_high_watermark loggés côté LSO) et, si possible, une mesure de charge CPU/
+  réseau du serveur dédié pendant la session, pour confirmer que la contention vient bien du serveur
+  DCS lui-même sous charge client humaine plutôt que de `lso.exe`.
 
 ## P1 — bugs confirmés à corriger, décisions à prendre
 
-- **Estimation Rust du brin systématiquement décalée par rapport à l'événement DCS.** Précédemment
-  listé ici comme « possible biais de -1 brin » sur 2 échantillons (F14-4-1, F18-2-1) — le test du 5
-  septembre soir apporte un 3e cas et un **mécanisme identifié** : sur le rapport où Rust (brin 4,
-  confiance `medium`) diverge de DCS (brin 1), le `runway_touch` DCS arrive après les 4
-  franchissements géométriques successifs ; l'estimateur (`continuous_hook_plane_crossing`) retient
-  le **dernier brin franchi avant l'événement DCS**, donc systématiquement le plus haut numéroté
-  quand l'événement DCS est en retard — cohérent avec un biais dans le même sens sur les 2 cas
-  précédents. Deux traps du même test montrent par ailleurs `wire_crossing_not_time_correlated_with_
-  event` (aucune estimation) quand le `runway_touch` arrive plus d'1 s après le franchissement
-  géométrique, et deux survols/bolters sans accrochage produisent une estimation « high » sémantique-
-  ment fausse (non exposée au pilote, `wire_primary: dcs_lqm` fonctionne correctement dans tous les
-  cas observés). Probablement aggravé par l'offset vertical de crosse F-14 (voir "Décisions encore
-  ouvertes" ci-dessous, corrigé le 6 septembre 2026 mais non revalidé en mission live). Piste :
-  corréler non pas sur l'horodatage de l'événement DCS mais sur le début de la décélération
-  (`touchdown_horizontal_speed_mps`) ou le premier contact géométrique, et ne jamais produire de
-  confiance « high » sans preuve d'arrêt. À rejouer avec `cadence-ab` une fois l'offset corrigé pour
-  voir si le biais de -1 brin disparaît.
+- **Estimation Rust du brin systématiquement décalée par rapport à l'événement DCS — partiellement
+  corrigé le 6 septembre 2026, la sélection du brin reste ouverte.** Précédemment listé ici comme
+  « possible biais de -1 brin » sur 2 échantillons (F14-4-1, F18-2-1) — le test du 5 septembre soir a
+  apporté un 3e cas et un **mécanisme identifié** : sur le rapport où Rust (brin 4, confiance
+  `medium`) diverge de DCS (brin 1), le `runway_touch` DCS arrive après les 4 franchissements
+  géométriques successifs ; l'estimateur (`continuous_hook_plane_crossing`) retient le **dernier brin
+  franchi avant l'événement DCS**, donc systématiquement le plus haut numéroté quand l'événement DCS
+  est en retard. Deux pistes avaient été envisagées : corréler sur le début de la décélération
+  (`touchdown_horizontal_speed_mps`) ou sur le premier contact géométrique, et ne jamais produire de
+  confiance « high » sans preuve d'arrêt. **Seule la seconde moitié est faite** :
+  `wire_estimate_at` (`src/track.rs`) exige désormais un brin confirmé par DCS (`WIRE#` du LQM) pour
+  retourner `confidence: "high"` ; sans confirmation, la confiance plafonne à `"medium"`, même avec
+  des fenêtres de corrélation serrées — corrige directement le cas confirmé où un survol/bolter sans
+  aucun accrochage produisait une estimation « high » sémantiquement fausse. **La première moitié a
+  été tentée puis abandonnée** : corréler sur `first_hook_ground_contact_time` (premier contact
+  géométrique) au lieu de l'événement DCS casse le test de fixture `wire_4_01_FA18C` (un trap franc
+  sans rebond) — la crosse y franchit géométriquement les brins 1 à 3 alors que l'avion est encore en
+  l'air en courte finale, avant le contact réel proche du brin 4 ; figer l'évidence au premier contact
+  géométrique aurait donc écarté à tort le franchissement du brin 4, réellement accroché. Le biais
+  confirmé en vol reste donc entier : distinguer « encore en l'air, survole les seuils de brin » de
+  « déjà accroché, entraîné au-delà par l'élongation du câble » demande une vraie détection de
+  décélération (piste `touchdown_horizontal_speed_mps` toujours ouverte), pas un simple seuil de
+  premier contact. Probablement aggravé par l'offset vertical de crosse F-14 (voir "Décisions encore
+  ouvertes" ci-dessous, corrigé le 6 septembre 2026 mais non revalidé en mission live). À rejouer avec
+  `cadence-ab` une fois une piste de décélération implémentée pour voir si le biais de -1 brin
+  disparaît.
+
+  **Mise à jour 6 septembre après-midi (test IA, 6 arrests)** : divergence Rust/DCS observée sur 3
+  estimations sur 5 nommées (F14-2-1 DCS 4/Rust 3 confiance `medium` ; F/A-18C-2-1 DCS 4/Rust 3
+  confiance `high` ; F/A-18C-1-1 DCS 1/Rust 2 confiance `high`) ; concordantes sur les 2 autres
+  (F14-3-1 3/3, F14-4-1 1/1, toutes deux `high`) ; une sixième estimation reste `insufficient` (aucune
+  franchissement fraîche corrélée). Deux apports : (1) **le biais n'est pas systématiquement "Rust
+  trop haut"** comme formulé jusqu'ici — ce corpus montre les deux sens (2× Rust en dessous de DCS,
+  1× Rust au-dessus), à nuancer dans la piste de décélération à venir. (2) **Nouveau mode de
+  confiance "high" trompeuse, distinct de celui déjà corrigé** : le correctif du 6 septembre matin
+  empêche `"high"` quand *aucun* brin n'est confirmé par DCS (survol/bolter) ; mais ici DCS confirme
+  bel et bien *un* brin (arrêt réel), et pourtant 2 des 3 divergences ci-dessus (F/A-18C-2-1,
+  F/A-18C-1-1) affichent quand même `confidence: "high"` sur le brin *erroné* nommé par Rust, parce
+  que `"high"` ne vérifie que le respect des fenêtres de corrélation serrées et la présence d'un
+  arrêt confirmé quelque part dans la passe — jamais que le brin nommé par Rust coïncide avec celui
+  confirmé par DCS. Un consommateur du rapport lisant `confidence: "high"` peut donc toujours se fier
+  à un numéro de brin faux dans ce cas précis, exactement le type de confiance sémantiquement fausse
+  que le correctif du 6 septembre matin visait à éliminer, via un chemin différent (arrêt confirmé
+  mais brin erroné, plutôt qu'arrêt non confirmé). Décision à prendre avec l'utilisateur : plafonner
+  `"high"` à `"medium"` quand un `dcs_wire` est connu et diffère du brin estimé (comparaison directe,
+  pas seulement présence d'un arrêt), plutôt que d'ajouter un correctif unilatéral.
 - **`baseline_manifest` sérialisé entièrement `null` dans le JSON malgré un manifeste valide fourni
   au démarrage.** Le manifeste (6 clés, aucune erreur de validation) est accepté puis perdu entre
   `run.rs` et `RecoveryReport`, ou le champ du rapport est alimenté depuis une source jamais remplie.
@@ -54,15 +130,30 @@ ci-dessous.
   aussi : un manifeste chargé une fois au démarrage ne peut pas suivre un changement de mission en
   cours de session (observé le 5 septembre : `_A` → `_B` après coup) — envisager d'horodater la
   lecture du manifeste dans le JSON, ou de le recharger à chaque nouvelle session DCS.
-- **Référence de vent incohérente : `180°/0,0 m/s` sur 2 rapports sur 8**, contre `95°/0,99-1,42 m/s`
-  cohérent sur les 6 autres (même navire, même mission, à quelques minutes d'écart). Remplace/précise
-  l'ancien point P2 « vent nul non exercé en test » : le vent réel **a bien été exercé** cette fois,
-  et la mécanique révèle une anomalie plutôt qu'une simple absence de couverture de test — `180/0`
-  ressemble à une valeur par défaut ou à un `GetWind` ayant renvoyé un vecteur nul sans faire
-  retomber `wind_reference_established` à `false`. Conséquence : l'AoA corrigée retombe silencieuse-
-  ment sur l'approximation brute. À investiguer côté séquence des deux appels
-  `AtmosphereService.GetWind`/interpolation par altitude (`src/track.rs`) : un des deux appels a-t-il
-  échoué silencieusement ?
+- **Référence de vent incohérente : `180°/0,0 m/s` intermittent — cause désormais fortement
+  circonscrite (6 septembre 2026, après-midi, test IA 8 recoveries, vent mission 5 nds/360° vrai).**
+  Grâce à l'instrumentation `wind_reference_probes` ajoutée le 6 septembre matin, les trois requêtes
+  `GetWind` de chaque rapport sont maintenant comparables individuellement sur ce corpus : la probe
+  **haute altitude** (~103-113 m, altitude avion) renvoie la valeur cohérente (`0°/4,26-4,34 m/s`) sur
+  **8 rapports sur 8, sans exception** ; la probe **basse altitude** (~0 m, niveau du pont — utilisée
+  pour l'interpolation AoA) est aberrante (`180°/0,0`) sur **5 rapports sur 8** ; la requête
+  **séparée de fin de rapport** (position du navire, également quasi niveau mer) est aberrante sur
+  **2 rapports sur 8** — et ces deux sous-ensembles ne se recoupent pas systématiquement (un rapport
+  a une probe basse bonne mais une requête de fin de rapport aberrante, et inversement). La
+  corrélation nette est donc **avec l'altitude de la requête, pas avec laquelle des trois elle est** :
+  toute requête `GetWind` à une altitude quasi nulle (mer/pont) est intermittemment peu fiable (7
+  occurrences aberrantes sur 16 requêtes near-zero-altitude ce test), tandis qu'une requête à
+  l'altitude de vol reste fiable à 100 %. `wind_reference_established` reste `true` dans tous les cas
+  aberrants observés : le RPC répond `Ok` avec `180°/0,0` sans jamais faire échouer l'appel, donc
+  bien une incohérence côté DCS/DCS-gRPC quant au vent près du pont, pas un échec réseau ni un bug de
+  notre propagation `Result`. **Reste à faire** : (1) confirmer cette corrélation altitude sur un
+  corpus supplémentaire (celui-ci n'a que 3 altitudes distinctes réellement testées : ~0 m navire/
+  pont deux façons différentes, et ~110 m avion — jamais une altitude intermédiaire) ; (2) décider
+  avec l'utilisateur si un garde-fou de plausibilité (ex. rejeter `heading == 180 && speed == 0,0`,
+  ou ne pas interroger à une altitude sous un plancher et réutiliser la probe haute) doit être ajouté
+  — décision de conception, pas un correctif à appliquer unilatéralement ; (3) si possible, isoler
+  côté DCS-gRPC/mission (hors périmètre de ce dépôt) pourquoi `GetWind` dégrade près du niveau de la
+  mer.
 - **Fenêtre de temps de groove `_OK_` (15-18 s NATOPS) jamais atteinte par un pilote humain sur ce
   test** : `groove_time_secs` mesuré à 19,8 / 20,3 / 22,4 / 23,0 / 26,1 s sur les 5 passes où il est
   connu, y compris sur le F-14 le plus rapide (138 kt, 19,8 s). Le temps est compté depuis le
@@ -75,7 +166,15 @@ ci-dessous.
   insuffisante (5 échantillons, tous IA de la veille exclus, aucun repère de niveau de pilotage) pour
   trancher entre ces trois causes. Le signal reste cohérent et pousse à traiter cette question avant
   toute promotion de `_OK_` comme fiable en usage humain, mais sans présumer aujourd'hui laquelle des
-  trois explications est la bonne.
+  trois explications est la bonne. **Mise à jour 6 septembre après-midi, corpus 100 % IA** : les 6
+  passes accrochées du test IA mesurent `groove_time_secs` entre 19,5 et 22,2 s (F-14 : 20,3-21,1 s ;
+  F/A-18C : 19,5-22,2 s) — à nouveau jamais dans `15,0..=18,0`, sur une plage quasiment identique au
+  corpus humain (19,8-26,1 s). Un pilotage IA n'est par construction pas concerné par l'explication
+  « pilotage humain perfectible » avancée pour le corpus précédent : cette troisième mesure
+  **affaiblit nettement** cette hypothèse comme cause principale et concentre le doute sur les deux
+  autres — roll-out détecté trop large/précoce, ou borne haute `OK_PERFECT_GROOVE_TIME_MAX_S` à
+  revoir (par type ou globalement) pour la géométrie de pattern réellement volée dans DCS. À trancher
+  avant toute promotion de `_OK_`.
 - **Observabilité manquante confirmée sur ce test** (aucune ligne au niveau par défaut ne permet de
   diagnostiquer trois situations vécues ce soir) : (1) deux générations de superviseur consommées
   sans une seule ligne INFO/WARN pendant un rechargement de mission (à côté, côté DCS,
@@ -90,20 +189,98 @@ ci-dessous.
 
 ### Hypothèses non confirmées, à investiguer plus avant
 
-- **Écart latéral quasi constant (~0,75-0,85 m) présent à toute distance**, observé sur les 5
-  appontages d'un premier test live CVN-72 du 5 septembre 2026 (matin), réussis comme Cut. Repéré en
-  reconstituant l'écart réel en mètres depuis `lineup_deg`/`distance_m` du JSON : l'écart latéral ne
-  grossit pas proportionnellement à la distance (ce qu'on attendrait d'une vraie erreur d'alignement
-  ou d'un axe de référence mal orienté) — il reste quasiment constant de 50 m jusqu'au toucher, sur
-  les 5 appontages sans exception. Ressemble davantage à un décalage fixe de point de référence
-  (crosse vs CG projetée, ou point de visée supposé) qu'à un vrai écart d'alignement croissant. **À
-  distinguer du biais vertical de crosse F-14B(U) déjà corrigé** (voir "Décisions encore ouvertes"
-  ci-dessous, `F14_HOOK_VERTICAL_CORRECTION_M`) : celui-ci porte sur l'altitude, pas le lineup, mais
-  la parenté (même famille de cause : offset de crosse mal placé dans le repère avion) mérite d'être
-  vérifiée maintenant que le correctif d'offset vertical est livré — un offset latéral mal calibré
-  au même endroit du code n'est pas à exclure. N'affecte pas la note de façon significative
-  (`NEAR_TOUCHDOWN_ANGLE_REFERENCE_M` le neutralise déjà en grande partie) et n'a donc aucune
-  urgence propre.
+- **Écart latéral quasi constant près du toucher — désormais reproduit sur F-14 *et* F/A-18, et
+  identifié comme la cause directe du plafonnement à `--` de 6 passes sur 6 dans le test IA du 6
+  septembre après-midi.** Initialement observé (~0,75-0,85 m, présent à toute distance dès 50 m) sur
+  les 5 appontages d'un premier test live CVN-72 du 5 septembre 2026 (matin), réussis comme Cut, en
+  reconstituant l'écart réel en mètres depuis `lineup_deg`/`distance_m` du JSON — l'écart ne grossit
+  pas proportionnellement à la distance (ce qu'on attendrait d'une vraie erreur d'alignement ou d'un
+  axe de référence mal orienté), ressemblant davantage à un décalage fixe de point de référence
+  (crosse vs CG projetée, ou point de visée supposé) qu'à un vrai écart d'alignement croissant.
+  **Le test IA du 6 septembre après-midi reproduit exactement ce comportement, cette fois sur les 6
+  passes accrochées (4×F-14B(U), 2×F/A-18C) et avec un effet mesuré sur la note** : les trois gates
+  ponctuelles (3/4, 1/2, 1/4 NM) sont toutes propres sur les 6 passes (`abs(GS) < 0,5°`,
+  `abs(LU) < 1,0°`, largement dans la bande `OK`), mais `trajectory_deviations` montre un
+  `lineup_deg` qui croît de façon lisse et quasi identique en pente sur les 6 passes, franchissant
+  `LATE_WINDOW_LU_DEG = 1,5°` autour de 150-160 m et atteignant ~2,5° vers 80 m — ce qui plafonne
+  chacune des 6 passes à `--` (2,0 pts) via la pondération temporelle de fin d'approche
+  (`LATE_WINDOW_*`), malgré des gates par ailleurs dignes d'un `OK`. **Reproduit à l'identique sur
+  F/A-18C**, qui ne porte aucune correction d'offset de crosse connue : ceci **affaiblit** l'hypothèse
+  d'un offset de crosse F-14 mal calibré comme cause unique (voir `F14_HOOK_VERTICAL_CORRECTION_M`
+  ci-dessous, qui reste une correction *verticale* distincte) et pointe plutôt vers soit un vrai
+  comportement de pilotage IA DCS cohérent sur les deux modules (dérive légère et systématique vers
+  un côté du centerline en courte finale), soit un point de référence géométrique partagé (axe
+  BRC/angle de pont, plutôt qu'un offset par avion) commun aux deux calculs. Devient la piste de
+  notation la plus prioritaire du projet : elle explique à elle seule pourquoi aucune des 6 passes IA
+  de ce test n'a dépassé `--`, indépendamment des questions `_OK_`/temps de groove ci-dessus.
+  `NEAR_TOUCHDOWN_ANGLE_REFERENCE_M` neutralise l'explosion `atan2` très près du pont, mais **pas**
+  cet effet dans la fenêtre 80-160 m visée par `LATE_WINDOW_LU_DEG`, contrairement à ce qui était
+  supposé avant ce test. Reste à faire : comparer le lineup au niveau de la trajectoire complète
+  (pas seulement gates + fenêtre tardive) pour confirmer que l'écart est bien présent dès l'entrée en
+  groove sur ce corpus IA (comme sur le corpus humain de matin) et non une dérive qui n'apparaît que
+  tardivement ; et déterminer si un axe de référence (BRC vs angle de pont réellement utilisé) plutôt
+  qu'un offset par avion explique la parenté F-14/F/A-18.
+
+  **Mise à jour 6 septembre 2026 (corpus historique déposé par l'utilisateur,
+  `.ignore/json-human-test/`, 300 rapports humains, 13 juin-23 août 2026, autre lignée du projet —
+  schéma différent, pas `schema_version: 3`, code non comparable à l'actuel).** L'utilisateur précise
+  que le module ayant produit ces rapports a évolué sur la période couverte : **les notes/grades
+  qu'ils contiennent ne sont pas fiables comme repère de qualité et n'ont donc servi à rien dans
+  l'analyse ci-dessous** — seule la géométrie brute (`gate_deviations`, `datums`) est exploitée, avec
+  un simple seuil de plausibilité sur la magnitude (`|lineup| <= 100 ft` à 1/4 NM, ~3,7°, pour écarter
+  les trajectoires clairement hors piste) plutôt qu'un tri par grade. Deux apports malgré
+  l'incompatibilité de schéma : (1) une poignée de rapports (grades mis de côté) montrent malgré tout
+  des écarts de lineup à 1/4 NM très modestes (9-22 ft, ~0,3-0,8°) sur des trajectoires par ailleurs
+  cohérentes — indice qu'obtenir un écart de cet ordre **n'est pas physiquement impossible** dans ce
+  simulateur/cette mission, indépendamment de la fiabilité des grades eux-mêmes qui les accompagnent.
+  (2) Sur les 261 rapports portant un `gate_deviations.at_quarter_nm`, le signe de l'écart de lineup à
+  1/4 NM se répartit quasi parfaitement également, **sans aucun filtre** : 126 négatifs / 135
+  positifs (et 99/100 une fois les 62 valeurs `> 100 ft` écartées comme aberrantes) — **pas de biais
+  unilatéral dominant** sur un corpus large et divers (nombreux pilotes, nombreuses sessions,
+  plusieurs mois, plusieurs versions du logiciel), contrairement au corpus du 6 septembre après-midi
+  (14 passes IA+humain, toutes du même côté). Le tout dernier point de trajectoire avant le toucher
+  montre un léger débalancement (114 négatifs / 85 positifs, 57 %/43 %) mais rien de comparable au
+  100 % unanime du 6 septembre. Cette analyse ne dépendant plus des grades, la conclusion est plus
+  solide qu'une première passe (biaisée par un tri sur `pass_grade`, corrigée le même jour) : ceci
+  affaiblit l'hypothèse d'un bug géométrique partagé (type `deck_angle`) **comme cause générale et
+  permanente** — **mais cette lignée utilise un schéma JSON et vraisemblablement un calcul de
+  géométrie entièrement différents du code actuel**, donc la comparaison reste indicative, pas
+  probante pour le `deck_angle`/repère de lineup du code présent, et n'exclut pas un bug ou un effet
+  de conditions spécifique à la session du 6 septembre (porte-avions/vent/cap/version de mission
+  donnés) qui n'aurait simplement pas de raison d'apparaître dans un corpus produit à d'autres dates
+  par un autre code. **La comparaison réellement décisive resterait à faire** : un corpus humain
+  capturé avec le code *actuel* (`schema_version: 3`, ex. les 8 rapports du test humain du 5
+  septembre soir déjà cités plus haut) permettrait de vérifier directement si le même biais
+  unilatéral que le test IA du 6 septembre après-midi s'y retrouve déjà — à demander/retrouver avant
+  de conclure.
+
+  **Mise à jour 6 septembre 2026, fin d'après-midi — comparaison décisive obtenue, hypothèse du bug
+  géométrique partagé affaiblie.** 4 passes humaines (`Justice-20260906`, même pilote, même
+  session/génération, même porte-avions, code/commit identique au test IA de l'après-midi) donnent un
+  lineup à 1/4 NM de **-1,27° / +0,62° / +0,28° / -0,37°** — **deux signes différents sur 4 passes
+  consécutives du même pilote, sur le même porte-avions, avec le code actuel.** Si le biais unanime
+  du 6 septembre après-midi (14 passes du même côté) venait d'une constante géométrique partagée
+  (`deck_angle` ou repère de lineup, indépendante du pilote), ce nouveau corpus humain — même code,
+  même navire — aurait dû montrer le même signe systématique ; ce n'est pas le cas. **Combiné à
+  l'absence de biais unilatéral déjà observée sur le corpus historique (300 rapports, autre lignée),
+  ceci pointe désormais plutôt vers une coïncidence propre au test IA du 6 septembre (pattern IA
+  scripté/déterministe menant à une dérive répétable d'un vol à l'autre) que vers un bug de géométrie
+  dans le code actuel.** Reste ouvert : pourquoi les 14 passes IA d'un même test convergent-elles
+  autant entre elles, si ce n'est ni un bug de code ni une contrainte physique universelle — piste la
+  plus probable désormais : le pilotage automatique DCS (IA) rejoue une même logique de correction
+  d'un vol à l'autre dans des conditions quasi identiques (même vent, même carrier), ce qui produirait
+  naturellement une dérive répétable sans qu'aucun bug LSO ne soit en cause. À vérifier sur un futur
+  test IA avec un vent différent (sens ou force) : si le signe de la dérive suit le vent, c'est
+  confirmé ; s'il reste identique quel que soit le vent, l'hypothèse d'un biais de pilotage IA
+  indépendant du vent prendrait le relais de celle du bug géométrique.
+
+  **Question posée par l'utilisateur (« le calcul peut-il seulement accorder un (OK)/`_OK_` ? »),
+  désormais tranchée par la preuve, pas par la seule inférence** : la 3ᵉ passe de ce même corpus
+  (`LSO-20260906-160913-...json`) obtient **`OkParentheses` (3,0 pts, lineup 1/4 NM = 0,28°, GS 1/4 NM
+  = 0,34°)** avec le code/commit actuel. **Première confirmation live que le code présent peut bien
+  produire mieux que `--`** — le doute exprimé plus haut ("0/14 passes vivantes n'ont jamais dépassé
+  `--`") est levé pour `(OK)` au moins ; `_OK_`/`OK` restent, eux, toujours sans preuve live à ce
+  jour.
 - **Déclin de l'AoA corrigée dans le groove** (~1,5-3° entre ¾ NM et ¼ NM, systématique sur 3-4 F-14
   dans un test avec vent nul, matin du 5 septembre). Le vent nul dans cette mission exclut un
   artefact de la correction vent introduite pour l'AoA ; reste à savoir si c'est un comportement de
@@ -145,7 +322,12 @@ ci-dessous.
   acquittement, ou alors le compteur comptabilise les évictions post-acquittement comme des
   débordements. Aucune perte réelle ce soir (`lost_snapshots: 0`), mais la métrique est aujourd'hui
   inexploitable telle quelle. Côté fork, ne pas modifier sans demande explicite — mais à
-  instrumenter avant de conclure.
+  instrumenter avant de conclure. **Mise à jour 6 septembre après-midi** : voir le nouveau point P0
+  ci-dessus — le même signal (`overflow_count` = `snapshots_received - 600`, `lost_snapshots: 0`)
+  réapparaît sur le test humain `Justice-20260906`, cette fois corrélé à un vrai `TelemetryGap` ayant
+  coûté sa note à un trap confirmé. Toujours pas de perte confirmée côté source, mais l'hypothèse
+  d'un consommateur LSO qui prend du retard sur le ring devient nettement plus crédible qu'un simple
+  artefact de comptage.
 - **Tentatives d'approche avortées avant le groove, invisibles hors logs DEBUG.** Déjà listé ;
   reconfirmé avec des chiffres concrets le 5 septembre soir : 3 faux départs de détection sur la
   soirée (un au catapultage T-45 lui-même : 55 s puis 2 s de flux bufferisé + échantillonnage crosse
@@ -154,8 +336,18 @@ ci-dessous.
   Piste additionnelle par rapport à la version précédente de ce point : exclure de l'armement du
   détecteur un avion qui vient de se trouver sur le pont (position proche de zéro, altitude proche de
   zéro, vitesse < 30 m/s) pendant une fenêtre de N secondes, ou exiger une vitesse verticale négative
-  et une distance déjà positive pour armer `detect_recovery_attempt` ; et logger le motif d'abandon
-  en INFO plutôt qu'en DEBUG.
+  et une distance déjà positive pour armer `detect_recovery_attempt`. **Fait le 6 septembre 2026** :
+  les deux motifs d'abandon (jamais sous 100 m MSL, grading `Unknown`) sont désormais loggés en INFO
+  avec durée écoulée et altitude minimale atteinte. **Mise à jour 6 septembre après-midi (test IA)** :
+  6 abandons supplémentaires mesurés (27-100 s, altitude minimale systématiquement 220-241 m —
+  jamais proche du pont) **sur un corpus 100 % IA**, ce qui nuance l'hypothèse initiale : ces faux
+  départs ne sont pas spécifiques à un comportement humain (pattern overhead, hésitation) mais
+  semblent structurels à la simple enveloppe géométrique du détecteur (3,5 NM/1100 ft) sur *tout*
+  circuit Case I, humain ou IA — un avion en initial/break/vent-arrière traverse et quitte cette
+  enveloppe plusieurs fois avant l'approche réellement notée. La piste "position proche de zéro"
+  ci-dessus n'aurait rien changé à ces 6 cas précis (altitude minimale toujours > 220 m) ; une piste
+  plus pertinente pour ce corpus serait d'exiger une tendance d'altitude décroissante sur la fenêtre
+  d'armement plutôt qu'un simple seuil de position pont.
 - **`hook_history_truncated` remonté comme cause secondaire sur 6 rapports sur 8** dans le test du 5
   septembre soir, alors que la fenêtre finale de notation (35 à 79 échantillons) reste toujours
   intacte : la timeline crosse est plafonnée à 512 entrées (`MAX_HOOK_EVIDENCE`), et un pattern
@@ -164,7 +356,14 @@ ci-dessous.
   retire jamais d'évidence utile à la notation, mais pollue `causes` sans raison. Piste : compacter
   les échantillons pré-groove (ne garder que les transitions, comme le fait une autre lignée
   antérieure du programme) plutôt que les tronquer par FIFO, ou ne plus remonter la troncature dans
-  `causes` quand `samples_in_final_window` est déjà complet.
+  `causes` quand `samples_in_final_window` est déjà complet. **Mise à jour 6 septembre après-midi
+  (test IA)** : présent sur **8 rapports sur 8** cette fois, y compris sur les 2 waveoffs qui n'ont
+  jamais atteint le groove — ce qui **infirme l'explication "structurel seulement pour un pattern
+  humain long"** : un échantillonnage crosse démarré dès l'armement du détecteur (avant même de
+  savoir si l'approche ira jusqu'au groove) peut visiblement dépasser 512 échantillons bien avant un
+  toucher, y compris sur un circuit IA plus resserré. Fait monter la priorité du correctif de
+  compaction ci-dessus : ce n'est pas un cas de bord humain rare mais un bruit systématique sur ce
+  corpus.
 - **Incohérence `datums[].alt` (clampé à 0) vs `trajectory_deviations[].alt_m` (non clampé)** :
   observé à la même position/au même instant dans plusieurs rapports du 5 septembre soir (ex. `alt =
   0.00` vs `alt_m = -0.8` pour la même approche), ce qui masque justement l'information « crosse sous
@@ -202,9 +401,16 @@ ci-dessous.
 
 ## Hors-scope confirmé (rappel volontaire)
 
-- **Robustesse multi-recoveries simultanées** : ni la première mission de test (8 unités) ni le test
-  du 5 septembre soir (recoveries séquentielles malgré 3 porte-avions dans la mission) n'ont permis
-  de tester deux avions en approche en même temps.
+- **Robustesse multi-recoveries simultanées — partiellement infirmé le 6 septembre après-midi.** Le
+  test IA (8 unités, `--suspend-detectors-during-recovery`, nouveau compteur diagnostique
+  `ActivePriorityPlanes::active_count`) a bien observé un chevauchement réel : F/A-18C-3-1 et
+  F/A-18C-4-1 se sont retrouvés simultanément en `record_recovery` sur le même porte-avions à 4
+  reprises (`concurrent_recoveries=2` en log), sans crash ni corruption croisée observée dans les
+  rapports produits. **Portée limitée** : les deux occurrences concurrentes étaient des faux départs
+  (jamais sous 100 m MSL), jamais deux approches complètes jusqu'au toucher en parallèle — la
+  robustesse d'une vraie double recovery simultanée jusqu'à l'issue (deux JSON/ACMI/PNG publiés au
+  même moment) reste donc à confirmer, mais l'isolation par paire tient au moins sous détection
+  concurrente réelle.
 - **Cadence adaptative pré-groove (100/200 ms)** : toujours en attente d'une décision explicite,
   indépendante de tout test. `lso.exe cadence-ab` (voir [AGENTS.md](AGENTS.md)) est l'outil de
   mesure prévu pour instruire cette décision, pas la décision elle-même. Exécuté une fois sur un
@@ -232,6 +438,16 @@ documente fidèlement "remise de gaz, initiateur inconnu" à chaque fois, comme 
 la mission/le jeu lors d'une prochaine session, pas par une modification de LSO. Le test du soir du
 même jour n'a montré aucun signe équivalent (les remises de gaz observées ont des causes distinctes,
 voir le bug `Bolter` sans preuve de contact plus haut).
+
+**Reconfirmé le 6 septembre 2026 après-midi** : F/A-18C-3-1 a enchaîné des waveoffs en boucle
+pendant le test IA (arrêt volontaire du test par l'utilisateur pour cette raison) ; les deux passes
+capturées avant l'arrêt portent toutes les deux exactement `GRADE:WO WOFDIC` — le même code
+DCS "Foul Deck Indicator Comment" que la session du 5 septembre matin. Signature identique, donc
+même hypothèse : à vérifier côté pont/mission (zone d'appontage occupée, gear pas en batterie,
+LSO déjà occupé par un autre appareil) avant de suspecter le module LSO — d'autant que la
+"Robustesse multi-recoveries simultanées" ci-dessus montre justement F/A-18C-3-1 et F/A-18C-4-1 en
+détection concurrente au même moment sur ce test, cohérent avec un encombrement de pont réel plutôt
+qu'un artefact LSO.
 
 ## Décisions encore ouvertes (mission/serveur nécessaires)
 
@@ -290,6 +506,15 @@ changement), mais la preuve DCS live disponible reste partielle :
   rejouer avec `cadence-ab` les rapports F-14 affectés du 5 septembre (bolters et traps) pour
   quantifier combien de Cut/`--` près du pont étaient artefactuels ; (4) vérifier si le biais de -1
   brin de l'estimation Rust (voir P1 plus haut) disparaît une fois ce correctif en place.
+- **`wire_estimate_at` n'accorde plus `confidence: "high"` sans brin confirmé par DCS** (implémenté
+  le 6 septembre 2026, moitié du point P1 "estimation Rust du brin systématiquement décalée"
+  ci-dessus). Une fenêtre de corrélation serrée (bracket/lag <=150 ms) prouve seulement une mesure
+  précise du franchissement, jamais un arrêt réel — corrige le cas confirmé où un survol/bolter sans
+  aucun accrochage produisait une confiance « high » sémantiquement fausse. Sans brin `WIRE#`
+  confirmé par le LQM, la confiance plafonne désormais à `"medium"`. Reste à revalider en mission
+  live que ce plafond ne masque pas, à l'usage, un cas où l'estimation Rust était en fait fiable
+  malgré l'absence de confirmation DCS (ex. LQM injoignable) — actuellement aucun moyen pour un
+  consommateur du rapport de distinguer ces deux causes de `"medium"` autrement qu'en lisant `reason`.
 - **Lecture de crosse figée au premier contact géométrique plutôt qu'à l'événement DCS**
   (`first_hook_ground_contact_time`, corrigé le 6 septembre 2026, ex-P0). `calibrated_hook_state` ne
   retient plus que les échantillons antérieurs au premier instant où la hauteur de crosse calculée

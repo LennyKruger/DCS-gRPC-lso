@@ -5,8 +5,8 @@ use ultraviolet::{DRotor3, DVec3};
 
 use crate::data::{AirplaneInfo, CarrierInfo, CarrierRecovery};
 use crate::grading::{
-    compute_pass_grade, compute_vstol_approach_grade_points, compute_vstol_final_grade_from_points,
-    PassGrade, SpotGrade,
+    compute_pass_grade_with_reason, compute_vstol_approach_grade_points,
+    compute_vstol_final_grade_from_points, PassGrade, SpotGrade,
 };
 use crate::telemetry::{
     AlignmentMethod, TelemetryInvalidReason, TelemetrySample, MAX_EXTRAPOLATION_MS,
@@ -344,6 +344,30 @@ struct WindReference {
     wind_b: DVec3,
 }
 
+/// One raw `AtmosphereService.GetWind` response kept for diagnosis, alongside the altitude it was
+/// queried at. Purely observational: never used for grading, and never replaces
+/// `WindReference`/`wind_velocity_vector` in the AoA correction itself. Added to investigate a
+/// confirmed live anomaly (5 September 2026: two reports out of eight reported `180deg/0.0 m/s`
+/// against `95deg/0.99-1.42 m/s` on the other six, same ship/mission/timeframe) — this exposes the
+/// two individual probes behind a `wind_reference_established` reference instead of only the
+/// already-derived boolean, so a future live capture can show whether one specific probe (as
+/// opposed to the other, or the separate report-time query) is the source of the degenerate value.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct WindProbe {
+    pub alt_m: f64,
+    pub heading_deg: u16,
+    pub speed_mps: f32,
+}
+
+/// The two raw probes behind a successfully established `WindReference`.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct WindReferenceProbes {
+    /// Queried at the aircraft's own altitude at groove entry.
+    pub high: WindProbe,
+    /// Queried at the carrier's deck altitude.
+    pub low: WindProbe,
+}
+
 impl WindReference {
     /// Linearly interpolate (or extrapolate, clamped to the two samples) the wind vector at the
     /// given altitude. Assumes DCS interpolates linearly between its two configured wind layers,
@@ -461,6 +485,8 @@ pub struct Track {
     /// recovery if the wind query failed. `aoa` falls back to the raw geometric approximation
     /// whenever this is `None`.
     wind_reference: Option<WindReference>,
+    /// Raw probes behind `wind_reference`, kept only for diagnosis (see `WindReferenceProbes`).
+    wind_reference_probes: Option<WindReferenceProbes>,
 }
 
 /// GS and lineup deviation recorded at a key gate distance.
@@ -552,11 +578,18 @@ impl GateDeviations {
     /// I pattern far more reliably, are kept as an unconditional requirement. Non revalidé en
     /// mission live (voir tasking-roadmap.md).
     pub(crate) fn three_quarter_counts(&self, groove_entry_time: Option<f64>) -> bool {
-        match (&self.at_three_quarter_nm, groove_entry_time) {
+        let counts = match (&self.at_three_quarter_nm, groove_entry_time) {
             (Some(gate), Some(entry)) => gate.timestamp_dcs >= entry,
             (None, Some(_)) => false,
             _ => true,
-        }
+        };
+        tracing::debug!(
+            three_quarter_nm_timestamp = self.at_three_quarter_nm.as_ref().map(|g| g.timestamp_dcs),
+            groove_entry_time,
+            counts,
+            "3/4 NM gate eligibility (excluded when it precedes confirmed groove entry)"
+        );
+        counts
     }
 
     /// Whether the gate evidence is sufficient to award a favourable grade. See
@@ -888,7 +921,14 @@ fn is_rolled_out(gate_samples: &VecDeque<ApproachSample>, bank_deg: f64) -> bool
     // Track angle relative to the groove axis: 0 deg when travel is straight down -x (inbound,
     // toward the ship) with no lateral (y) drift.
     let track_angle_deg = vy.atan2(-vx).to_degrees();
-    track_angle_deg.abs() <= GROOVE_ROLLOUT_MAX_TRACK_ANGLE_DEG
+    let rolled_out = track_angle_deg.abs() <= GROOVE_ROLLOUT_MAX_TRACK_ANGLE_DEG;
+    tracing::trace!(
+        bank_deg,
+        track_angle_deg,
+        rolled_out,
+        "groove roll-out check (bank/track vs 15deg thresholds)"
+    );
+    rolled_out
 }
 
 /// Least-squares linear regression of `x` and `y` against `time` over every *valid* sample in
@@ -995,6 +1035,14 @@ pub struct TrackResult {
     /// Final numeric score. Kept separately because V/STOL bonuses can produce
     /// quarter-point values (e.g. 4.75) while reusing the CATOBAR labels.
     pub grade_points: Option<f64>,
+    /// Short, plain-language explanation of the specific rule that produced `approach_grade`
+    /// (see `grading::grade_from_gates_with_reason`/`compute_pass_grade_with_reason`) -- built
+    /// alongside the grade itself, not reconstructed afterward, so it can never disagree with
+    /// it. Used for the Discord "Why This Grade" field alongside the telemetry-availability
+    /// message when grading itself was unavailable (that message takes priority; see
+    /// `record_recovery.rs`). A short generic placeholder for V/STOL, which does not yet have a
+    /// detailed per-gate breakdown of its own.
+    pub grade_reason: String,
     pub spot_grade: Option<SpotGrade>,
     pub spot_distance_m: Option<f64>,
     pub intended_spot: Option<&'static str>,
@@ -1022,6 +1070,11 @@ pub struct TrackResult {
     /// geometric approximation for the whole recovery (query failure, or the aircraft never
     /// entered the groove).
     pub wind_reference_established: bool,
+    /// Raw probes behind `wind_reference_established` when it is `true` (see
+    /// `WindReferenceProbes`); `None` both when the reference was never established and when it
+    /// was established through a path that predates this diagnostic (kept purely for live
+    /// investigation, never for grading).
+    pub wind_reference_probes: Option<WindReferenceProbes>,
 }
 
 impl Track {
@@ -1086,6 +1139,7 @@ impl Track {
             first_sample_time: None,
             last_sample_time: None,
             wind_reference: None,
+            wind_reference_probes: None,
         }
     }
 
@@ -1107,6 +1161,13 @@ impl Track {
             alt_b_m,
             wind_b,
         });
+    }
+
+    /// Record the two raw `GetWind` responses behind the just-established `WindReference`, purely
+    /// for diagnosis (see `WindReferenceProbes`). Call alongside `set_wind_reference`, with the
+    /// same two probes before they were converted to velocity vectors.
+    pub fn set_wind_reference_probes(&mut self, high: WindProbe, low: WindProbe) {
+        self.wind_reference_probes = Some(WindReferenceProbes { high, low });
     }
 
     /// The AoA to record for this sample: wind-corrected if a reference is available, otherwise
@@ -1854,15 +1915,32 @@ impl Track {
             self.grading = Some(Grading::WaveoffUnknown);
         }
 
+        // Still correlated on the event-reported touchdown time (`landing_time`), not yet on a
+        // geometric/deceleration proxy: a same-approach fixture (`wire_4_01_FA18C`, a clean
+        // straight-in trap with no bolter/bounce) shows the hook's ground-plane crossings for
+        // wires 1-3 recorded *before* `first_hook_ground_contact_time`, purely because the hook
+        // sweeps forward across their thresholds while still airborne on short final -- so
+        // freezing evidence at first geometric contact discarded the correct (later, wire 4)
+        // crossing on that fixture. The live-confirmed bias this is meant to fix (retaining the
+        // highest-numbered crossing recorded before a *late* DCS event, `AGENTS.md`/P1) needs a
+        // proxy that distinguishing "still airborne, sweeping over wire thresholds" from
+        // "already arrested, carried forward past them by cable stretch" -- e.g. the onset of the
+        // sharp post-catch deceleration in `touchdown_horizontal_speed_mps` -- which is not
+        // implemented here yet; left as an open decision (see tasking-roadmap.md). What *is*
+        // implemented below is the second, independent half of the fix that does not depend on
+        // resolving that question: a wire estimate can no longer read "high" confidence without
+        // a DCS-confirmed arrest.
+        let dcs_wire = self.dcs_grading.as_deref().and_then(parse_dcs_wire);
         let wire_estimation = self.wire_estimate_at(
             self.landing_time
                 .or_else(|| self.datums.last().map(|datum| datum.time))
                 .unwrap_or_default(),
+            dcs_wire.is_some(),
         );
 
         // If DCS grading is set, use its reported wire for arrested recoveries only.
         let grading = if matches!(&self.carrier_info.recovery, CarrierRecovery::Arrested) {
-            if let Some(dcs_wire) = self.dcs_grading.as_deref().and_then(parse_dcs_wire) {
+            if let Some(dcs_wire) = dcs_wire {
                 match self.grading {
                     Some(Grading::Recovered {
                         cable_estimated, ..
@@ -1890,6 +1968,10 @@ impl Track {
         // geometry alone had called `Bolter`, with no `runway_touch`/`land` event at all.
         let grading = match grading {
             Grading::Bolter if dcs_grade_is_waveoff(self.dcs_grading.as_deref()) => {
+                tracing::info!(
+                    dcs_grading = ?self.dcs_grading,
+                    "geometric Bolter refused: DCS LQM opens on GRADE:WO"
+                );
                 Grading::WaveoffUnknown
             }
             other => other,
@@ -1920,22 +2002,46 @@ impl Track {
             (Some(entry), Some(land)) if land > entry => Some(land - entry),
             _ => None,
         };
+        tracing::debug!(
+            groove_entry_time = ?self.groove_entry_time,
+            landing_time = ?self.landing_time,
+            first_hook_ground_contact_time = ?self.first_hook_ground_contact_time,
+            hook_contact_to_dcs_event_delta_secs =
+                match (self.first_hook_ground_contact_time, self.landing_time) {
+                    (Some(contact), Some(land)) => Some(land - contact),
+                    _ => None,
+                },
+            groove_time_secs,
+            "groove/touchdown timing summary"
+        );
 
         // CATOBAR keeps the native wire/groove grading path.  AV-8B V/STOL
         // deliberately reuses the same GS/LU gate tiers, referenced to its 3.0°
         // glide slope, but excludes CATOBAR-only wire/groove bonuses.  AOA is
         // visual information only and is not part of the points calculation.
-        let (approach_grade, approach_points) = if self.carrier_info.is_vstol() {
-            compute_vstol_approach_grade_points(&grading, &self.gate_deviations)
+        let (approach_grade, approach_points, grade_reason) = if self.carrier_info.is_vstol() {
+            let (grade, points) =
+                compute_vstol_approach_grade_points(&grading, &self.gate_deviations);
+            // V/STOL does not yet have a detailed per-gate rationale of its own (see
+            // `grade_reason`'s doc comment) -- a short, generic placeholder naming the final
+            // grade is still more useful than an empty field.
+            (
+                grade,
+                points,
+                format!(
+                    "{}: V/STOL approach grade averaged from gate scores.",
+                    grade.label()
+                ),
+            )
         } else {
-            let grade = compute_pass_grade(
+            let (grade, reason) = compute_pass_grade_with_reason(
                 &grading,
                 &self.gate_deviations,
                 &self.trajectory_deviations,
                 groove_time_secs,
                 self.groove_entry_time,
             );
-            (grade, grade.points())
+            (grade, grade.points(), reason)
         };
         let spot_grade = self.spot_distance_m.map(SpotGrade::from_distance_m);
 
@@ -2003,6 +2109,7 @@ impl Track {
             approach_grade,
             pass_grade,
             grade_points,
+            grade_reason,
             spot_grade,
             spot_distance_m: self.spot_distance_m,
             intended_spot: self.carrier_info.is_vstol().then_some("7.5"),
@@ -2023,6 +2130,7 @@ impl Track {
             hook_observation: self.hook_observation,
             wire_estimation,
             wind_reference_established: self.wind_reference.is_some(),
+            wind_reference_probes: self.wind_reference_probes,
         }
     }
 
@@ -2082,7 +2190,7 @@ impl Track {
         }
     }
 
-    fn wire_estimate_at(&self, event_time: f64) -> WireEstimateEvidence {
+    fn wire_estimate_at(&self, event_time: f64, arrest_confirmed: bool) -> WireEstimateEvidence {
         let mut eligible = self
             .wire_crossings
             .iter()
@@ -2095,6 +2203,10 @@ impl Track {
         eligible.sort_by(|left, right| left.timestamp_dcs.total_cmp(&right.timestamp_dcs));
         tracing::debug!(event_time, crossings = ?eligible, "wire crossing evidence at event");
         let Some(last) = eligible.last() else {
+            tracing::debug!(
+                reason = "no_fresh_hook_plane_crossing",
+                "wire estimate: none"
+            );
             return WireEstimateEvidence {
                 wire: None,
                 confidence: "insufficient",
@@ -2107,6 +2219,11 @@ impl Track {
         // If the event does not closely correlate with a continuously observed
         // crossing, keep every crossing as evidence but decline to name a wire.
         if !(0.0..=SAMPLE_GAP_WARNING_MS).contains(&event_lag_ms) {
+            tracing::debug!(
+                event_lag_ms,
+                reason = "wire_crossing_not_time_correlated_with_event",
+                "wire estimate: none"
+            );
             return WireEstimateEvidence {
                 wire: None,
                 confidence: "insufficient",
@@ -2114,13 +2231,28 @@ impl Track {
                 crossings: self.wire_crossings.clone(),
             };
         }
-        WireEstimateEvidence {
-            wire: Some(last.wire),
-            confidence: if last.bracket_gap_ms <= 150.0 && event_lag_ms <= 150.0 {
+        // "high" additionally requires a DCS-confirmed arrest (a parsed LQM wire): tight
+        // brackets alone describe how well the crossing was *measured*, not whether the
+        // aircraft actually stopped, and a late `runway_touch`/`Land` correlation used to let
+        // this read "high" on a bolter/touch-and-go whose last geometric crossing was simply
+        // the highest-numbered wire the hook happened to pass before the event fired.
+        let confidence =
+            if arrest_confirmed && last.bracket_gap_ms <= 150.0 && event_lag_ms <= 150.0 {
                 "high"
             } else {
                 "medium"
-            },
+            };
+        tracing::debug!(
+            wire = last.wire,
+            confidence,
+            arrest_confirmed,
+            bracket_gap_ms = last.bracket_gap_ms,
+            event_lag_ms,
+            "wire estimate"
+        );
+        WireEstimateEvidence {
+            wire: Some(last.wire),
+            confidence,
             reason: "continuous_hook_plane_crossing",
             crossings: self.wire_crossings.clone(),
         }
@@ -2935,6 +3067,34 @@ mod tests {
             corrected_aoa_deg(plane.velocity, DVec3::new(0.0, 0.0, -20.0), plane.rotation);
         assert_eq!(track.effective_aoa(&plane), expected);
         assert_ne!(track.effective_aoa(&plane), 999.0);
+    }
+
+    #[test]
+    fn wind_reference_probes_are_surfaced_for_diagnosis_when_established() {
+        // Purely diagnostic (see `WindReferenceProbes`): must round-trip the exact raw responses
+        // through `finish()`, independent of whatever velocity vectors were derived from them.
+        let carrier = CarrierInfo::by_type("CVN_71").unwrap();
+        let plane_info = AirplaneInfo::by_type("FA-18C_hornet").unwrap();
+        let mut track = Track::new("pilot", carrier, plane_info);
+        track.set_wind_reference(300.0, DVec3::zero(), 0.0, DVec3::new(0.0, 0.0, -20.0));
+        let high = WindProbe {
+            alt_m: 300.0,
+            heading_deg: 180,
+            speed_mps: 0.0,
+        };
+        let low = WindProbe {
+            alt_m: 0.0,
+            heading_deg: 95,
+            speed_mps: 1.2,
+        };
+        track.set_wind_reference_probes(high, low);
+
+        let result = track.finish();
+        assert!(result.wind_reference_established);
+        assert_eq!(
+            result.wind_reference_probes,
+            Some(WindReferenceProbes { high, low })
+        );
     }
 
     fn approach_sample(time: f64, x: f64) -> ApproachSample {
@@ -4205,7 +4365,7 @@ mod tests {
             };
             track.observe_wire_crossings(&carrier, &before, 100.0);
             track.observe_wire_crossings(&carrier, &after, 100.0);
-            assert_eq!(track.wire_estimate_at(1.1).wire, Some(3));
+            assert_eq!(track.wire_estimate_at(1.1, true).wire, Some(3));
         }
     }
 
@@ -4239,7 +4399,7 @@ mod tests {
             100.0,
         );
 
-        let estimate = track.wire_estimate_at(2.0);
+        let estimate = track.wire_estimate_at(2.0, true);
         assert_eq!(estimate.wire, None);
         assert_eq!(
             estimate.reason,
@@ -4310,6 +4470,54 @@ mod tests {
             }
             other => panic!("expected Grading::Recovered, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn wire_estimate_never_reports_high_confidence_without_a_dcs_confirmed_arrest() {
+        // A tightly bracketed, well-correlated crossing is still not proof the aircraft actually
+        // stopped -- only a DCS-confirmed wire (LQM `WIRE#`) is. Without it, confidence must never
+        // exceed "medium", even when every timing bracket is tight.
+        let carrier_info = CarrierInfo::by_type("CVN_71").unwrap();
+        let plane_info = AirplaneInfo::by_type("FA-18C_hornet").unwrap();
+        let carrier = Transform {
+            forward: DVec3::unit_z(),
+            ..Transform::default()
+        };
+        let hook_offset = plane_info.hook;
+        let midpoint3 = (carrier_info.cable3.0 + carrier_info.cable3.1) / 2.0;
+        let mut track = Track::new("pilot", carrier_info, plane_info);
+        track.observe_wire_crossings(
+            &carrier,
+            &Transform {
+                position: midpoint3 - hook_offset - DVec3::unit_z(),
+                time: 1.0,
+                ..Transform::default()
+            },
+            100.0,
+        );
+        track.observe_wire_crossings(
+            &carrier,
+            &Transform {
+                position: midpoint3 - hook_offset + DVec3::unit_z(),
+                time: 1.05,
+                ..Transform::default()
+            },
+            100.0,
+        );
+        track.first_hook_ground_contact_time = Some(1.05);
+        track.landing_time = Some(1.05);
+        track.grading = Some(Grading::Recovered {
+            cable: None,
+            cable_estimated: None,
+        });
+        // No `set_dcs_grading` call at all: no LQM confirmation of an arrest.
+
+        let result = track.finish();
+        assert_eq!(result.wire_estimation.wire, Some(3));
+        assert_eq!(
+            result.wire_estimation.confidence, "medium",
+            "confidence must not be \"high\" without a DCS-confirmed arrest"
+        );
     }
 
     #[test]

@@ -10,6 +10,13 @@ This file records user-visible changes. The crate version remains `0.2.0`; chang
 - `groove_time_secs`: the recovery report now serializes the groove duration (previously computed
   but visible only in the Discord embed), so `_OK_` eligibility can be checked without Discord
   configured.
+- `wind_reference_probes`: diagnostic-only field surfacing the two raw `GetWind` responses (each
+  altitude/heading/speed) behind `wind_reference_established`, plus a DEBUG-level log of each probe
+  individually (and of the separate report-time `GetWind` query, previously only logged on failure).
+  Added to investigate a confirmed live anomaly (two reports out of eight reading `180deg/0.0 m/s`
+  against a consistent `95deg/0.99-1.42 m/s` on the other six, same ship/mission/timeframe) — no
+  change to the AoA correction logic itself; see `tasking-roadmap.md` for what this is meant to
+  determine on the next live test.
 - Automatic `_OK_` grade (`is_amplitude_perfect`/`grade_from_gates`, `project-derived-v4`): a pass
   already `Ok` by every existing rule is upgraded to `_OK_` (5.0 points) when every gate and every
   continuous sample stays inside a tighter GS/lineup band (`PROJECT-DERIVED`, borrowed from the
@@ -112,6 +119,24 @@ This file records user-visible changes. The crate version remains `0.2.0`; chang
 - `--no-acmi` to keep charts and JSON without saving Tacview recordings.
 - `--no-acmi` now also skips TacView serialization and ACMI-only metadata/unit RPCs instead of only
   suppressing the final file.
+- Discord "Why This Grade" field: a short, plain-language explanation of the specific rule that
+  produced the pass grade (e.g. "(OK): drifted 0.6° high on glideslope — OK needs better than
+  0.5°."), or the existing telemetry-unavailability message when grading itself was unavailable.
+  Built by new `grade_from_gates_with_reason`/`compute_pass_grade_with_reason` (`src/grading.rs`),
+  which `grade_from_gates`/`compute_pass_grade` now wrap, so the displayed reason can never diverge
+  from the actual grade (same single-source-of-truth rationale as the `wire_estimated`/
+  `wire_estimation` fix above). Stored on `TrackResult::grade_reason`. Replaces the separate
+  "Technical status" field, which is now folded into this one.
+- Discord "LSO Notes" fallback (`describe_measured_deviations`, `src/grading.rs`) for a touch-and-go,
+  which DCS never sends a `LandingQualityMark` comment for (confirmed live 6 September 2026: 3 of 3
+  T&G passes in one session had no `dcs_grading` at all). Explicitly labelled as measured by LSO,
+  never phrased to resemble a DCS/NATOPS comment.
+- Diagnostic logging for the next live investigation round: `wire_estimate_at` confidence/reason,
+  3/4 NM gate eligibility, groove/touchdown timing summary, and the roll-out bank/track-angle check
+  are now logged (DEBUG/TRACE); a geometric `Bolter` refused by `GRADE:WO` is now logged (INFO); a
+  new `ActivePriorityPlanes::active_count` surfaces genuine concurrent-recovery overlap (INFO) when
+  `--suspend-detectors-during-recovery` is set; the two false-start abandon paths in
+  `record_recovery` are promoted from DEBUG to INFO with elapsed time and lowest altitude reached.
 
 ### Fixed
 
@@ -152,6 +177,18 @@ This file records user-visible changes. The crate version remains `0.2.0`; chang
   Interpretation is now frozen at the first *geometric* hook contact
   (`first_hook_ground_contact_time`, `alt <= 0.0`), whichever of that or `landing_time` fires
   first.
+- `wire_estimate_at` (`Track::finish()`) could report `confidence: "high"` from tight timing
+  brackets alone, even though a tight bracket only proves the crossing was measured precisely, not
+  that the aircraft actually stopped there — confirmed live 5 September 2026 (evening) on
+  survols/bolters with no arrest at all reading a semantically false "high" wire estimate. `"high"`
+  now additionally requires a DCS-confirmed arrest (a parsed LQM `WIRE#`); without one, confidence
+  is capped at `"medium"`. The other half of the same live-confirmed bias — the estimator retaining
+  the highest-numbered wire crossing recorded before a late `Land`/`runway_touch` event — remains
+  unresolved: correlating on `first_hook_ground_contact_time` instead was tried and reverted, since
+  it discarded a still-correct wire-4 crossing on a clean straight-in trap (`wire_4_01_FA18C`) where
+  the hook geometrically swept past wires 1-3 while still airborne, before the later, only-genuine
+  contact. See `tasking-roadmap.md` for the decision this leaves open (likely needs a deceleration
+  proxy, e.g. `touchdown_horizontal_speed_mps`, rather than a hard first-contact cutoff).
 - Event-stream errors and clean closure no longer become positional `telemetry_gap`; existing gates
   remain intact while outcome availability is assessed separately.
 - Plane/carrier respawns with a changed ID abort every stale same-name task within the current
@@ -261,6 +298,8 @@ This file records user-visible changes. The crate version remains `0.2.0`; chang
   the former F/A-18C copy.
 - F/A-18C CQ touch-and-go recognition now requires stable, timestamped pre-touch hook evidence;
   uncalibrated modules remain unknown. Technical unavailability is separate from pilot performance.
+- Discord "Gates (GS / LU)" field now shows degrees instead of feet, matching every other angle
+  shown in the embed.
 
 ### Security and dependencies
 
