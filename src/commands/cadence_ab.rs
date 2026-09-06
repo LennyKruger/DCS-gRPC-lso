@@ -207,10 +207,12 @@ fn replay(
 
     let (gates, trajectory) =
         replay_gate_and_trajectory(samples, ideal_base_alt, glide_slope_deg, is_vstol);
-    // `None`: this diagnostic never replays touchdown detection (see this module's own doc
-    // comment), so no groove-time-to-touchdown span is available here — `_OK_` can therefore
-    // never appear in a cadence-ab replay grade, only up to `Ok`. Diagnostic-only limitation.
-    let grade = grade_from_gates(&gates, &trajectory, None);
+    // `None, None`: this diagnostic never replays touchdown/groove-entry detection (see this
+    // module's own doc comment), so neither a groove-time-to-touchdown span nor a groove-entry
+    // timestamp is available here — `_OK_` can therefore never appear in a cadence-ab replay
+    // grade (only up to `Ok`), and the 3/4 NM gate always keeps the historical, unconditional
+    // requirement. Diagnostic-only limitation.
+    let grade = grade_from_gates(&gates, &trajectory, None, None);
 
     Variant {
         samples_kept: kept,

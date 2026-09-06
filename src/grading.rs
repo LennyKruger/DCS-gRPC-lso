@@ -278,26 +278,31 @@ pub fn compute_vstol_final_grade_from_points(
 ///
 /// `groove_time_secs` is `None` when either timestamp was not recorded
 /// (e.g. the aircraft never entered the 3/4-nm gate before landing).
+///
+/// `groove_entry_time` (DCS simulation time of roll-out-confirmed groove entry, CATOBAR only) is
+/// forwarded to `GateDeviations::all_valid` so the 3/4 NM gate is not required when it was
+/// captured before that instant -- see that method's doc comment.
 pub fn compute_pass_grade(
     grading: &Grading,
     gates: &GateDeviations,
     trajectory: &[TrajectoryDeviation],
     groove_time_secs: Option<f64>,
+    groove_entry_time: Option<f64>,
 ) -> PassGrade {
     match grading {
         Grading::Unknown => PassGrade::Incomplete,
         Grading::WaveoffUnknown => PassGrade::WaveoffUnknown,
-        Grading::Bolter if gates.all_valid() => PassGrade::Bolter,
-        Grading::Recovered { .. } if gates.all_valid() => {
-            grade_from_gates(gates, trajectory, groove_time_secs)
+        Grading::Bolter if gates.all_valid(groove_entry_time) => PassGrade::Bolter,
+        Grading::Recovered { .. } if gates.all_valid(groove_entry_time) => {
+            grade_from_gates(gates, trajectory, groove_time_secs, groove_entry_time)
         }
         // A qualification touch-and-go keeps the independently measured
         // approach grade, but can never receive a trap/wire-specific upgrade.
         // `_OK_` ("Perfect pass") is reserved for a real trap: a touch-and-go is a deliberate
         // hook-up practice pass, never a full stop, so it is capped one tier down instead (see
         // docs/GRADING_REFERENCE.md: "A touch-and-go cannot receive `_OK_` or points").
-        Grading::TouchAndGo { .. } if gates.all_valid() => {
-            match grade_from_gates(gates, trajectory, groove_time_secs) {
+        Grading::TouchAndGo { .. } if gates.all_valid(groove_entry_time) => {
+            match grade_from_gates(gates, trajectory, groove_time_secs, groove_entry_time) {
                 PassGrade::Perfect => PassGrade::Ok,
                 other => other,
             }
@@ -321,9 +326,13 @@ pub fn compute_vstol_approach_grade_points(
     match grading {
         Grading::Unknown => (PassGrade::Incomplete, None),
         Grading::WaveoffUnknown => (PassGrade::WaveoffUnknown, None),
-        Grading::Bolter if gates.all_valid() => (PassGrade::Bolter, PassGrade::Bolter.points()),
+        // V/STOL never relaxes the 3/4 NM gate requirement: unlike CATOBAR, it has no
+        // roll-out-confirmed groove entry to distinguish a mid-turn reading from a real one (see
+        // `AGENTS.md`, "Gates, outcomes et câble") -- `None` here always keeps the historical,
+        // unconditional three-gates rule.
+        Grading::Bolter if gates.all_valid(None) => (PassGrade::Bolter, PassGrade::Bolter.points()),
         Grading::TouchAndGo { .. } => (PassGrade::Incomplete, None),
-        Grading::Recovered { .. } if gates.all_valid() => {
+        Grading::Recovered { .. } if gates.all_valid(None) => {
             let mut gate_scores = Vec::with_capacity(3);
             if let Some(gate) = gates.at_three_quarter_nm.as_ref() {
                 gate_scores.push(grade_single_gate(gate, false).points().unwrap_or_default());
@@ -338,7 +347,7 @@ pub fn compute_vstol_approach_grade_points(
             if gate_scores.is_empty() {
                 // V/STOL never earns `_OK_`/groove-time bonuses (see this function's doc
                 // comment), so `None` here is not a simplification, it is the actual rule.
-                let fallback = grade_from_gates(gates, &[], None);
+                let fallback = grade_from_gates(gates, &[], None, None);
                 (fallback, fallback.points())
             } else {
                 let average_points = gate_scores.iter().sum::<f64>() / gate_scores.len() as f64;
@@ -397,10 +406,19 @@ fn grade_single_gate(gate: &crate::track::GateDatum, quarter_nm: bool) -> PassGr
 /// `pub(crate)` (rather than only reachable through `compute_pass_grade`) so the `cadence-ab`
 /// diagnostic command (B.2 of the notation/cadence work) can grade a replayed gate/trajectory
 /// pair directly, without needing to fabricate a `Grading` outcome the replay never computes.
+/// `cadence-ab` always passes `None` for `groove_entry_time` (it never re-derives groove entry
+/// from the replay), which keeps its historical, unconditional three-gates behaviour.
+///
+/// `groove_entry_time` also excludes the 3/4 NM gate's own GS/lineup values from the amplitude
+/// computed below when it was captured before that instant — not just from `all_valid`'s
+/// completeness check. Counting a turn-artifact reading toward "worst GS/lineup" would defeat the
+/// point of no longer requiring it: see `GateDeviations::all_valid`'s doc comment for why that
+/// reading is not representative of the approach.
 pub(crate) fn grade_from_gates(
     gates: &GateDeviations,
     trajectory: &[TrajectoryDeviation],
     groove_time_secs: Option<f64>,
+    groove_entry_time: Option<f64>,
 ) -> PassGrade {
     // Dangerously low at the 1/4-nm gate → Cut pass. GS_CUT_LOW_DEG is negative, so this
     // triggers when the hook is well below the ideal glide path at close range. Also checked
@@ -428,11 +446,16 @@ pub(crate) fn grade_from_gates(
     // `persistent_trajectory_values` first (A.1 robustness guard): an isolated single-frame
     // spike above the gates' own bracket/skew-validated evidence never counts on its own.
     let (persistent_gs, persistent_lu) = persistent_trajectory_values(trajectory);
+    // A 3/4 NM gate that does not count toward completeness (see `three_quarter_counts`) must
+    // not count toward amplitude either -- otherwise a turn-artifact reading would still tank the
+    // grade it was excluded to protect.
+    let three_quarter = if gates.three_quarter_counts(groove_entry_time) {
+        gates.at_three_quarter_nm.as_ref()
+    } else {
+        None
+    };
     let all_gs: Vec<f64> = [
-        gates
-            .at_three_quarter_nm
-            .as_ref()
-            .map(|g| g.gs_deviation_deg),
+        three_quarter.map(|g| g.gs_deviation_deg),
         gates.at_half_nm.as_ref().map(|g| g.gs_deviation_deg),
         gates.at_quarter_nm.as_ref().map(|g| g.gs_deviation_deg),
     ]
@@ -454,10 +477,7 @@ pub(crate) fn grade_from_gates(
         .abs();
 
     let worst_lu = [
-        gates
-            .at_three_quarter_nm
-            .as_ref()
-            .map(|g| g.lineup_deg.abs()),
+        three_quarter.map(|g| g.lineup_deg.abs()),
         gates.at_half_nm.as_ref().map(|g| g.lineup_deg.abs()),
         gates.at_quarter_nm.as_ref().map(|g| g.lineup_deg.abs()),
     ]
@@ -797,84 +817,99 @@ mod tests {
         // `clean_pass_with_groove_time_in_window_reaches_perfect_regardless_of_wire` for the
         // same amplitude with groove time actually supplied.
         let g = gates_deg(0.2, 0.3, 0.1, 0.2, 0.1, 0.1);
-        assert_eq!(grade_from_gates(&g, &[], None), PassGrade::Ok);
+        assert_eq!(grade_from_gates(&g, &[], None, None), PassGrade::Ok);
     }
 
     #[test]
     fn test_slight_gs_deviation_is_ok_parentheses() {
         // 0.6° high GS at 3/4 nm: exceeds GS_SLIGHT_HIGH (0.5°) → (OK).
         let g = gates_deg(0.6, 0.3, 0.1, 0.2, 0.1, 0.1);
-        assert_eq!(grade_from_gates(&g, &[], None), PassGrade::OkParentheses);
+        assert_eq!(
+            grade_from_gates(&g, &[], None, None),
+            PassGrade::OkParentheses
+        );
     }
 
     #[test]
     fn test_slight_gs_high_threshold_is_0_5() {
         // 0.9° high GS: still between GS_SLIGHT_HIGH and GS_SIGNIFICANT → (OK), not --.
         let g = gates_deg(0.9, 0.0, 0.0, 0.0, 0.0, 0.0);
-        assert_eq!(grade_from_gates(&g, &[], None), PassGrade::OkParentheses);
+        assert_eq!(
+            grade_from_gates(&g, &[], None, None),
+            PassGrade::OkParentheses
+        );
     }
 
     #[test]
     fn test_catobar_slight_gs_low_threshold_is_0_5() {
         // The boundary is inclusive: 0.5° low GS is (OK).
         let g = gates_deg(-0.5, 0.0, 0.0, 0.0, 0.0, 0.0);
-        assert_eq!(grade_from_gates(&g, &[], None), PassGrade::OkParentheses);
+        assert_eq!(
+            grade_from_gates(&g, &[], None, None),
+            PassGrade::OkParentheses
+        );
     }
 
     #[test]
     fn test_gs_high_below_new_threshold_is_ok() {
         // 0.4° high GS: below GS_SLIGHT_HIGH (0.5°) → OK.
         let g = gates_deg(0.4, 0.0, 0.0, 0.0, 0.0, 0.0);
-        assert_eq!(grade_from_gates(&g, &[], None), PassGrade::Ok);
+        assert_eq!(grade_from_gates(&g, &[], None, None), PassGrade::Ok);
     }
 
     #[test]
     fn test_slight_lu_deviation_is_ok_parentheses() {
         // 1.1° LU at half nm: exceeds LU_SLIGHT (1.0°) → (OK).
         let g = gates_deg(0.2, 0.3, 0.1, 1.1, 0.1, 0.1);
-        assert_eq!(grade_from_gates(&g, &[], None), PassGrade::OkParentheses);
+        assert_eq!(
+            grade_from_gates(&g, &[], None, None),
+            PassGrade::OkParentheses
+        );
     }
 
     #[test]
     fn test_catobar_significant_gs_threshold_is_1_0() {
         // The boundary is inclusive: 1.0° high GS is no-grade.
         let g = gates_deg(1.0, 0.3, 0.1, 0.2, 0.1, 0.1);
-        assert_eq!(grade_from_gates(&g, &[], None), PassGrade::NoGrade);
+        assert_eq!(grade_from_gates(&g, &[], None, None), PassGrade::NoGrade);
     }
 
     #[test]
     fn test_significant_lu_deviation_is_no_grade() {
         // 3.1° LU at 1/4 nm: exceeds LU_SIGNIFICANT (3.0°) → --.
         let g = gates_deg(0.2, 0.3, 0.1, 0.2, 0.1, 3.1);
-        assert_eq!(grade_from_gates(&g, &[], None), PassGrade::NoGrade);
+        assert_eq!(grade_from_gates(&g, &[], None, None), PassGrade::NoGrade);
     }
 
     #[test]
     fn test_medium_lu_deviation_is_no_grade() {
         // 2.1° LU at 3/4 nm: exceeds LU_MEDIUM (2.0°) → --.
         let g = gates_deg(0.0, 2.1, 0.0, 0.0, 0.0, 0.0);
-        assert_eq!(grade_from_gates(&g, &[], None), PassGrade::NoGrade);
+        assert_eq!(grade_from_gates(&g, &[], None, None), PassGrade::NoGrade);
     }
 
     #[test]
     fn test_below_medium_lu_is_ok_parentheses() {
         // 1.9° LU: above LU_SLIGHT but below LU_MEDIUM → (OK).
         let g = gates_deg(0.0, 1.9, 0.0, 0.0, 0.0, 0.0);
-        assert_eq!(grade_from_gates(&g, &[], None), PassGrade::OkParentheses);
+        assert_eq!(
+            grade_from_gates(&g, &[], None, None),
+            PassGrade::OkParentheses
+        );
     }
 
     #[test]
     fn test_dangerously_low_at_quarter_nm_is_cut() {
         // −2.6° GS at 1/4 nm: below GS_CUT_LOW_DEG (−2.5°) → Cut.
         let g = gates_deg(0.0, 0.0, 0.0, 0.0, -2.6, 0.0);
-        assert_eq!(grade_from_gates(&g, &[], None), PassGrade::Cut);
+        assert_eq!(grade_from_gates(&g, &[], None, None), PassGrade::Cut);
     }
 
     #[test]
     fn test_low_at_earlier_gates_not_cut() {
         // −2.6° GS only at 3/4 nm (not at 1/4 nm) → NoGrade, not Cut.
         let g = gates_deg(-2.6, 0.0, 0.0, 0.0, 0.0, 0.0);
-        assert_eq!(grade_from_gates(&g, &[], None), PassGrade::NoGrade);
+        assert_eq!(grade_from_gates(&g, &[], None, None), PassGrade::NoGrade);
     }
 
     fn trajectory_point(
@@ -926,8 +961,11 @@ mod tests {
             trajectory_point(710.0, 1.2, 0.0),
             trajectory_point(700.0, 1.2, 0.0),
         ];
-        assert_eq!(grade_from_gates(&g, &[], None), PassGrade::Ok);
-        assert_eq!(grade_from_gates(&g, &trajectory, None), PassGrade::NoGrade);
+        assert_eq!(grade_from_gates(&g, &[], None, None), PassGrade::Ok);
+        assert_eq!(
+            grade_from_gates(&g, &trajectory, None, None),
+            PassGrade::NoGrade
+        );
     }
 
     #[test]
@@ -938,7 +976,7 @@ mod tests {
         // clean approach — see `PERSISTENCE_MIN_CONSECUTIVE_SAMPLES`.
         let g = gates_deg(0.1, 0.1, 0.1, 0.1, 0.1, 0.1);
         let trajectory = [trajectory_point(700.0, 1.2, 0.0)];
-        assert_eq!(grade_from_gates(&g, &trajectory, None), PassGrade::Ok);
+        assert_eq!(grade_from_gates(&g, &trajectory, None, None), PassGrade::Ok);
     }
 
     #[test]
@@ -949,7 +987,7 @@ mod tests {
             trajectory_point(700.0, 0.0, 1.5),
         ];
         assert_eq!(
-            grade_from_gates(&g, &trajectory, None),
+            grade_from_gates(&g, &trajectory, None, None),
             PassGrade::OkParentheses
         );
     }
@@ -960,8 +998,8 @@ mod tests {
         let g = gates_deg(1.2, 0.0, 0.0, 0.0, 0.0, 0.0);
         let trajectory = [trajectory_point(700.0, 0.1, 0.0)];
         assert_eq!(
-            grade_from_gates(&g, &trajectory, None),
-            grade_from_gates(&g, &[], None)
+            grade_from_gates(&g, &trajectory, None, None),
+            grade_from_gates(&g, &[], None, None)
         );
     }
 
@@ -973,7 +1011,10 @@ mod tests {
         // alone would miss.
         let g = gates_deg(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         let trajectory = [trajectory_point(400.0, -2.6, 0.0)];
-        assert_eq!(grade_from_gates(&g, &trajectory, None), PassGrade::Cut);
+        assert_eq!(
+            grade_from_gates(&g, &trajectory, None, None),
+            PassGrade::Cut
+        );
     }
 
     #[test]
@@ -987,7 +1028,10 @@ mod tests {
             trajectory_point(710.0, -2.6, 0.0),
             trajectory_point(700.0, -2.6, 0.0),
         ];
-        assert_eq!(grade_from_gates(&g, &trajectory, None), PassGrade::NoGrade);
+        assert_eq!(
+            grade_from_gates(&g, &trajectory, None, None),
+            PassGrade::NoGrade
+        );
     }
 
     fn danger_point(distance_m: f64, sink_rate_mps: f64, bank_deg: f64) -> TrajectoryDeviation {
@@ -1014,7 +1058,10 @@ mod tests {
             danger_point(380.0, 8.5, 0.0),
             danger_point(360.0, 8.2, 0.0),
         ];
-        assert_eq!(grade_from_gates(&g, &trajectory, None), PassGrade::Cut);
+        assert_eq!(
+            grade_from_gates(&g, &trajectory, None, None),
+            PassGrade::Cut
+        );
     }
 
     #[test]
@@ -1024,7 +1071,7 @@ mod tests {
         // an otherwise clean pass.
         let g = gates_deg(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         let trajectory = [danger_point(400.0, 8.5, 0.0), danger_point(380.0, 8.5, 0.0)];
-        assert_eq!(grade_from_gates(&g, &trajectory, None), PassGrade::Ok);
+        assert_eq!(grade_from_gates(&g, &trajectory, None, None), PassGrade::Ok);
     }
 
     #[test]
@@ -1037,7 +1084,7 @@ mod tests {
             danger_point(710.0, 9.0, 0.0),
             danger_point(700.0, 9.0, 0.0),
         ];
-        assert_eq!(grade_from_gates(&g, &trajectory, None), PassGrade::Ok);
+        assert_eq!(grade_from_gates(&g, &trajectory, None, None), PassGrade::Ok);
     }
 
     #[test]
@@ -1051,7 +1098,10 @@ mod tests {
             danger_point(380.0, 0.0, -31.0),
             danger_point(360.0, 0.0, -33.0),
         ];
-        assert_eq!(grade_from_gates(&g, &trajectory, None), PassGrade::Cut);
+        assert_eq!(
+            grade_from_gates(&g, &trajectory, None, None),
+            PassGrade::Cut
+        );
     }
 
     #[test]
@@ -1064,7 +1114,7 @@ mod tests {
             danger_point(380.0, 0.0, 12.0),
             danger_point(360.0, 0.0, 12.0),
         ];
-        assert_eq!(grade_from_gates(&g, &trajectory, None), PassGrade::Ok);
+        assert_eq!(grade_from_gates(&g, &trajectory, None, None), PassGrade::Ok);
     }
 
     #[test]
@@ -1080,7 +1130,7 @@ mod tests {
             trajectory_point_at(4.0, 500.0, 0.45, 0.0),
         ];
         assert_eq!(
-            grade_from_gates(&g, &trajectory, None),
+            grade_from_gates(&g, &trajectory, None, None),
             PassGrade::OkParentheses
         );
     }
@@ -1095,7 +1145,7 @@ mod tests {
             trajectory_point_at(0.0, 900.0, 0.45, 0.0),
             trajectory_point_at(4.0, 500.0, 0.05, 0.0),
         ];
-        assert_eq!(grade_from_gates(&g, &trajectory, None), PassGrade::Ok);
+        assert_eq!(grade_from_gates(&g, &trajectory, None, None), PassGrade::Ok);
     }
 
     #[test]
@@ -1107,7 +1157,7 @@ mod tests {
             trajectory_point_at(0.0, 900.0, 0.10, 0.0),
             trajectory_point_at(4.0, 500.0, 0.15, 0.0),
         ];
-        assert_eq!(grade_from_gates(&g, &trajectory, None), PassGrade::Ok);
+        assert_eq!(grade_from_gates(&g, &trajectory, None, None), PassGrade::Ok);
     }
 
     #[test]
@@ -1123,7 +1173,7 @@ mod tests {
             trajectory_point_at(21.0, 500.0, 0.40, 0.0),
         ];
         assert_eq!(
-            grade_from_gates(&g, &trajectory, None),
+            grade_from_gates(&g, &trajectory, None, None),
             PassGrade::OkParentheses
         );
     }
@@ -1138,7 +1188,7 @@ mod tests {
             trajectory_point_at(4.0, 500.0, 0.45, 0.0),
         ];
         assert_eq!(
-            grade_from_gates(&g, &trajectory, None),
+            grade_from_gates(&g, &trajectory, None, None),
             PassGrade::OkParentheses
         );
     }
@@ -1149,7 +1199,7 @@ mod tests {
         // rather than panic or divide by zero.
         let g = gates_deg(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         let trajectory = [trajectory_point_at(0.0, 700.0, 0.05, 0.0)];
-        assert_eq!(grade_from_gates(&g, &trajectory, None), PassGrade::Ok);
+        assert_eq!(grade_from_gates(&g, &trajectory, None, None), PassGrade::Ok);
     }
 
     #[test]
@@ -1166,7 +1216,7 @@ mod tests {
             trajectory_point_at(3.0, 600.0, -0.4, 0.0),
         ];
         assert_eq!(
-            grade_from_gates(&g, &trajectory, None),
+            grade_from_gates(&g, &trajectory, None, None),
             PassGrade::OkParentheses
         );
     }
@@ -1182,7 +1232,7 @@ mod tests {
             trajectory_point_at(1.0, 800.0, 0.4, 0.0),
             trajectory_point_at(2.0, 700.0, 0.1, 0.0),
         ];
-        assert_eq!(grade_from_gates(&g, &trajectory, None), PassGrade::Ok);
+        assert_eq!(grade_from_gates(&g, &trajectory, None, None), PassGrade::Ok);
     }
 
     #[test]
@@ -1196,7 +1246,7 @@ mod tests {
             trajectory_point_at(2.0, 700.0, 0.0, 0.1),
             trajectory_point_at(3.0, 600.0, 0.0, -0.1),
         ];
-        assert_eq!(grade_from_gates(&g, &trajectory, None), PassGrade::Ok);
+        assert_eq!(grade_from_gates(&g, &trajectory, None, None), PassGrade::Ok);
     }
 
     #[test]
@@ -1206,7 +1256,10 @@ mod tests {
         // LATE_WINDOW_DISTANCE_M, with no room left to correct -- caps it at NoGrade instead.
         let g = gates_deg(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         let trajectory = [trajectory_point(100.0, 0.9, 0.0)];
-        assert_eq!(grade_from_gates(&g, &trajectory, None), PassGrade::NoGrade);
+        assert_eq!(
+            grade_from_gates(&g, &trajectory, None, None),
+            PassGrade::NoGrade
+        );
     }
 
     #[test]
@@ -1215,7 +1268,10 @@ mod tests {
         // LU_MEDIUM (2.0).
         let g = gates_deg(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         let trajectory = [trajectory_point(100.0, 0.0, 1.6)];
-        assert_eq!(grade_from_gates(&g, &trajectory, None), PassGrade::NoGrade);
+        assert_eq!(
+            grade_from_gates(&g, &trajectory, None, None),
+            PassGrade::NoGrade
+        );
     }
 
     #[test]
@@ -1231,7 +1287,7 @@ mod tests {
             trajectory_point(700.0, 0.9, 0.0),
         ];
         assert_eq!(
-            grade_from_gates(&g, &trajectory, None),
+            grade_from_gates(&g, &trajectory, None, None),
             PassGrade::OkParentheses
         );
     }
@@ -1248,7 +1304,7 @@ mod tests {
             trajectory_point(100.0, 0.6, 0.0),
         ];
         assert_eq!(
-            grade_from_gates(&g, &trajectory, None),
+            grade_from_gates(&g, &trajectory, None, None),
             PassGrade::OkParentheses
         );
     }
@@ -1259,7 +1315,10 @@ mod tests {
         // late-window check only ever holds back Ok/(OK), like trend does for Ok alone.
         let g = gates_deg(1.2, 0.0, 0.0, 0.0, 0.0, 0.0);
         let trajectory = [trajectory_point(100.0, 0.9, 0.0)];
-        assert_eq!(grade_from_gates(&g, &trajectory, None), PassGrade::NoGrade);
+        assert_eq!(
+            grade_from_gates(&g, &trajectory, None, None),
+            PassGrade::NoGrade
+        );
     }
 
     #[test]
@@ -1269,14 +1328,17 @@ mod tests {
         // must not somehow soften that to NoGrade.
         let g = gates_deg(0.0, 0.0, 0.0, 0.0, -2.6, 0.0);
         let trajectory = [trajectory_point(100.0, 0.9, 0.0)];
-        assert_eq!(grade_from_gates(&g, &trajectory, None), PassGrade::Cut);
+        assert_eq!(
+            grade_from_gates(&g, &trajectory, None, None),
+            PassGrade::Cut
+        );
     }
 
     #[test]
     fn test_bolter_outcome() {
         let g = gates_deg(0.2, 0.3, 0.1, 0.2, 0.1, 0.1);
         assert_eq!(
-            compute_pass_grade(&Grading::Bolter, &g, &[], None),
+            compute_pass_grade(&Grading::Bolter, &g, &[], None, None),
             PassGrade::Bolter
         );
     }
@@ -1285,7 +1347,7 @@ mod tests {
     fn test_waveoff_outcome() {
         let g = GateDeviations::default();
         assert_eq!(
-            compute_pass_grade(&Grading::WaveoffUnknown, &g, &[], None),
+            compute_pass_grade(&Grading::WaveoffUnknown, &g, &[], None, None),
             PassGrade::WaveoffUnknown
         );
     }
@@ -1304,7 +1366,7 @@ mod tests {
             cable_estimated: Some(3),
         };
         assert_eq!(
-            compute_pass_grade(&grading, &g, &[], Some(16.5)),
+            compute_pass_grade(&grading, &g, &[], Some(16.5), None),
             PassGrade::Perfect
         );
     }
@@ -1322,7 +1384,7 @@ mod tests {
             cable_estimated: Some(4),
         };
         assert_eq!(
-            compute_pass_grade(&grading, &g, &[], Some(16.5)),
+            compute_pass_grade(&grading, &g, &[], Some(16.5), None),
             PassGrade::Perfect
         );
     }
@@ -1337,11 +1399,11 @@ mod tests {
             cable_estimated: Some(3),
         };
         assert_eq!(
-            compute_pass_grade(&grading, &g, &[], Some(15.0)),
+            compute_pass_grade(&grading, &g, &[], Some(15.0), None),
             PassGrade::Perfect
         );
         assert_eq!(
-            compute_pass_grade(&grading, &g, &[], Some(18.0)),
+            compute_pass_grade(&grading, &g, &[], Some(18.0), None),
             PassGrade::Perfect
         );
     }
@@ -1354,11 +1416,11 @@ mod tests {
             cable_estimated: Some(3),
         };
         assert_eq!(
-            compute_pass_grade(&grading, &g, &[], Some(14.99)),
+            compute_pass_grade(&grading, &g, &[], Some(14.99), None),
             PassGrade::Ok
         );
         assert_eq!(
-            compute_pass_grade(&grading, &g, &[], Some(18.01)),
+            compute_pass_grade(&grading, &g, &[], Some(18.01), None),
             PassGrade::Ok
         );
     }
@@ -1374,7 +1436,7 @@ mod tests {
             cable_estimated: Some(3),
         };
         assert_eq!(
-            compute_pass_grade(&grading, &g, &[], Some(16.5)),
+            compute_pass_grade(&grading, &g, &[], Some(16.5), None),
             PassGrade::Ok
         );
     }
@@ -1391,7 +1453,7 @@ mod tests {
             cable_estimated: Some(3),
         };
         assert_eq!(
-            compute_pass_grade(&grading, &g, &[], Some(16.5)),
+            compute_pass_grade(&grading, &g, &[], Some(16.5), None),
             PassGrade::Ok
         );
     }
@@ -1412,7 +1474,7 @@ mod tests {
             trajectory_point(600.0, 0.1, 0.1),
         ];
         assert_eq!(
-            compute_pass_grade(&grading, &g, &trajectory, Some(16.5)),
+            compute_pass_grade(&grading, &g, &trajectory, Some(16.5), None),
             PassGrade::Perfect
         );
     }
@@ -1435,7 +1497,7 @@ mod tests {
             trajectory_point(550.0, 0.1, 0.1),
         ];
         assert_eq!(
-            compute_pass_grade(&grading, &g, &trajectory, Some(16.5)),
+            compute_pass_grade(&grading, &g, &trajectory, Some(16.5), None),
             PassGrade::Ok
         );
     }
@@ -1449,7 +1511,7 @@ mod tests {
             cable_estimated: Some(3),
         };
         assert_eq!(
-            compute_pass_grade(&grading, &g, &[], Some(12.0)),
+            compute_pass_grade(&grading, &g, &[], Some(12.0), None),
             PassGrade::Ok
         );
     }
@@ -1463,7 +1525,7 @@ mod tests {
             cable_estimated: Some(3),
         };
         assert_eq!(
-            compute_pass_grade(&grading, &g, &[], Some(22.0)),
+            compute_pass_grade(&grading, &g, &[], Some(22.0), None),
             PassGrade::Ok
         );
     }
@@ -1477,7 +1539,7 @@ mod tests {
             cable_estimated: Some(3),
         };
         assert_eq!(
-            compute_pass_grade(&grading, &g, &[], Some(16.5)),
+            compute_pass_grade(&grading, &g, &[], Some(16.5), None),
             PassGrade::OkParentheses
         );
     }
@@ -1490,7 +1552,10 @@ mod tests {
             cable: Some(3),
             cable_estimated: Some(3),
         };
-        assert_eq!(compute_pass_grade(&grading, &g, &[], None), PassGrade::Ok);
+        assert_eq!(
+            compute_pass_grade(&grading, &g, &[], None, None),
+            PassGrade::Ok
+        );
     }
 
     #[test]
@@ -1501,7 +1566,7 @@ mod tests {
         };
 
         assert_eq!(
-            compute_pass_grade(&grading, &g, &[], Some(16.5)),
+            compute_pass_grade(&grading, &g, &[], Some(16.5), None),
             PassGrade::OkParentheses
         );
     }
@@ -1514,7 +1579,7 @@ mod tests {
         };
 
         assert_eq!(
-            compute_pass_grade(&grading, &g, &[], Some(16.5)),
+            compute_pass_grade(&grading, &g, &[], Some(16.5), None),
             PassGrade::Ok
         );
     }

@@ -185,11 +185,32 @@ fn f14_aoa_rating(aoa: f64) -> Aoa {
     }
 }
 
-/// Hook position shared by all F-14 variants (extracted via ModelViewer2).
-const F14_HOOK: DVec3 = DVec3 {
+/// Raw hook position shared by all F-14 variants, as extracted via ModelViewer2.
+const F14_HOOK_MODEL: DVec3 = DVec3 {
     x: 0.0,
     y: -1.978941,
     z: -6.563727,
+};
+
+/// Empirical vertical correction applied on top of `F14_HOOK_MODEL`. A live human test (5
+/// September 2026, evening, F-14B(U)) measured the modelled hook sitting ~0.8-1.1 m *below* deck
+/// level while the aircraft was physically on deck or rolling through a wire (`alt_m` in
+/// `trajectory_deviations` reaching -0.67 to -1.1 m instead of ~0.0 m; the T-45's own extracted
+/// hook offset shows 0.0 m at touchdown by comparison). This inflated near-deck GS deviations
+/// (a bolter measured 0.06° from the sink-rate/bank Cut), fed a spurious "below-deck ⇒ contact"
+/// reading (see the `Bolter`-without-proof fix in `Track::next`), and is the likely common cause
+/// of the wire-estimate bias tracked separately (`Track::wire_estimate_at`). PROJECT-DERIVED, not
+/// a ModelViewer2 re-extraction: applied until a fresh ModelViewer2 measurement is available
+/// (see tasking-roadmap.md) and until F-14A/F-14B are checked against a human recording of their
+/// own (this constant is shared by all three variants).
+const F14_HOOK_VERTICAL_CORRECTION_M: f64 = 1.0;
+
+/// Hook position shared by all F-14 variants: `F14_HOOK_MODEL` plus the empirical vertical
+/// correction above.
+const F14_HOOK: DVec3 = DVec3 {
+    x: F14_HOOK_MODEL.x,
+    y: F14_HOOK_MODEL.y + F14_HOOK_VERTICAL_CORRECTION_M,
+    z: F14_HOOK_MODEL.z,
 };
 
 /// Hook-animation draw-argument index shared by all F-14 variants (distinct from the F/A-18C

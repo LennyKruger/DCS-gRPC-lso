@@ -128,6 +128,30 @@ This file records user-visible changes. The crate version remains `0.2.0`; chang
 - A go-around that overflew the deck well above deck level was classified `Bolter` instead of
   `WaveoffUnknown`; `crossed_deck_threshold` now also requires the aircraft to be near deck level
   (`DECK_CROSSING_ALT_CAP_FT = 50 ft`) at the moment of crossing.
+- Confirmed live 5 September 2026 (evening, human test): the 50 ft guard above still let a
+  purely geometric deck crossing with no confirmed contact and no DCS event at all (survol
+  measured at 8.7 m) be classified `Bolter`. The geometry-only `Bolter` path (no event ever
+  correlated) now additionally requires hook altitude at the crossing to be at or below
+  `DECK_CONTACT_CONFIRMATION_ALT_M = 1.0 m` (`deck_crossing_confirmed_contact`); otherwise the
+  pass is `WaveoffUnknown`. Separately, `Track::finish()` now refuses a `Bolter` outright when the
+  DCS LQM itself opens with `GRADE:WO` (`dcs_grade_is_waveoff`) — not inventing a waveoff author,
+  only declining a bolter DCS's own grading directly contradicts, as observed on a pass graded
+  `GRADE:WO ... WO(AFU)IC` by the LSO with no `runway_touch`/`land` event.
+- F-14 (all variants) hook geometry (`F14_HOOK`, `src/data.rs`) modelled the hook ~0.8-1.1 m below
+  actual deck level while the aircraft was physically on deck/rolling through a wire (T-45 reads
+  ~0.0 m at touchdown by comparison). Corrected with an empirical `+1.0 m` vertical offset on top
+  of the ModelViewer2-extracted position, pending a fresh ModelViewer2 remeasurement and human
+  confirmation on F-14A/F-14B specifically (see `tasking-roadmap.md`). This bias was feeding a
+  spurious "hook below deck ⇒ contact" reading on the item above, inflating near-deck GS
+  deviations, and is the likely common cause of the wire-estimate bias tracked separately.
+- Hook-position calibration (`calibrated_hook_state`) could read a raw sample taken while the
+  crosse was physically pressed against the deck (reads `0.0`, i.e. "up") as evidence, because the
+  cut-off used to select which samples to interpret was the event-correlated `landing_time`, which
+  lags true physical contact by ~0.2-1 s. On a confirmed live T-45 trap this window alone would
+  have produced an invented `TouchAndGo` on a real arrest without the DCS LQM as a safety net.
+  Interpretation is now frozen at the first *geometric* hook contact
+  (`first_hook_ground_contact_time`, `alt <= 0.0`), whichever of that or `landing_time` fires
+  first.
 - Event-stream errors and clean closure no longer become positional `telemetry_gap`; existing gates
   remain intact while outcome availability is assessed separately.
 - Plane/carrier respawns with a changed ID abort every stale same-name task within the current
@@ -181,6 +205,30 @@ This file records user-visible changes. The crate version remains `0.2.0`; chang
 
 ### Changed
 
+- CATOBAR groove-entry roll-out check (`is_rolled_out`, `src/track.rs`): the ground-track-angle
+  proxy for "tracking down the groove axis" now fits a least-squares linear regression of position
+  against time over the whole buffered `gate_samples` window (`track_velocity_regression`), instead
+  of comparing only the two endpoint samples of that buffer. A single noisy or skewed telemetry
+  frame sitting right at either edge of the window can no longer swing the whole estimate on its
+  own, since every sample in the window now contributes to the fit. Precision improvement only:
+  `GROOVE_ROLLOUT_MAX_TRACK_ANGLE_DEG`/`GROOVE_ROLLOUT_MAX_BANK_DEG` and the underlying doctrine
+  (NAVAIR 00-80T-105 groove entry as a "roll wings level" event, not a fixed distance) are
+  unchanged; no new `PROJECT-DERIVED` threshold introduced. An "on speed" (AoA) proxy was
+  considered and explicitly rejected: this project's AoA is only a geometric approximation, never
+  a value exposed by DCS-gRPC, and was judged too unreliable to gate groove-entry detection on.
+- CATOBAR `_OK_`/`OK`/`(OK)` no longer unconditionally requires the 3/4 NM gate
+  (`GateDeviations::all_valid`/`three_quarter_counts`, `src/track.rs`; `grade_from_gates`,
+  `src/grading.rs`): when that gate was captured *before* roll-out-confirmed groove entry
+  (`Track::groove_entry_time`) -- present or not, valid or not -- it counts toward neither
+  completeness nor GS/lineup amplitude, and only the 1/2 NM and 1/4 NM gates (plus the continuous
+  trajectory) are required/scored. On a real Case I pattern the 3/4 NM gate routinely falls in the
+  base-to-final turn rather than the groove (confirmed live 5 September 2026, evening: 7 of 8 human
+  passes, lineup up to -10.5° at that gate), imposing `--` regardless of the actual groove that
+  followed. A 3/4 NM gate captured *after* groove entry is unaffected. V/STOL keeps the historical
+  unconditional rule (it has no roll-out-confirmed groove entry to anchor this on); `cadence-ab`
+  also keeps it, since it never re-derives groove entry from a replay. `PROJECT-DERIVED`; not
+  revalidated on live mission data yet (no NATOPS text makes any fixed gate crossing a
+  qualification requirement in the first place -- see `AGENTS.md`, "Gates, outcomes et câble").
 - CATOBAR grading now takes the worst GS/lineup amplitude across the continuous trajectory as well
   as the three gates, not the three gates alone; a significant excursion strictly between two gates
   (previously invisible to grading) can now downgrade the pass, and a dip below the Cut threshold

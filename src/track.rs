@@ -66,6 +66,16 @@ pub(crate) const GATE_QUARTER_NM: f64 = 463.0;
 /// tighter than the 300 ft groove-entry guard rather than reusing it.
 const DECK_CROSSING_ALT_CAP_FT: f64 = 50.0;
 
+/// Hook altitude (relative to deck level) at the exact tick the aircraft's longitudinal position
+/// first crosses the deck threshold, at or below which that crossing counts as **confirmed
+/// physical contact** rather than merely a low fly-over. Deliberately much tighter than
+/// `DECK_CROSSING_ALT_CAP_FT` above (which only rejects a *high* go-around's threshold crossing):
+/// confirmed live, a genuine survol at 8.7 m (~28 ft, comfortably inside the 50 ft cap) produced
+/// no contact at all and was still misclassified as `Bolter` with zero proof of a touch (5
+/// September 2026, human test). PROJECT-DERIVED: chosen to tolerate deck heave/telemetry noise
+/// around a genuine touch, not calibrated on a large corpus.
+const DECK_CONTACT_CONFIRMATION_ALT_M: f64 = 1.0;
+
 /// Exponential moving average (EMA) smoothing factor for the carrier position.
 ///
 /// DCS updates the carrier's world position in discrete steps (~every 1.4 s at
@@ -423,6 +433,19 @@ pub struct Track {
     smoothed_carrier_pos: Option<DVec3>,
     hook_observation: HookObservation,
     crossed_deck_threshold: bool,
+    /// Set alongside `crossed_deck_threshold`, at the same single tick: whether the hook altitude
+    /// at that exact threshold crossing was at or below `DECK_CONTACT_CONFIRMATION_ALT_M`, i.e.
+    /// whether the crossing represents confirmed physical contact rather than merely a low
+    /// fly-over. Gates the geometry-only `Bolter` path in `Track::next` (see that constant).
+    deck_crossing_confirmed_contact: bool,
+    /// DCS simulation time of the first sample where the hook geometrically reaches deck level
+    /// (`alt <= 0.0`) for an arrested recovery. Used instead of the event-correlated
+    /// `landing_time` (which can lag the physical contact by ~0.2-1 s) to freeze which hook
+    /// samples `calibrated_hook_state` may interpret: a raw reading taken while the crosse is
+    /// pressed against the deck reads as `0.0` regardless of true hook position and must never be
+    /// mistaken for "hook up" (confirmed live 5 September 2026: this contamination would have
+    /// invented a `TouchAndGo` on a real trap without the DCS LQM as a safety net).
+    first_hook_ground_contact_time: Option<f64>,
     telemetry_quality: TelemetryQuality,
     events: Vec<EventEvidence>,
     spot_zone: SpotZoneObservation,
@@ -507,7 +530,48 @@ pub struct GateDeviations {
 }
 
 impl GateDeviations {
-    pub fn all_valid(&self) -> bool {
+    /// Whether the 3/4 NM gate counts at all, for both completeness (`all_valid`) and grading
+    /// amplitude (`grade_from_gates`, `src/grading.rs`), given `groove_entry_time` (the DCS
+    /// simulation time of roll-out-confirmed groove entry, CATOBAR only,
+    /// `Track::groove_entry_time`). `None` always counts it -- the historical rule, and the one
+    /// V/STOL keeps (see the callers in `src/grading.rs`).
+    ///
+    /// When `groove_entry_time` is known and the 3/4 NM gate's timestamp precedes it (or the gate
+    /// was never captured at all -- groove entry's own box condition, `x <=
+    /// GATE_THREE_QUARTER_NM`, guarantees the crossing already happened by the time groove entry
+    /// is confirmed, present gate or not), the 3/4 NM gate **does not count**: on a real Case I
+    /// pattern the aircraft is typically still turning final at that distance
+    /// (`GATE_THREE_QUARTER_NM` sits well inside the base-to-final turn for a human abeam
+    /// position), so a GS/lineup reading captured there reflects the turn, not a deviation from
+    /// the groove the pass is actually being judged on. Confirmed live 5 September 2026 (evening,
+    /// human test): the 3/4 NM gate was captured before roll-out confirmation on 7 of 8 passes,
+    /// with lineup readings up to -10.5°, imposing `--` on otherwise-clean approaches regardless
+    /// of what followed in the groove. `PROJECT-DERIVED`: NATOPS never makes any fixed gate
+    /// crossing a qualification requirement in the first place (see `AGENTS.md`, "Gates, outcomes
+    /// et câble") -- only the 1/2 NM and 1/4 NM gates, which land inside the groove on a real Case
+    /// I pattern far more reliably, are kept as an unconditional requirement. Non revalidé en
+    /// mission live (voir tasking-roadmap.md).
+    pub(crate) fn three_quarter_counts(&self, groove_entry_time: Option<f64>) -> bool {
+        match (&self.at_three_quarter_nm, groove_entry_time) {
+            (Some(gate), Some(entry)) => gate.timestamp_dcs >= entry,
+            (None, Some(_)) => false,
+            _ => true,
+        }
+    }
+
+    /// Whether the gate evidence is sufficient to award a favourable grade. See
+    /// `three_quarter_counts` for what `groove_entry_time` does here.
+    pub fn all_valid(&self, groove_entry_time: Option<f64>) -> bool {
+        if !self.three_quarter_counts(groove_entry_time) {
+            return self
+                .at_half_nm
+                .as_ref()
+                .zip(self.at_quarter_nm.as_ref())
+                .is_some_and(|(half, quarter)| half.timestamp_dcs < quarter.timestamp_dcs)
+                && self.half_quality.status == GateStatus::Valid
+                && self.quarter_quality.status == GateStatus::Valid;
+        }
+
         let ordered = self
             .at_three_quarter_nm
             .as_ref()
@@ -815,12 +879,55 @@ fn is_rolled_out(gate_samples: &VecDeque<ApproachSample>, bank_deg: f64) -> bool
         // rather than inventing a signal from noise.
         return false;
     }
-    // Track angle relative to the groove axis: 0 deg when travel over the window is straight
-    // down -x (inbound, toward the ship) with no lateral (y) drift.
-    let track_angle_deg = (newest.y - oldest.y)
-        .atan2(oldest.x - newest.x)
-        .to_degrees();
+    let Some((vx, vy)) = track_velocity_regression(gate_samples) else {
+        // Degenerate fit (fewer than two valid samples, or no time spread among them even
+        // though the buffer itself spans enough wall-clock time) -- same "wait, don't invent a
+        // signal" posture as the window-duration check above.
+        return false;
+    };
+    // Track angle relative to the groove axis: 0 deg when travel is straight down -x (inbound,
+    // toward the ship) with no lateral (y) drift.
+    let track_angle_deg = vy.atan2(-vx).to_degrees();
     track_angle_deg.abs() <= GROOVE_ROLLOUT_MAX_TRACK_ANGLE_DEG
+}
+
+/// Least-squares linear regression of `x` and `y` against `time` over every *valid* sample in
+/// `window`, returning the fitted ground-track velocity `(dx/dt, dy/dt)`.
+///
+/// Replaces comparing only the two endpoint samples of the buffer: a single noisy or skewed
+/// sample sitting right at either edge used to swing the whole track-angle estimate on its own,
+/// since it was one of only two points consulted. Fitting a trend line through every sample in
+/// the window means one noisy frame is outweighed by the rest of the window instead of dictating
+/// the result outright -- a precision improvement only, not a change to what "wings level,
+/// tracking down the groove" means (see the constants block above); it introduces no new
+/// `PROJECT-DERIVED` threshold, does not change `GROOVE_ROLLOUT_MAX_TRACK_ANGLE_DEG` itself, and
+/// (like the endpoint comparison it replaces) does not filter on `ApproachSample::valid` --
+/// telemetry validity is already enforced upstream of `gate_samples` (see `Track::next`'s
+/// `sample.is_valid()` gating elsewhere), not re-litigated here.
+fn track_velocity_regression(window: &VecDeque<ApproachSample>) -> Option<(f64, f64)> {
+    if window.len() < 2 {
+        return None;
+    }
+    let count = window.len() as f64;
+    let t_mean = window.iter().map(|sample| sample.time).sum::<f64>() / count;
+    let x_mean = window.iter().map(|sample| sample.x).sum::<f64>() / count;
+    let y_mean = window.iter().map(|sample| sample.y).sum::<f64>() / count;
+
+    let mut s_tt = 0.0;
+    let mut s_tx = 0.0;
+    let mut s_ty = 0.0;
+    for sample in window {
+        let dt = sample.time - t_mean;
+        s_tt += dt * dt;
+        s_tx += dt * (sample.x - x_mean);
+        s_ty += dt * (sample.y - y_mean);
+    }
+    if s_tt <= 0.0 {
+        // Every sample shares (numerically) the same timestamp -- no time spread to fit a slope
+        // against.
+        return None;
+    }
+    Some((s_tx / s_tt, s_ty / s_tt))
 }
 
 #[derive(Debug, Default, PartialEq, Eq, serde::Serialize)]
@@ -947,22 +1054,26 @@ impl Track {
             min_distance_state: None,
             smoothed_carrier_pos: None,
             hook_observation: HookObservation {
-                // "test_corpus" for the F/A-18C only: its `<= 0.2` up / `>= 0.8` down mapping was
-                // empirically confirmed. The T-45 and F-14 share the same draw-argument
-                // convention (a single 0..1 hook animation) and are interpreted with the same
-                // thresholds, but that specific polarity has not itself been independently
-                // confirmed for either -- "assumed", not "confirmed", until it is.
-                polarity: match plane_info.hook_draw_argument {
-                    Some(_) if plane_info.name == "F/A-18C Hornet" => {
-                        "fa18c_zero_up_one_down_test_corpus"
+                // "test_corpus" for the F/A-18C: its `<= 0.2` up / `>= 0.8` down mapping was
+                // empirically confirmed first. The T-45 and F-14B(U) share the same draw-argument
+                // convention (a single 0..1 hook animation) and were confirmed live in both
+                // directions on 5 September 2026 (human touch-and-go and arrested traps).
+                // F-14A/F-14B share the same draw-argument index as the F-14B(U) but remain an
+                // unconfirmed extrapolation pending their own human recording.
+                polarity: match (plane_info.name, plane_info.hook_draw_argument) {
+                    ("F/A-18C Hornet", Some(_)) => "fa18c_zero_up_one_down_test_corpus",
+                    ("T-45C Goshawk" | "F-14B(U) Tomcat", Some(_)) => {
+                        "zero_up_one_down_confirmed_live_20260905"
                     }
-                    Some(_) => "assumed_zero_up_one_down_pending_live_validation",
-                    None => "unknown_pending_live_validation",
+                    (_, Some(_)) => "assumed_zero_up_one_down_pending_live_validation",
+                    (_, None) => "unknown_pending_live_validation",
                 },
                 interpreted_state: "unknown",
                 ..HookObservation::default()
             },
             crossed_deck_threshold: false,
+            deck_crossing_confirmed_contact: false,
+            first_hook_ground_contact_time: None,
             telemetry_quality: TelemetryQuality::default(),
             events: Vec::new(),
             spot_zone: SpotZoneObservation::default(),
@@ -1249,9 +1360,15 @@ impl Track {
                     return false;
                 }
                 None if self.entered_groove => {
-                    // A deck crossing without an arrest is a bolter. Hook draw
-                    // arguments are retained as raw evidence but not interpreted
-                    // until polarity is validated for the deployed modules.
+                    // A deck crossing without an arrest is a bolter -- but only once physical
+                    // contact is actually confirmed (`deck_crossing_confirmed_contact`). This
+                    // branch never has an event-correlated touchdown (that case is handled by the
+                    // `Some(Grading::Recovered { .. })` arm above); relying on
+                    // `crossed_deck_threshold` alone let a plain low fly-over (confirmed live at
+                    // 8.7 m / ~28 ft, comfortably inside the 50 ft go-around guard) or a DCS
+                    // `GRADE:WO` waveoff be misclassified as `Bolter` with zero proof of a touch.
+                    // Hook draw arguments are retained as raw evidence but not interpreted until
+                    // polarity is validated for the deployed modules.
                     if self.crossed_deck_threshold && self.min_distance_state.is_some() {
                         if self.calibrated_hook_state() == CalibratedHookState::Up {
                             tracing::debug!("qualification touch-and-go detected");
@@ -1264,11 +1381,19 @@ impl Track {
                             });
                             return false;
                         }
-                        tracing::debug!(
-                            distance_in_m = distance,
-                            "bolter detected (deck crossing, no arrest)"
-                        );
-                        self.grading = Some(Grading::Bolter);
+                        if self.deck_crossing_confirmed_contact {
+                            tracing::debug!(
+                                distance_in_m = distance,
+                                "bolter detected (deck crossing, confirmed contact, no arrest)"
+                            );
+                            self.grading = Some(Grading::Bolter);
+                        } else {
+                            tracing::debug!(
+                                distance_in_m = distance,
+                                "waveoff detected (deck crossing without confirmed contact)"
+                            );
+                            self.grading = Some(Grading::WaveoffUnknown);
+                        }
                         return false;
                     }
 
@@ -1329,6 +1454,13 @@ impl Track {
             }
         };
 
+        if matches!(self.carrier_info.recovery, CarrierRecovery::Arrested)
+            && self.first_hook_ground_contact_time.is_none()
+            && alt <= 0.0
+        {
+            self.first_hook_ground_contact_time = Some(plane.time);
+        }
+
         let scoring_relevant =
             self.entered_groove || (x > 0.0 && x <= GATE_THREE_QUARTER_NM && m_to_ft(alt) <= 500.0);
         if scoring_relevant {
@@ -1360,6 +1492,7 @@ impl Track {
             && m_to_ft(alt) <= DECK_CROSSING_ALT_CAP_FT
         {
             self.crossed_deck_threshold = true;
+            self.deck_crossing_confirmed_contact = alt <= DECK_CONTACT_CONFIRMATION_ALT_M;
         }
 
         if x > 0.0 {
@@ -1372,6 +1505,8 @@ impl Track {
                 self.groove_entry_time = None;
                 self.entered_groove = false;
                 self.crossed_deck_threshold = false;
+                self.deck_crossing_confirmed_contact = false;
+                self.first_hook_ground_contact_time = None;
             }
             if x > GATE_HALF_NM {
                 self.gate_deviations.at_half_nm = None;
@@ -1748,6 +1883,18 @@ impl Track {
         };
         let grading = normalize_grading_for_recovery(grading, &self.carrier_info.recovery);
 
+        // A `Bolter` derived only from our own geometry is refused when the DCS LQM itself
+        // starts with `GRADE:WO` (a waveoff/go-around grade): this is not inventing a waveoff
+        // author, it is refusing a bolter that DCS's own grading directly contradicts. Confirmed
+        // live 5 September 2026: an LQM `GRADE:WO ... WO(AFU)IC` was received on a pass our
+        // geometry alone had called `Bolter`, with no `runway_touch`/`land` event at all.
+        let grading = match grading {
+            Grading::Bolter if dcs_grade_is_waveoff(self.dcs_grading.as_deref()) => {
+                Grading::WaveoffUnknown
+            }
+            other => other,
+        };
+
         // Reconcile `cable_estimated` with `wire_estimation`: both must describe the same
         // wire-crossing evidence, and `wire_estimation` above is the single, complete-history
         // computation (unlike the touchdown/deck-crossing call sites earlier in `Track::next`,
@@ -1786,6 +1933,7 @@ impl Track {
                 &self.gate_deviations,
                 &self.trajectory_deviations,
                 groove_time_secs,
+                self.groove_entry_time,
             );
             (grade, grade.points())
         };
@@ -1807,7 +1955,15 @@ impl Track {
                 (approach_grade, approach_points)
             };
 
-        if !self.gate_deviations.all_valid() {
+        // V/STOL keeps the unconditional three-gates rule (`None`): it has no roll-out-confirmed
+        // groove entry to distinguish a mid-turn 3/4 NM reading from a real one.
+        let three_quarter_groove_entry_time = (!self.carrier_info.is_vstol())
+            .then_some(self.groove_entry_time)
+            .flatten();
+        if !self
+            .gate_deviations
+            .all_valid(three_quarter_groove_entry_time)
+        {
             self.telemetry_quality
                 .add_unavailability_cause(Completeness::InsufficientGates);
         }
@@ -2002,7 +2158,13 @@ impl Track {
         }
         let in_groove = self.entered_groove;
         let in_final_window = in_groove && self.previous_x <= GATE_QUARTER_NM;
-        let before_touchdown = self.landing_time.is_none();
+        // Frozen at the first *geometric* hook contact (`alt <= 0.0`), not the event-correlated
+        // `landing_time`: the DCS touchdown event lags the physical contact by ~0.2-1 s, a window
+        // in which the raw draw argument reflects the crosse pressed against the deck (reads as
+        // `0.0`, i.e. "up") rather than its true position. Whichever signal fires first freezes
+        // interpretation, since either is proof contact has already happened.
+        let before_touchdown =
+            self.first_hook_ground_contact_time.is_none() && self.landing_time.is_none();
         match status {
             HookSampleStatus::Success => self.hook_observation.successful_samples += 1,
             HookSampleStatus::Timeout => self.hook_observation.timeout_samples += 1,
@@ -2609,6 +2771,13 @@ pub(crate) fn replay_gate_and_trajectory(
     (gate_deviations, trajectory_deviations)
 }
 
+/// Whether a DCS LQM comment opens with a `GRADE:WO` waveoff/go-around grade (e.g. `LSO:
+/// GRADE:WO : SLOX DRX (LURIM) DRIM (LURIC) WO(AFU)IC`). Used only to *refuse* a `Bolter` our own
+/// geometry derived without an event, never to invent a waveoff author.
+fn dcs_grade_is_waveoff(comment: Option<&str>) -> bool {
+    comment.is_some_and(|comment| comment.contains("GRADE:WO"))
+}
+
 fn parse_dcs_wire(comment: &str) -> Option<u8> {
     let (_, suffix) = comment.split_once("WIRE#")?;
     let suffix = suffix.trim_start();
@@ -2781,6 +2950,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn is_rolled_out_uses_a_trend_line_not_just_the_two_endpoint_samples() {
+        // A perfectly straight inbound track (y = 0 throughout, x decreasing at a constant
+        // 200 m/s) must confirm roll-out.
+        let clean: VecDeque<ApproachSample> = (0..5)
+            .map(|i| approach_sample(i as f64, 1000.0 - 200.0 * i as f64))
+            .collect();
+        assert!(is_rolled_out(&clean, 0.0));
+
+        // Regression for the switch from comparing only the buffer's two endpoint samples to a
+        // least-squares trend line over the whole window: a single noisy sample sitting right at
+        // the oldest edge (e.g. one skewed telemetry frame) must no longer dominate the result.
+        // With only the two endpoints compared, this exact offset at the oldest sample alone
+        // computes a ~15.4 deg track angle -- just over `GROOVE_ROLLOUT_MAX_TRACK_ANGLE_DEG`,
+        // wrongly denying a real roll-out for one bad frame. The trend line, informed by the
+        // other four clean samples, computes ~11.3 deg instead, comfortably inside the threshold.
+        let mut noisy_edge = clean.clone();
+        noisy_edge.front_mut().unwrap().y = 220.0;
+        assert!(is_rolled_out(&noisy_edge, 0.0));
+
+        // The same offset on an interior sample, away from either edge, has even less leverage
+        // on the fitted trend and must not deny roll-out either.
+        let mut noisy_middle = clean.clone();
+        noisy_middle[2].y = 220.0;
+        assert!(is_rolled_out(&noisy_middle, 0.0));
+    }
+
+    #[test]
+    fn is_rolled_out_still_rejects_a_track_genuinely_sweeping_across_the_groove_axis() {
+        // Not just noise-tolerant: a track whose lateral position keeps growing throughout the
+        // window (still sweeping through the box mid-turn, not settled on the groove axis) must
+        // still be rejected by the trend line, the same as it was by the two endpoints.
+        let sweeping: VecDeque<ApproachSample> = (0..5)
+            .map(|i| {
+                let mut sample = approach_sample(i as f64, 1000.0 - 200.0 * i as f64);
+                sample.y = 100.0 * i as f64;
+                sample
+            })
+            .collect();
+        assert!(!is_rolled_out(&sweeping, 0.0));
+    }
+
     fn gate(timestamp_dcs: f64) -> GateDatum {
         GateDatum {
             gs_deviation_deg: 0.0,
@@ -2918,18 +3129,96 @@ mod tests {
     #[test]
     fn zero_one_or_two_gates_are_incomplete_and_three_ordered_gates_are_valid() {
         let mut gates = GateDeviations::default();
-        assert!(!gates.all_valid());
+        assert!(!gates.all_valid(None));
         gates.at_three_quarter_nm = Some(gate(1.0));
         gates.three_quarter_quality = valid_quality();
-        assert!(!gates.all_valid());
+        assert!(!gates.all_valid(None));
         gates.at_half_nm = Some(gate(2.0));
         gates.half_quality = valid_quality();
-        assert!(!gates.all_valid());
+        assert!(!gates.all_valid(None));
         gates.at_quarter_nm = Some(gate(3.0));
         gates.quarter_quality = valid_quality();
-        assert!(gates.all_valid());
+        assert!(gates.all_valid(None));
         gates.at_quarter_nm.as_mut().unwrap().timestamp_dcs = 1.5;
-        assert!(!gates.all_valid());
+        assert!(!gates.all_valid(None));
+    }
+
+    #[test]
+    fn three_quarter_gate_before_groove_entry_is_not_required() {
+        // Regression for the relaxed rule: on a real Case I pattern the 3/4 NM gate is commonly
+        // captured while the aircraft is still turning final, well before roll-out-confirmed
+        // groove entry (confirmed live 5 September 2026, evening: 7 of 8 human passes). A pass
+        // with only 1/2 NM and 1/4 NM valid and ordered is still gradable when the 3/4 NM gate --
+        // present or not, valid or not -- was captured before groove entry.
+        let mut gates = GateDeviations {
+            at_half_nm: Some(gate(2.0)),
+            half_quality: valid_quality(),
+            at_quarter_nm: Some(gate(3.0)),
+            quarter_quality: valid_quality(),
+            ..Default::default()
+        };
+        // No 3/4 NM gate at all yet still gradable, as long as groove entry precedes it being
+        // required.
+        assert!(gates.all_valid(Some(1.5)));
+
+        // A 3/4 NM gate that failed validation (turn-induced lineup, say) but was captured before
+        // groove entry must not block grading either.
+        gates.at_three_quarter_nm = Some(gate(1.0));
+        gates.three_quarter_quality = GateQuality {
+            status: GateStatus::Invalid,
+            reason: Some("stale_skewed_or_reordered_gate_bracket".to_string()),
+            bracket_gap_ms: None,
+        };
+        assert!(gates.all_valid(Some(1.5)));
+
+        // The same gate, once captured *after* groove entry, is required again.
+        gates.at_three_quarter_nm.as_mut().unwrap().timestamp_dcs = 1.8;
+        assert!(!gates.all_valid(Some(1.5)));
+    }
+
+    #[test]
+    fn three_quarter_gate_after_groove_entry_is_still_required() {
+        // Companion test: when the 3/4 NM gate genuinely lands inside the groove (a tight
+        // roll-out) and was captured but failed validation, it still blocks the pass -- being
+        // *after* groove entry is what matters, not merely being present.
+        let mut gates = GateDeviations {
+            at_half_nm: Some(gate(2.0)),
+            half_quality: valid_quality(),
+            at_quarter_nm: Some(gate(3.0)),
+            quarter_quality: valid_quality(),
+            at_three_quarter_nm: Some(gate(1.0)),
+            three_quarter_quality: GateQuality {
+                status: GateStatus::Invalid,
+                reason: Some("stale_skewed_or_reordered_gate_bracket".to_string()),
+                bracket_gap_ms: None,
+            },
+        };
+        // Captured at t=1.0, after a groove entry at t=0.5: still required, and invalid.
+        assert!(!gates.all_valid(Some(0.5)));
+        // With no groove-entry timestamp at all, the historical unconditional rule applies too.
+        assert!(!gates.all_valid(None));
+
+        gates.three_quarter_quality = valid_quality();
+        assert!(gates.all_valid(Some(0.5)));
+        assert!(gates.all_valid(None));
+    }
+
+    #[test]
+    fn three_quarter_gate_missing_before_groove_entry_is_not_required() {
+        // A 3/4 NM gate that was never captured at all (e.g. a telemetry gap during the turn)
+        // must not be treated more strictly than one that was captured but turn-corrupted: groove
+        // entry's own box condition (`x <= GATE_THREE_QUARTER_NM`) guarantees the crossing already
+        // happened by the time groove entry is confirmed, present gate or not.
+        let gates = GateDeviations {
+            at_half_nm: Some(gate(2.0)),
+            half_quality: valid_quality(),
+            at_quarter_nm: Some(gate(3.0)),
+            quarter_quality: valid_quality(),
+            ..Default::default()
+        };
+        assert!(gates.all_valid(Some(1.5)));
+        // But an unknown groove-entry timestamp still falls back to the unconditional rule.
+        assert!(!gates.all_valid(None));
     }
 
     #[test]
@@ -2982,6 +3271,59 @@ mod tests {
         );
         assert_eq!(result.pass_grade, PassGrade::Incomplete);
         assert_eq!(result.grade_points, None);
+    }
+
+    #[test]
+    fn gate_before_groove_entry_does_not_block_an_otherwise_clean_catobar_pass() {
+        // End-to-end regression for the relaxed rule, through `Track::finish()`: a 3/4 NM gate
+        // with a turn-artifact lineup (-10.5 deg, matching a confirmed live human pass) captured
+        // before groove entry must no longer force `--`/`NoGrade` on an otherwise clean approach.
+        let carrier = CarrierInfo::by_type("CVN_71").unwrap();
+        let plane = AirplaneInfo::by_type("FA-18C_hornet").unwrap();
+        let mut track = Track::new("pilot", carrier, plane);
+        track.groove_entry_time = Some(1.5);
+        track.gate_deviations = GateDeviations {
+            at_three_quarter_nm: Some(GateDatum {
+                lineup_deg: -10.5,
+                timestamp_dcs: 1.0,
+                ..gate(1.0)
+            }),
+            at_half_nm: Some(gate(2.0)),
+            at_quarter_nm: Some(gate(3.0)),
+            three_quarter_quality: valid_quality(),
+            half_quality: valid_quality(),
+            quarter_quality: valid_quality(),
+        };
+        track.grading = Some(Grading::Recovered {
+            cable: Some(3),
+            cable_estimated: Some(3),
+        });
+
+        let result = track.finish();
+        assert_eq!(result.pass_grade, PassGrade::Ok);
+        assert!(result.telemetry_quality.completeness == Completeness::Complete);
+
+        // Companion: the same gate captured *after* groove entry still blocks the pass.
+        let mut late_track = Track::new("pilot", carrier, plane);
+        late_track.groove_entry_time = Some(0.5);
+        late_track.gate_deviations = GateDeviations {
+            at_three_quarter_nm: Some(GateDatum {
+                lineup_deg: -10.5,
+                timestamp_dcs: 1.0,
+                ..gate(1.0)
+            }),
+            at_half_nm: Some(gate(2.0)),
+            at_quarter_nm: Some(gate(3.0)),
+            three_quarter_quality: valid_quality(),
+            half_quality: valid_quality(),
+            quarter_quality: valid_quality(),
+        };
+        late_track.grading = Some(Grading::Recovered {
+            cable: Some(3),
+            cable_estimated: Some(3),
+        });
+        let late_result = late_track.finish();
+        assert_eq!(late_result.pass_grade, PassGrade::NoGrade);
     }
 
     #[test]
@@ -4173,6 +4515,144 @@ mod tests {
         };
         assert!(!track.next(&carrier_frame, &departure, None));
         assert_eq!(track.finish().grading, Grading::Bolter);
+    }
+
+    #[test]
+    fn low_flyover_without_confirmed_contact_is_a_waveoff_not_a_bolter() {
+        // Regression for a confirmed live bug (5 September 2026, human test): a survol at ~8.7 m
+        // (comfortably inside the 50 ft/`DECK_CROSSING_ALT_CAP_FT` go-around guard, but far above
+        // `DECK_CONTACT_CONFIRMATION_ALT_M`) never touched the deck and had no correlated DCS
+        // event, yet was still classified `Bolter` by the altitude-cap check alone.
+        let carrier_info = CarrierInfo::by_type("CVN_71").unwrap();
+        let plane_info = AirplaneInfo::by_type("FA-18C_hornet").unwrap();
+        let carrier = Transform {
+            forward: DVec3::unit_z(),
+            ..Transform::default()
+        };
+        let landing = carrier_info.approach_reference_offset(plane_info);
+        let fb = DVec3::unit_z().rotated_by(DRotor3::from_rotation_xz(
+            carrier_info.deck_angle.to_radians(),
+        ));
+        let hook_offset_y = plane_info.hook.y;
+        let mut track = Track::new("pilot", carrier_info, plane_info);
+
+        for (index, distance) in [1400.0, 700.0, 300.0, 100.0].into_iter().enumerate() {
+            let time = [0.0, 1.0, 1.1, 1.2][index];
+            let mut carrier_frame = carrier.clone();
+            carrier_frame.time = time;
+            let altitude = distance * plane_info.glide_slope.to_radians().tan()
+                + carrier_info.deck_altitude
+                - hook_offset_y;
+            let plane = Transform {
+                time,
+                position: landing - fb * distance,
+                alt: altitude,
+                ..Transform::default()
+            };
+            assert!(track.next(&carrier_frame, &plane, None));
+        }
+        assert!(
+            track.entered_groove,
+            "warm-up should have confirmed groove entry before the deck crossing"
+        );
+
+        // Crosses x=0 at 8.7 m relative altitude: below the 50 ft cap, but well above the 1 m
+        // confirmed-contact threshold -- no actual touch happened.
+        let crossing_alt = carrier_info.deck_altitude - hook_offset_y + 8.7;
+        let mut carrier_frame = carrier.clone();
+        carrier_frame.time = 1.6;
+        let crossing = Transform {
+            time: 1.6,
+            position: landing - fb * -5.0,
+            alt: crossing_alt,
+            ..Transform::default()
+        };
+        assert!(track.next(&carrier_frame, &crossing, None));
+
+        carrier_frame.time = 1.8;
+        let departure = Transform {
+            time: 1.8,
+            position: landing - fb * -200.0,
+            alt: crossing_alt,
+            ..Transform::default()
+        };
+        assert!(!track.next(&carrier_frame, &departure, None));
+        assert_eq!(track.finish().grading, Grading::WaveoffUnknown);
+    }
+
+    #[test]
+    fn dcs_waveoff_grade_overrides_a_geometry_only_bolter() {
+        // Regression for a confirmed live bug (5 September 2026, human test): the DCS LQM itself
+        // opened with `GRADE:WO ... WO(AFU)IC` (the LSO ordered a waveoff) on a pass our own
+        // geometry alone had called `Bolter`, with no `runway_touch`/`land` event at all. Refusing
+        // a bolter DCS's own grading directly contradicts is not inventing a waveoff author.
+        let carrier = CarrierInfo::by_type("CVN_71").unwrap();
+        let hornet = AirplaneInfo::by_type("FA-18C_hornet").unwrap();
+        let mut track = Track::new("pilot", carrier, hornet);
+        track.grading = Some(Grading::Bolter);
+        track
+            .set_dcs_grading("LSO: GRADE:WO : SLOX DRX (LURIM) DRIM (LURIC) WO(AFU)IC".to_string());
+
+        assert_eq!(track.finish().grading, Grading::WaveoffUnknown);
+    }
+
+    #[test]
+    fn dcs_ok_grade_never_overrides_a_confirmed_bolter() {
+        // Companion to the above: an unrelated `GRADE:` prefix (not a waveoff) must never touch
+        // an already-confirmed `Bolter`.
+        let carrier = CarrierInfo::by_type("CVN_71").unwrap();
+        let hornet = AirplaneInfo::by_type("FA-18C_hornet").unwrap();
+        let mut track = Track::new("pilot", carrier, hornet);
+        track.grading = Some(Grading::Bolter);
+        // Deliberately no `WIRE#` token: that would independently promote the grading to
+        // `Recovered` regardless of this fix (a DCS-reported wire is itself stronger evidence of
+        // an arrest), which is not what this test is checking.
+        track.set_dcs_grading("LSO: GRADE:--- : _H_IC".to_string());
+
+        assert_eq!(track.finish().grading, Grading::Bolter);
+    }
+
+    #[test]
+    fn hook_reading_is_frozen_at_first_geometric_contact_not_at_the_late_dcs_event() {
+        // Regression for a confirmed live bug (5 September 2026, human test): the DCS touchdown
+        // event lags physical contact by ~0.2-1 s. A raw sample taken in that window, while the
+        // crosse is pressed against the deck, reads `0.0` ("up") regardless of true hook
+        // position. `first_hook_ground_contact_time` (set from geometry, not the event) must
+        // freeze interpretation before that contaminated window, exactly like `landing_time` did.
+        let carrier = CarrierInfo::by_type("CVN_71").unwrap();
+        let hornet = AirplaneInfo::by_type("FA-18C_hornet").unwrap();
+        let mut track = Track::new("pilot", carrier, hornet);
+        track.entered_groove = true;
+        track.previous_x = 400.0;
+        for index in 0..3 {
+            track.observe_hook_sample(
+                20.0 + index as f64 * 0.25,
+                index,
+                0.0,
+                Some(1.0),
+                HookSampleStatus::Success,
+            );
+        }
+        assert_eq!(track.calibrated_hook_state(), CalibratedHookState::Down);
+
+        // Geometric contact fires here -- before any DCS event ever correlates a touchdown.
+        track.first_hook_ground_contact_time = Some(20.8);
+
+        // Contaminated post-contact samples: crosse crushed against the deck reads as 0.0.
+        for index in 0..3 {
+            track.observe_hook_sample(
+                21.0 + index as f64 * 0.25,
+                10 + index,
+                0.0,
+                Some(0.0),
+                HookSampleStatus::Success,
+            );
+        }
+        assert_eq!(
+            track.calibrated_hook_state(),
+            CalibratedHookState::Down,
+            "post-contact samples must not rewrite the pre-contact evidence"
+        );
     }
 
     #[test]

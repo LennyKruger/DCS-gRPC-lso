@@ -2,18 +2,34 @@
 
 > Document de continuité, à tenir à jour à chaque changement significatif de code ou de contrat.
 > Dépôt `E:\DCS stuffs\Initiative ESG\DCS-gRPC-lso`, branche `feature/refonte-v3-lua-buffer`.
-> Dernier état vérifié : HEAD `5f52e13` ("Dernière modification avant test humans 05/09/2026"),
-> working tree propre à l'exception de ce ménage documentaire. Ce commit contient, entre autres, le
-> raffinement CATOBAR de l'entrée en groove par confirmation de roulis/route, le correctif de la
-> désynchronisation `wire_estimated`/`wire_estimation`, le plancher de distance sous lequel
-> `trajectory_deviations` n'est plus poussé (évite l'explosion `atan2` près du toucher) puis son
-> complément `NEAR_TOUCHDOWN_ANGLE_REFERENCE_M`, le nouveau Cut sink-rate/bank-angle soutenu près du
+> Dernier commit : HEAD `5f52e13` ("Dernière modification avant test humans 05/09/2026"). Working
+> tree actuellement **non propre** : trois correctifs de classification P0, issus de l'analyse d'un
+> test live CVN-72 humain du 5 septembre 2026 (soir), sont appliqués mais pas encore committés — un
+> `Bolter` géométrique sans preuve de contact (survol confirmé à 8,7 m classé `Bolter`) exige
+> désormais soit un contact confirmé (`DECK_CONTACT_CONFIRMATION_ALT_M = 1,0 m`), soit un événement
+> DCS, sinon retombe sur `WaveoffUnknown` ; un `GRADE:WO` du LQM DCS refuse désormais un `Bolter`
+> déduit de la seule géométrie ; le point de crosse F-14 (toutes variantes) reçoit une correction
+> verticale empirique de +1,0 m (biais ~0,8-1,1 m confirmé live) ; et la lecture de crosse est
+> désormais figée au premier contact géométrique (`alt <= 0`) plutôt qu'à l'événement DCS tardif.
+> Un quatrième changement, distinct des trois correctifs P0 ci-dessus (décision de conception, pas
+> un bug), est appliqué dans la même passe : la porte 3/4 NM n'est plus exigée pour `_OK_`/`OK`/
+> `(OK)` CATOBAR lorsqu'elle a été capturée avant l'entrée en groove confirmée (roll-out). Un
+> cinquième change la précision de cette détection de roll-out elle-même sans toucher sa doctrine :
+> `is_rolled_out` compare désormais une régression linéaire sur toute la fenêtre `gate_samples`
+> plutôt que les deux seuls échantillons aux extrémités du buffer, moins sensible à un échantillon
+> isolé bruité sur un bord. Voir "Gates, outcomes et câble" plus bas pour le détail complet des
+> cinq changements, et [CHANGES.md](CHANGES.md)
+> (`Unreleased`) pour la version changelog. Le commit `5f52e13` contenait par ailleurs, entre
+> autres, le raffinement CATOBAR de l'entrée en groove par confirmation de roulis/route, le
+> correctif de la désynchronisation `wire_estimated`/`wire_estimation`, le plancher de distance sous
+> lequel `trajectory_deviations` n'est plus poussé (évite l'explosion `atan2` près du toucher) puis
+> son complément `NEAR_TOUCHDOWN_ANGLE_REFERENCE_M`, le Cut sink-rate/bank-angle soutenu près du
 > pont, `_OK_` automatique (amplitude MOOSE-inspirée + temps de groove NATOPS 15-18 s), la
 > calibration de la position de crosse (T&G vs Bolter) étendue au T-45 et aux F-14 via leurs propres
-> index de draw argument, et `groove_time_secs` désormais exposé dans le JSON. Détail synthétique
-> daté dans [CHANGES.md](CHANGES.md) (section `Unreleased`) ; ce qui reste à revalider en mission
-> live est dans [tasking-roadmap.md](tasking-roadmap.md). Crate `lso` 0.2.0, Rust 2021 ; les
-> changements postérieurs au tag `0.2.0` sont sous `Unreleased` dans [CHANGES.md](CHANGES.md).
+> index de draw argument, et `groove_time_secs` désormais exposé dans le JSON. Ce qui reste à
+> revalider en mission live est dans [tasking-roadmap.md](tasking-roadmap.md). Crate `lso` 0.2.0,
+> Rust 2021 ; les changements postérieurs au tag `0.2.0` sont sous `Unreleased` dans
+> [CHANGES.md](CHANGES.md).
 
 Pour un résumé humain, vulgarisé, du fonctionnement du module : voir [primer.md](primer.md).
 Pour la roadmap, les décisions ouvertes et les bugs connus non résolus : voir
@@ -81,13 +97,20 @@ privée, ou déplacer silencieusement le métier dans Lua.
 
 ## État exécutable vérifié
 
-Dernière validation locale complète au commit `5f52e13` (5 septembre 2026, voir en tête de document
-pour le contenu de ce commit) :
+Dernière validation locale complète au commit `5f52e13` (5 septembre 2026) :
 
 - `cargo test --locked --no-fail-fast` : **196 réussis, 0 échec** (194 tests du binaire + 2 tests
   de provenance de build) ;
 - `cargo fmt --check` et `cargo clippy --locked --all-targets -- -D warnings` propres ;
 - Working tree propre à ce commit (aucune modification de code en attente).
+
+Sur le working tree courant (non committé, voir en tête de document pour le détail des cinq
+changements) : `cargo test --locked --no-fail-fast` **206 réussis, 0 échec** (204 tests du binaire
++ 2 tests de provenance de build, dont 4 nouveaux tests pour les correctifs P0, 6 nouveaux tests
+pour le changement de règle 3/4 NM et 2 nouveaux tests pour la régression linéaire de
+`is_rolled_out`), `cargo fmt --check` et `cargo clippy --locked --all-targets -- -D warnings`
+propres. Rien de tout cela n'a encore été revalidé en mission live (voir
+[tasking-roadmap.md](tasking-roadmap.md)).
 
 Un test live CVN-72 (4×F-14 + 4×F-18 IA) a été mené le 5 septembre 2026 au soir sur ce commit et a
 confirmé l'absence de régression sur les correctifs déjà en place à ce moment-là, mais chacun des
@@ -274,7 +297,20 @@ l'état du code (voir "Règles de vérité" plus haut).
 - États : `Missing`, `Late`, `Invalid`, `Valid`.
 - Validité : deux samples inbound encadrants, temps croissant, bracket <=300 ms, skew <=300 ms,
   phase/altitude admissibles.
-- Trois gates valides et ordonnées sont obligatoires pour une note favorable.
+- Trois gates valides et ordonnées sont obligatoires pour une note favorable **CATOBAR uniquement
+  lorsque la porte 3/4 NM a été capturée après l'entrée en groove confirmée** (roll-out, voir
+  ci-dessous). Quand la porte 3/4 NM (présente ou non, valide ou non) précède l'entrée en groove,
+  elle ne compte ni pour l'éligibilité ni pour l'amplitude GS/lineup retenue
+  (`GateDeviations::three_quarter_counts`/`all_valid`, `src/track.rs` ; `grade_from_gates`,
+  `src/grading.rs`) : seules les portes 1/2 NM et 1/4 NM (plus la trajectoire continue) restent
+  exigées. Sur un pattern Case I humain, la porte 3/4 NM tombe structurellement dans le virage
+  base-à-finale plutôt que dans le groove (confirmé live 5 septembre 2026 soir : 7 passes sur 8,
+  lineup jusqu'à -10,5° à cette porte), ce qui imposait `--` indépendamment du groove réellement
+  volé ensuite. Aucune source NATOPS ne fait d'un franchissement de porte fixe une condition de
+  qualification. **V/STOL garde la règle historique inconditionnelle** (pas d'entrée en groove
+  confirmée par roll-out à laquelle ancrer cette relaxation) ; `lso.exe cadence-ab` aussi (ne
+  rejoue jamais la détection d'entrée en groove). `PROJECT-DERIVED`, non revalidé en mission live —
+  voir [tasking-roadmap.md](tasking-roadmap.md).
 - Démarrage à l'intérieur : `Late`, jamais de donnée inventée.
 - Formule au seuil `x` : `ideal_alt = base_alt + x * tan(pente_avion)` ;
   `gs_deg = atan2(observed_alt - ideal_alt, x)` ; `lineup = atan2(écart_latéral, x)` (voir
@@ -286,9 +322,18 @@ l'état du code (voir "Règles de vérité" plus haut).
   événement ("roll wings level on centerline with a centered ball"), jamais une distance/altitude
   fixe. `is_rolled_out()` (`src/track.rs`) ajoute donc deux proxies observables de cet événement,
   vérifiés sur `GROOVE_ROLLOUT_MIN_CONSECUTIVE_SAMPLES = 2` échantillons consécutifs une fois déjà
-  dans la boîte : roulis quasi nul (`GROOVE_ROLLOUT_MAX_BANK_DEG = 15°`) et route sol déjà pointée
-  dans l'axe du groove (`GROOVE_ROLLOUT_MAX_TRACK_ANGLE_DEG = 15°`, calculée sur la fenêtre
-  `gate_samples` déjà bufferisée pour les gates, sans nouveau champ de télémétrie). Seuils
+  dans la boîte : roulis quasi nul (`GROOVE_ROLLOUT_MAX_BANK_DEG = 15°`, échantillon courant) et
+  route sol déjà pointée dans l'axe du groove (`GROOVE_ROLLOUT_MAX_TRACK_ANGLE_DEG = 15°`, sans
+  nouveau champ de télémétrie). Ce dernier proxy est calculé par régression linéaire (moindres
+  carrés) de la position sur le temps sur toute la fenêtre `gate_samples` déjà bufferisée pour les
+  gates (`track_velocity_regression`), plutôt qu'en comparant seulement les deux échantillons aux
+  extrémités du buffer (ancienne méthode) : un seul échantillon bruité/skewé en bord de fenêtre ne
+  peut plus à lui seul faire basculer l'estimation. Purement une amélioration de précision de
+  mesure, sans changer les seuils `GROOVE_ROLLOUT_MAX_TRACK_ANGLE_DEG`/`GROOVE_ROLLOUT_MAX_BANK_DEG`
+  eux-mêmes ni introduire de nouvelle hypothèse `PROJECT-DERIVED`. Un troisième proxy candidat
+  ("on speed", via l'AoA) a été explicitement écarté : l'AoA de ce projet n'est qu'une
+  approximation géométrique (voir plus bas, "AoA dans `datums`..."), jamais une donnée exposée par
+  DCS-gRPC, donc pas assez fiable pour conditionner une détection d'entrée en groove. Seuils
   `PROJECT-DERIVED`, non chiffrés par NATOPS, jamais revalidés en live. **CATOBAR uniquement** :
   V/STOL (Tarawa AV-8B) garde la boîte seule, son profil d'approche (hover/cross/VL, voir
   VSTOL.md) n'ayant pas de virage final CATOBAR à distinguer d'un survol transitoire de la boîte.
@@ -300,7 +345,17 @@ l'état du code (voir "Règles de vérité" plus haut).
   déclenche que si l'avion est proche du niveau du pont au moment du franchissement
   (`DECK_CROSSING_ALT_CAP_FT = 50 ft`, relatif au pont, crosse comprise) — sinon `WaveoffUnknown`.
   Corrige un bug confirmé live où une remise de gaz haute (~460 ft au franchissement) était classée
-  `Bolter` ; voir [tasking-roadmap.md](tasking-roadmap.md).
+  `Bolter`. **Insuffisant seul** : un franchissement sans jamais aucun événement DCS corrélé (`Land`/
+  `RunwayTouch`) doit en plus prouver un contact réel avant de conclure `Bolter`
+  (`deck_crossing_confirmed_contact`, hauteur de crosse au franchissement
+  `<= DECK_CONTACT_CONFIRMATION_ALT_M = 1,0 m`, nettement plus strict que les 50 ft ci-dessus qui
+  n'excluent qu'un survol *haut*) ; sinon `WaveoffUnknown`. Corrige un second bug confirmé live où
+  un survol bas mais sans contact (8,7 m, largement sous les 50 ft) était classé `Bolter`. Séparément,
+  un `Bolter` déjà retenu (par cette voie géométrique ou par un contact événementiel réel) est
+  toujours refusé dans `Track::finish()` si le LQM DCS ouvre lui-même sur `GRADE:WO`
+  (`dcs_grade_is_waveoff`) — refuser un bolter que DCS contredit directement n'invente pas un
+  auteur de remise de gaz. Les deux correctifs (5 septembre 2026, soir) restent non revalidés en
+  mission live — voir [tasking-roadmap.md](tasking-roadmap.md).
 - Déclencheur commun touch-and-go/Bolter : la distance au point de toucher atteint un minimum puis
   regrossit de plus de 150 m (`src/track.rs`) — l'avion a touché puis est reparti sans s'arrêter.
   Seule la position de crosse à cet instant distingue ensuite les deux issues.
@@ -312,16 +367,33 @@ l'état du code (voir "Règles de vérité" plus haut).
   d'interprétation `<= 0.2` = up, `>= 0.8` = down, avec stabilité exigée (3 échantillons/0,4 s pour
   "up", 2/0,2 s pour "down" — barre plus haute pour "up" car c'est cette conclusion qui transforme
   le verdict par défaut `Bolter` en `TouchAndGo`), uniquement sur des échantillons pris dans le
-  dernier 1/4 NM et avant l'enregistrement du toucher. **Seule la polarité 0,2/0,8 du F/A-18C a été
-  confirmée empiriquement** (`HookObservation::polarity = "fa18c_zero_up_one_down_test_corpus"`) ;
-  celle du T-45/F-14 est une extension non vérifiée de la même convention, fournie par
-  l'utilisateur avec l'index mais pas la confirmation de polarité
+  dernier 1/4 NM et **avant le premier contact** — désormais figé sur le premier contact
+  *géométrique* de la crosse (`first_hook_ground_contact_time`, hauteur de crosse `<= 0`), et non
+  plus sur l'horodatage de l'événement DCS corrélé (`landing_time`), en retard de ~0,2 à 1 s sur le
+  contact physique confirmé live : un échantillon pris dans cette fenêtre reflète la crosse écrasée
+  sur le pont (`0,0`, soit "up") et aurait pu inventer un `TouchAndGo` sur un vrai trap sans le
+  filet de sécurité du LQM DCS (5 septembre 2026, soir ; correctif non revalidé en mission live).
+  **La polarité 0,2/0,8 du F/A-18C a été confirmée empiriquement en premier**
+  (`HookObservation::polarity = "fa18c_zero_up_one_down_test_corpus"`) ; celle du T-45 et du
+  F-14B(U) est désormais **confirmée en live dans les deux sens** (5 septembre 2026, soir,
+  `"zero_up_one_down_confirmed_live_20260905"`) ; celle du F-14A/F-14B (même index de draw
+  argument que le F-14B(U), mais variante non testée) reste une extension non vérifiée
   (`"assumed_zero_up_one_down_pending_live_validation"`). Sans index connu pour un type (ou lecture
   ambiguë/instable), le résultat reste `Unknown` → `Bolter` par défaut, jamais `TouchAndGo` inventé.
   L'échantillonnage de crosse est un sampler indépendant, hors du chemin critique 10-20 Hz de
   position : défaut 4 Hz / timeout 300 ms, configurable dans 2-4 Hz / 250-300 ms
   (`--hook-sampling-hz`, `--hook-timeout-ms`) ; `--legacy-inline-hook-sampling` restaure l'ancien
   échantillonnage bloquant inline comme rollback A/B (voir "Observabilité runtime").
+- Géométrie 3D du point de crosse F-14 (`F14_HOOK`, `src/data.rs`, toutes variantes) : la position
+  extraite via ModelViewer2 plaçait le point de crosse ~0,8-1,1 m sous le niveau réel du pont
+  pendant qu'un F-14B(U) y roulait (le T-45 ne présente pas ce biais, ~0,0 m au toucher). Reçoit une
+  correction verticale empirique `F14_HOOK_VERTICAL_CORRECTION_M = +1,0 m`, `PROJECT-DERIVED` et
+  non une réextraction ModelViewer2 — confirmée live pour le F-14B(U) uniquement (5 septembre 2026,
+  soir), à vérifier aussi sur F-14A/F-14B dès qu'un enregistrement humain existe pour ces variantes,
+  et à remplacer par une vraie remesure ModelViewer2 dès que possible. Alimentait un faux positif
+  de contact (voir le franchissement de seuil de pont ci-dessus) et est la cause probable la plus
+  vraisemblable du biais de -1 brin observé sur l'estimation Rust du câble
+  (`Track::wire_estimate_at`, voir [tasking-roadmap.md](tasking-roadmap.md)).
 - Grading v4 (`project-derived-v4`) : en plus des trois gates ponctuelles, la trajectoire continue
   du groove au touchdown (`trajectory_deviations`) peut dégrader — jamais améliorer — l'amplitude
   retenue, sous réserve d'un garde de persistance (une seule frame aberrante isolée ne compte plus,
@@ -364,16 +436,17 @@ l'état du code (voir "Règles de vérité" plus haut).
   [tasking-roadmap.md](tasking-roadmap.md) pour le détail des deux bugs.
 
 **Table de note CATOBAR** (`project-derived-v4`, `PROJECT-DERIVED` sauf mention contraire ;
-`abs(GS)`/`abs(LU)` = pire valeur sur les trois gates **et** la trajectoire continue) :
+`abs(GS)`/`abs(LU)` = pire valeur sur les gates comptées (voir ci-dessus pour la porte 3/4 NM) **et**
+la trajectoire continue) :
 
 | Résultat | Règle | Points |
 |---|---|---:|
 | `_OK_` | `OK` ci-dessous resserré à `abs(GS) <= 0,4/0,3°` (haut/bas) et `abs(LU) <= 0,5°` partout, **et** temps de groove 15-18 s ; jamais pour un touch-and-go | 5.0 |
-| `OK` | trois gates valides ; `abs(GS) < 0,5°`, `abs(LU) < 1,0°` | 4.0 |
+| `OK` | gates comptées valides ; `abs(GS) < 0,5°`, `abs(LU) < 1,0°` | 4.0 |
 | `(OK)` | pas d'écart significatif ; `abs(GS) >= 0,5°` ou `abs(LU) >= 1,0°` | 3.0 |
 | `--` | `abs(GS) >= 1,0°` ou `abs(LU) >= 2,0°` | 2.0 |
 | `C` | GS strictement sous `-2,5°` à la gate 1/4 NM, ou n'importe où dans la trajectoire continue à 463 m ou en dessous ; ou sink rate soutenu (>=3 échantillons) `>= 8,0 m/s` ou gîte `>= 30°` à l'intérieur de 463 m | 0.0 |
-| `B` | bolter confirmé et trois gates valides | 2.5 |
+| `B` | bolter confirmé et gates comptées valides | 2.5 |
 | `WO?` | remise de gaz/go-around neutre, initiateur inconnu | aucun |
 | `NC` | télémétrie insuffisante/invalide ou trap non confirmé | aucun |
 
