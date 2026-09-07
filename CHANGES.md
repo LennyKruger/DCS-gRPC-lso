@@ -186,6 +186,13 @@ This file records user-visible changes. The crate version remains `0.2.0`; chang
 
 ### Fixed
 
+- A matching DCS `GRADE:WO` LQM now establishes `WaveoffUnknown` on the current track immediately,
+  allowing the existing departure guard to finalize that attempt before the next circuit. This
+  prevents successive waveoffs and a later arrested landing from being collapsed into one report,
+  where the first WO consumed the later authoritative `WIRE#` as a duplicate. Event diagnostics
+  now report such an explicit DCS waveoff as outcome-confirmed while retaining unknown initiator;
+  regression coverage uses the observed `WO -> WO -> WIRE# 2` sequence
+  (`src/track.rs`, `src/tasks/event_correlator.rs`).
 - Invalid buffered unit observations were reduced to an aggregate count and attributed using the
   track's state when a late batch arrived; post-touch errors could therefore revoke an otherwise
   usable pass. Attribution now runs at finish from each observation's own source capture time:

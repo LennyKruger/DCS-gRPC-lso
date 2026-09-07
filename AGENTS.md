@@ -2,16 +2,18 @@
 
 > Document de continuité, à tenir à jour à chaque changement significatif de code ou de contrat.
 > Dépôt `E:\DCS stuffs\Initiative ESG\DCS-gRPC-lso`, branche `feature/refonte-v3-lua-buffer`.
-> Dernier commit : HEAD `8e1228a` ("Commit pre-dev tests 07/09/2026"). Working tree actuellement
-> **non propre** : les corrections issues du corpus humain F-14B(U) du 7 septembre 2026 sont
-> appliquées mais non committées. L'entrée en groove CATOBAR exige maintenant un axe réellement
+> Dernier commit : HEAD `b0e112b` ("Commit post-dev tests 07/09/2026"). Working tree actuellement
+> **non propre** : la correction de segmentation des waveoffs issue du second corpus humain
+> F-14B(U) du 7 septembre 2026 est appliquée mais non committée. L'entrée en groove CATOBAR exige
+> un axe réellement
 > stabilisé (lineup, bank, route et tendance resserrés, maintenus 0,75 s) ; les observations unité
 > invalides conservent séquence, horodatage source, côté, statut et réception afin d'être attribuées
 > au vrai segment temporel ; la santé sépare cadence de capture, âge de livraison et pertes de
 > séquence ; une preuve cinématique d'arrestation structurée est exposée à titre diagnostique sans
 > lever `unconfirmed_arrest` ; la timeline de crosse est un ring récent de 2 048 entrées ; et
-> `lso.exe groove-ab` compare en lecture seule l'ancien et le nouveau détecteur sur des JSON v3.
-> Tous ces changements restent à revalider dans une nouvelle mission live. Crate `lso` 0.2.0,
+> `lso.exe groove-ab` compare en lecture seule l'ancien et le nouveau détecteur sur des JSON v3 ;
+> un LQM DCS `GRADE:WO` établit désormais l'issue de la tentative courante afin que son départ ferme
+> la track avant le circuit suivant. Crate `lso` 0.2.0,
 > Rust 2021 ; les changements postérieurs au tag `0.2.0` sont sous `Unreleased` dans
 > [CHANGES.md](CHANGES.md).
 
@@ -87,7 +89,7 @@ Baseline exécutée avant modification sur le HEAD propre `8e1228a` :
   de provenance de build) ;
 - `cargo fmt --check` et `cargo clippy --locked --all-targets -- -D warnings` propres.
 
-Sur le working tree courant non committé :
+Sur le HEAD propre `b0e112b`, avant la correction de segmentation courante :
 
 - `cargo test --locked --no-fail-fast` : **244 réussis, 0 échec** (242 tests du binaire + 2 tests
   de provenance) ;
@@ -96,10 +98,22 @@ Sur le working tree courant non committé :
   retrouve une entrée avec le nouveau détecteur sur les 12 ; deux durées restent `N/A` faute de
   touchdown DCS exploitable.
 
-La session humaine du 7 septembre a été capturée avec un binaire issu d'un working tree dirty au
+Sur le working tree courant non committé :
+
+- `cargo test --locked --no-fail-fast` : **246 réussis, 0 échec** (244 tests du binaire + 2 tests
+  de provenance) ;
+- `cargo fmt --check` et `cargo clippy --locked --all-targets -- -D warnings` propres.
+
+La première session humaine du 7 septembre a été capturée avec un binaire issu d'un working tree dirty au
 commit `b6308bc`, sans `-vv`. Elle fournit le corpus de calibration, mais ne constitue une
-revalidation live ni des changements courants ni de la dernière corrélation de brin par onset.
-Voir [tasking-roadmap.md](tasking-roadmap.md) pour les validations en mission encore nécessaires.
+revalidation live ni des changements courants ni de la dernière corrélation de brin par onset. La
+seconde session (`.ignore/tests-20260907-2-human`, `-vv`) a exercé le code post-corrections via un
+binaire encore déclaré dirty au commit `8e1228a` : six approches réelles ont été reconstruites (deux
+T&G crosse haute, un bolter, deux `GRADE:WO`, puis un trap DCS `WIRE# 2`). Les deux waveoffs et le
+trap ont été fusionnés dans une seule track parce que le premier LQM n'établissait pas une issue ;
+le correctif courant traite désormais un `GRADE:WO` matching comme l'issue terminale de la tentative
+et attend le départ géométrique normal pour la fermer. Cette correction reste à revalider live avec
+un binaire propre et identifié. Voir [tasking-roadmap.md](tasking-roadmap.md) pour les autres limites.
 
 ## Produit et périmètre métier
 
@@ -275,8 +289,12 @@ dans `[groove_entry_time, landing_time]` = `InvalidTelemetry` ; temps source abs
 `indeterminate_missing_source_time` et indisponibilité conservatrice, sans substituer le temps de
 réception.
 
-Aucune baseline live récente n'est revalidée dans ce document — voir
-[tasking-roadmap.md](tasking-roadmap.md) pour les dernières mesures live datées et leurs limites.
+Le second corpus humain F-14B(U) du 7 septembre 2026 confirme une capture source à 20 Hz
+(`capture_gap_max_ms = 50`), sans perte de séquence ni intervalle source manqué sur les quatre
+rapports exportés. Les évictions internes du ring (2 210 à 7 224) n'y correspondent donc à aucune
+perte lecteur. La livraison reste en revanche tardive (p95 690 à 830 ms, maximum 870 à 1 020 ms),
+sans observation invalide dans les segments notés de ce corpus ; la cause et l'effet d'un run sans
+`-vv` restent à isoler dans [tasking-roadmap.md](tasking-roadmap.md).
 Des rotations répétées du watchdog indiquent un producteur silencieux ou un canal gRPC dégradé, pas
 une raison d'augmenter ce délai de 2 s sans mesure préalable.
 
@@ -332,7 +350,12 @@ l'état du code (voir "Règles de vérité" plus haut).
   capture `>300 ms` remet la persistance à zéro. Ces seuils `PROJECT-DERIVED` ont été calibrés sur
   les 12 passes F-14B(U) du 7 septembre : ils retardent les deux entrées problématiques sans imposer
   artificiellement un groove de 15–18 s, et conservent les écarts tardifs dans la trajectoire notée.
-  Ils sont testés aux frontières mais non revalidés dans une mission live postérieure au correctif.
+  Le second corpus humain F-14B(U) du 7 septembre valide live les trois entrées isolées : 756, 368
+  et 346 m, lineup 0,25°, -0,53° et 0,12°, avec exactement 0,75 s/16 samples stables ; `groove-ab`
+  les reproduit à l'identique. La dernière approche, fusionnée avec deux waveoffs par le bug de
+  segmentation corrigé plus bas, n'entre pas en groove (`lineup` encore 3,51° à 1/2 NM et 2,64° à
+  1/4 NM), ce qui est cohérent avec le `GRADE:C` DCS. Les autres pilotes/types et les conditions
+  plus difficiles restent à revalider.
   `groove_entry` sérialise l'instant DCS, distance, lineup, bank, angle de route, pente de lineup,
   durée/nombre de samples, trigger et seuils exacts. Le contrat RPC ne fournit pas d'ancre exacte
   DCS→UTC : `utc_mapping_status` l'indique et le temps Unix de réception reste distinct, jamais
@@ -353,6 +376,14 @@ l'état du code (voir "Règles de vérité" plus haut).
   (`dcs_grade_is_waveoff`) — refuser un bolter que DCS contredit directement n'invente pas un
   auteur de remise de gaz. Les deux correctifs (5 septembre 2026, soir) restent non revalidés en
   mission live — voir [tasking-roadmap.md](tasking-roadmap.md).
+- Un LQM matching dont le commentaire ouvre sur `GRADE:WO` établit immédiatement
+  `WaveoffUnknown` pour la tentative courante, sans prétendre connaître son initiateur. La collecte
+  conserve la fin de trajectoire puis se ferme par le garde géométrique normal lorsque la distance
+  au point de toucher regrossit de plus de 150 m. Le détecteur peut alors créer une nouvelle `Track`
+  pour le circuit suivant : LQM, groove, gates, touchdown et franchissements de brins ne traversent
+  jamais deux passes. `event_correlation.outcome_confirmed` vaut vrai pour ce waveoff explicitement
+  attesté par DCS, mais reste faux pour une remise de gaz déduite de la seule géométrie. Correctif
+  testé sur la séquence déterministe `GRADE:WO -> GRADE:WO -> WIRE# 2`, non encore revalidé live.
 - Déclencheur commun touch-and-go/Bolter : la distance au point de toucher atteint un minimum puis
   regrossit de plus de 150 m (`src/track.rs`) — l'avion a touché puis est reparti sans s'arrêter.
   Seule la position de crosse à cet instant distingue ensuite les deux issues.
@@ -586,6 +617,11 @@ Une panne ou fermeture propre de `StreamEvents` :
 
 Les overflows hook/event sont diagnostiques. Seule la perte du buffer positions peut produire
 `BufferLimit`.
+
+Pour un LQM matching, le premier événement appartient uniquement à la tentative courante. Un
+`GRADE:WO` est une preuve de l'issue waveoff mais pas de son auteur ; il arme la clôture de la track
+sur le départ géométrique. Les LQM ultérieurs ne sont des doublons que tant que cette même track
+n'est pas encore fermée, jamais à travers plusieurs circuits.
 
 ## Observabilité runtime
 

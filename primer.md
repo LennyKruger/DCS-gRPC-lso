@@ -387,7 +387,10 @@ l'étape 3, le programme détermine l'issue :
 - **Remise de gaz ("Wave off")** : l'avion s'est écarté sans jamais toucher le pont. Le
   programme ne sait pas dire, à partir des données brutes, si c'est le pilote qui a décidé de
   remettre les gaz ou un ordre du LSO/de sécurité — donc il l'affiche comme "remise de gaz",
-  sans jamais inventer une cause qu'il ne peut pas prouver.
+  sans jamais inventer une cause qu'il ne peut pas prouver. Quand DCS émet explicitement une note
+  `GRADE:WO`, cette note termine la tentative dès que l'avion repart : le circuit suivant commence
+  dans un rapport neuf, afin qu'un second waveoff ou un trap ultérieur ne soit jamais absorbé comme
+  un simple doublon du premier.
 
 **Exemple fictif :** Wolf 1-1 → `Recovered`, brin estimé par géométrie = 3, brin annoncé par DCS
 = 3 → les deux concordent, confiance "haute".

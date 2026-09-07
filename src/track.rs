@@ -2541,11 +2541,33 @@ impl Track {
     /// Set the track's dcs grading.
     pub fn set_dcs_grading(&mut self, dcs_grading: String) -> bool {
         if self.dcs_grading.is_none() {
+            // A matching DCS LQM that opens on GRADE:WO is outcome evidence for the current
+            // attempt, not merely a comment to retain until some later touchdown.  Latching the
+            // waveoff here lets `next()` close the track once the aircraft moves away from its
+            // closest point, so a subsequent circuit starts with a fresh Track instead of
+            // inheriting this LQM, groove and wire-crossing history.
+            //
+            // Do not overwrite a positional/contact outcome already established on this same
+            // track.  `finish()` still resolves the narrower geometry-only Bolter contradiction
+            // below, while a correlated touchdown remains stronger evidence than a late WO
+            // comment.
+            let marks_current_attempt_as_waveoff =
+                dcs_grade_is_waveoff(Some(dcs_grading.as_str())) && self.grading.is_none();
             self.dcs_grading = Some(dcs_grading);
+            if marks_current_attempt_as_waveoff {
+                self.grading = Some(Grading::WaveoffUnknown);
+                tracing::info!(
+                    "DCS GRADE:WO established the terminal outcome for the current attempt"
+                );
+            }
             true
         } else {
             false
         }
+    }
+
+    pub(crate) fn has_dcs_waveoff_evidence(&self) -> bool {
+        dcs_grade_is_waveoff(self.dcs_grading.as_deref())
     }
 
     fn observe_wire_crossings(
@@ -3689,8 +3711,8 @@ pub(crate) fn replay_gate_trajectory_and_groove(
 }
 
 /// Whether a DCS LQM comment opens with a `GRADE:WO` waveoff/go-around grade (e.g. `LSO:
-/// GRADE:WO : SLOX DRX (LURIM) DRIM (LURIC) WO(AFU)IC`). Used only to *refuse* a `Bolter` our own
-/// geometry derived without an event, never to invent a waveoff author.
+/// GRADE:WO : SLOX DRX (LURIM) DRIM (LURIC) WO(AFU)IC`). This confirms that a waveoff occurred,
+/// while its `WaveoffUnknown` representation deliberately makes no claim about who initiated it.
 fn dcs_grade_is_waveoff(comment: Option<&str>) -> bool {
     comment.is_some_and(|comment| comment.contains("GRADE:WO"))
 }
@@ -6259,6 +6281,43 @@ mod tests {
         track
             .set_dcs_grading("LSO: GRADE:WO : SLOX DRX (LURIM) DRIM (LURIC) WO(AFU)IC".to_string());
 
+        assert_eq!(track.finish().grading, Grading::WaveoffUnknown);
+    }
+
+    #[test]
+    fn dcs_waveoff_grade_closes_the_track_after_departure() {
+        // Regression for the 7 September 2026 human F-14B(U) session: a GRADE:WO was retained as
+        // text but did not establish an outcome, so the recorder followed two more circuits and
+        // consumed their LQMs as duplicates. Once DCS has identified this attempt as a waveoff,
+        // the ordinary >150 m departure guard must close it.
+        let carrier_info = CarrierInfo::by_type("CVN_71").unwrap();
+        let plane_info = AirplaneInfo::by_type("FA-18C_hornet").unwrap();
+        let carrier = Transform {
+            forward: DVec3::unit_z(),
+            ..Transform::default()
+        };
+        let landing = carrier_info.approach_reference_offset(plane_info);
+        let fb = DVec3::unit_z().rotated_by(DRotor3::from_rotation_xz(
+            carrier_info.deck_angle.to_radians(),
+        ));
+        let mut track = Track::new("pilot", carrier_info, plane_info);
+
+        let inbound = Transform {
+            time: 1.0,
+            position: landing - fb * 100.0,
+            alt: 50.0,
+            ..Transform::default()
+        };
+        assert!(track.next(&carrier, &inbound, None));
+        assert!(track.set_dcs_grading("LSO: GRADE:WO _LULIM_ _LULIC_ WO(AFU)IC [BC]".to_string()));
+
+        let departure = Transform {
+            time: 2.0,
+            position: landing - fb * -300.0,
+            alt: 50.0,
+            ..Transform::default()
+        };
+        assert!(!track.next(&carrier, &departure, None));
         assert_eq!(track.finish().grading, Grading::WaveoffUnknown);
     }
 

@@ -61,13 +61,15 @@
   seuil dur de 1 000 ms qui coûte réellement une note semble marginal/intermittent plutôt que garanti
   à chaque passe. Le test avec `-vv` recommandé ci-dessus reste à faire.
 
-  **Instrumentation locale ajoutée après le corpus du 7 septembre, non revalidée live** : les
-  rapports séparent désormais `capture_gap_*`, `delivery_age_*`, continuité/pertes observées par le
-  curseur et évictions capacité/rétention du ring. La sémantique d'invalidation et les seuils
-  300/1 000 ms sont inchangés. Prochain test : déterminer si les séquences restent continues et les
-  gaps de capture proches de 50 ms malgré une livraison tardive ; ne discuter un assouplissement de
-  fraîcheur qu'après preuve qu'il n'utilise aucune information future et ne masque aucune vraie
-  interruption de capture.
+  **Mise à jour après instrumentation, second corpus humain du 7 septembre 2026**
+  (`.ignore/tests-20260907-2-human`, `-vv`) : les quatre tracks publiées capturent toutes à
+  20 Hz avec `max_capture_gap_ms = 50 ms`, zéro intervalle source manqué et zéro perte de séquence
+  lecteur, malgré 2 210 à 7 224 évictions de capacité. La dégradation est donc bien un retard de
+  livraison : p95 690-830 ms, maximum 870-1 020 ms. Les deux dépassements de 1 000 ms sont restés
+  hors segment noté (`scoring_invalid_samples = 0`, maximum noté 870-990 ms), donc aucune note n'a
+  été retirée par la télémétrie cette fois. La séparation capture/livraison/perte est ainsi validée
+  live sur ce scénario et confirme que les évictions seules ne sont pas des pertes ; la cause de la
+  latence reste ouverte faute de mesure CPU serveur et d'A/B sans les 14,7 Mo de traces `-vv`.
 
 ## P1 — bugs confirmés à corriger, décisions à prendre
 
@@ -82,13 +84,20 @@
   indépendante couvrant chaque cas, quantifier les faux positifs et confirmer que le maintien à
   faible vitesse relative n'est pas un artefact de disparition/gel de l'unité. Ne jamais promouvoir
   cette Phase B sur la seule passe 09:34 ni sur les tests synthétiques.
-- **Attribution temporelle des observations unité invalides et nouvelle santé structurée :
-  revalidation live requise.** Le correctif conserve maintenant temps source/séquence/entité/statut
+  Le second corpus humain du 7 septembre apporte un premier discriminant live favorable : la
+  signature accepte le trap final (`WIRE# 2` visible dans le log) avec onset 350 ms avant contact,
+  vitesse relative minimale nulle maintenue 6,95 s/140 samples et aucun conflit, tout en rejetant
+  correctement deux T&G et un bolter (aucun onset soutenu, vitesse minimale >56 m/s). Elle reste
+  néanmoins diagnostique : rebond, gel/disparition et fausse décélération ne sont toujours pas tous
+  couverts en vérité terrain indépendante.
+- **Attribution temporelle des observations unité invalides : revalidation live requise.** Le
+  correctif conserve maintenant temps source/séquence/entité/statut
   et n'invalide que `[entrée groove, touchdown]`; après-touch et avant-groove restent diagnostics,
   temps source absent reste indéterminé et conservateur. Rejouer un cas semblable à 09:56 avec le
   nouveau binaire et vérifier que les statuts source exacts, les 11 instants et leur arrivée tardive
-  apparaissent sans `TimeWentBackwards` inventé, et que les métriques capture/livraison/perte restent
-  cohérentes entre JSON et log `-vv`.
+  apparaissent sans `TimeWentBackwards` inventé. La santé capture/livraison/perte, elle, a été
+  revalidée live sur le second corpus du 7 septembre (voir P0) ; aucune observation unité invalide
+  n'y était présente, donc il ne teste pas cette attribution.
 - **Estimation Rust du brin systématiquement décalée par rapport à l'événement DCS — les deux
   moitiés du correctif sont désormais implémentées (6 septembre 2026), reste entièrement à
   revalider en mission live.** Mécanisme confirmé le 5 septembre soir : sur un rapport où Rust
@@ -180,14 +189,13 @@
   un nouveau test dédié reproduisant la forme exacte du corpus live
   (`wire_estimate_correlates_via_deceleration_onset_when_the_last_crossing_lags_the_event_too_far`),
   sans régression sur les 5 fixtures ACMI ni les tests existants (`cargo test` 228, `cargo fmt`/
-  `cargo clippy -D warnings` propres). **Non encore revalidé en mission live** : ce correctif n'a
-  jamais tourné sur un enregistrement réel (seulement rejoué manuellement à partir des traces du log
-  déjà capturé, pas d'un nouveau test live) — à confirmer sur une prochaine session que `wire:
-  Some(1)` est bien produit dans des cas équivalents, et que la tolérance élargie (1,2 s) ne
-  provoque pas de faux positif sur un pilotage/avion différent (biais plus faible, franchissements
-  plus espacés dans le temps, etc.). Le corpus humain du 7 septembre ne lève pas ce point : son
-  binaire venait d'un working tree dirty au commit `b6308bc` et semble antérieur à la dernière
-  variante de la corrélation par onset.
+  `cargo clippy -D warnings` propres). Le second corpus humain du 7 septembre exerce bien cette
+  variante : l'onset du trap final est détecté 350 ms avant l'événement, mais deux `GRADE:WO` et le
+  trap ont été fusionnés par un bug de segmentation désormais corrigé. Les seuls franchissements
+  conservés venaient alors du premier waveoff, et le `WIRE# 2` final avait été rejeté comme LQM
+  dupliqué ; ce corpus confirme donc l'onset live mais ne valide toujours pas l'estimation de brin
+  bout en bout ni l'absence de faux positif de la tolérance à 1,2 s. Refaire un trap isolé après le
+  correctif de segmentation.
 
   **Historique de la divergence Rust/DCS avant ce correctif (test IA du 6 septembre après-midi, 6
   arrests)** : divergence observée sur 3 estimations sur 5 nommées (F14-2-1 DCS 4/Rust 3 confiance
@@ -250,6 +258,13 @@
   (corrélation avec l'altitude de la requête, pas avec son identité), mais renforce aussi le besoin
   d'un garde-fou de plausibilité générique (point (2) ci-dessus) plutôt qu'un correctif ciblé sur une
   seule des trois requêtes.
+
+  **Second corpus humain du 7 septembre 2026 (`tests-20260907-2-human`)** : les trois références
+  établies ont des probes haute et basse cohérentes (`91°`, respectivement `5,49-6,10 m/s` et
+  `1,14-1,42 m/s`). La requête séparée de fin de rapport renvoie pourtant `180°/0,0 m/s` sur le
+  deuxième rapport alors que ses deux probes sont valides ; la quatrième track n'a pas établi de
+  référence faute d'entrée en groove. Cette nouvelle occurrence renforce le caractère intermittent
+  de l'anomalie near-zero/report-time, sans fournir encore une règle de remplacement sûre.
 - **Fenêtre de temps de groove `_OK_` (15-18 s NATOPS) jamais atteinte par un pilote humain sur ce
   test** : `groove_time_secs` mesuré à 19,8 / 20,3 / 22,4 / 23,0 / 26,1 s sur les 5 passes où il est
   connu, y compris sur le F-14 le plus rapide (138 kt, 19,8 s). Le temps est compté depuis le
@@ -467,13 +482,15 @@
   ci-dessus n'aurait rien changé à ces 6 cas précis (altitude minimale toujours > 220 m) ; une piste
   plus pertinente pour ce corpus serait d'exiger une tendance d'altitude décroissante sur la fenêtre
   d'armement plutôt qu'un simple seuil de position pont.
-- **Timeline crosse portée à 2 048 entrées : revalidation live et optimisation éventuelle.** Le ring
-  récent couvre désormais ~8,5 min à 4 Hz et expose capacité, politique, intervalle DCS retenu,
-  motif et nombre exact d'évictions ; un test de 3 min/720 samples confirme l'absence de troncature.
-  Vérifier en mission longue que les observations proches du contact restent présentes et que la
-  séparation sampler/positions n'est pas dégradée. L'activation seulement pendant groove/dernier
-  quart reste une optimisation ouverte : ne l'envisager qu'avec warm-up mesuré et sans perdre les
-  transitions pré-groove utiles ni rendre le sampler dépendant du détecteur de groove.
+- **Sampler de crosse indépendant : erreurs RPC à expliquer et optimisation éventuelle.** Le second
+  corpus humain du 7 septembre valide la capacité du ring : aucune troncature, y compris sur une
+  track anormalement longue de 6 min 31 s, et les observations proches du contact sont conservées.
+  La capture positions reste à 20 Hz et aucun échantillon hook n'est perdu par le canal, ce qui
+  confirme l'isolation du chemin critique. En revanche, le log cumule 1 306 RPC hook en erreur
+  `cancelled` pour 2 545 succès (zéro `deadline_exceeded`) ; les états T&G/bolter restent correctement
+  déterminés grâce aux succès, mais la cause de ces annulations doit être isolée avant optimisation.
+  L'activation seulement pendant groove/dernier quart reste ouverte : ne l'envisager qu'avec warm-up
+  mesuré et sans perdre les transitions pré-groove utiles ni rendre le sampler dépendant du détecteur.
 - **Incohérence `datums[].alt` (clampé à 0) vs `trajectory_deviations[].alt_m` (non clampé)** :
   observé à la même position/au même instant dans plusieurs rapports du 5 septembre soir (ex. `alt =
   0.00` vs `alt_m = -0.8` pour la même approche), ce qui masque justement l'information « crosse sous
@@ -565,6 +582,15 @@ Tous les points ci-dessous sont corrigés et testés unitairement (`cargo test`/
 propres au moment de leur implémentation, voir [CHANGES.md](CHANGES.md) pour le détail de chaque
 changement), mais la preuve DCS live disponible reste partielle :
 
+- **Segmentation d'un LQM `GRADE:WO` en tentative terminale indépendante** : le second corpus humain
+  du 7 septembre a fusionné deux waveoffs puis un trap `WIRE# 2` dans une seule track de 6 min 31 s ;
+  le premier LQM gagnait et les deux suivants devenaient `duplicate_ignored`, produisant finalement
+  un faux `unconfirmed_arrest`. `Track::set_dcs_grading` établit désormais `WaveoffUnknown` dès le
+  premier `GRADE:WO` matching et le garde de départ existant ferme la track quand la distance
+  regrossit de plus de 150 m. Le test déterministe `WO -> WO -> WIRE# 2` vérifie trois états frais et
+  conserve le brin 2 final. À revalider live : obtenir trois rapports distincts, chacun avec un seul
+  LQM accepté, et vérifier que la courte queue conservée jusqu'au départ ne manque pas le début du
+  circuit suivant.
 - **Porte 3/4 NM plus exigée pour `_OK_`/`OK`/`(OK)` CATOBAR quand elle précède l'entrée en
   groove confirmée** (implémenté le 6 septembre 2026, décision de conception plutôt qu'un bug —
   discutée et validée avec l'utilisateur, qui a confirmé vouloir se limiter à ignorer
@@ -667,15 +693,20 @@ changement), mais la preuve DCS live disponible reste partielle :
   `OSCILLATION_MIN_SWING_DEG`/`OSCILLATION_MIN_REVERSALS`) : jamais rejoués sur un corpus de
   rapports live pour vérifier qu'ils ne masquent pas de vrais écarts ni ne déclenchent de faux
   positifs sur des approches réelles.
-- **Détecteur d'entrée en groove stable-axis du 7 septembre : revalidation live nécessaire.** Les
+- **Détecteur d'entrée en groove stable-axis du 7 septembre : revalidation live partielle.** Les
   seuils courants (`|lineup| <=2°`, bank/route `<=10°`, pente de lineup `<=0,5°/s`, persistance
   `0,75 s`, gap max `300 ms`) ont été calibrés par replay exact de la géométrie `datums` sur les 12
   passes F-14B(U) du 7 septembre. Ils retardent notamment 09:24 de 23,19 à 17,39 s et 09:28 de
   21,49 à 17,14 s, sans uniformiser le reste du corpus (13,76–28,41 s sur les durées calculables).
   La passe 09:28 reste géométriquement `--` à cause d'un défaut tardif (`max |lineup|` 2,79°) : le
-  détecteur ne blanchit donc pas cet écart. Reste à vérifier avec un nouveau binaire en mission :
-  autres pilotes/types, vent de travers, correction tardive légitime, absence de faux négatif et
-  cohérence de `groove_entry`/logs `-vv`. Les seuils sont `PROJECT-DERIVED`; ne pas les desserrer ni
+  détecteur ne blanchit donc pas cet écart. Le second corpus humain du 7 septembre le revalide sur
+  trois passes F-14B(U) isolées : entrées à 756/368/346 m, lineup 0,25/-0,53/0,12°, durée stable
+  exactement 0,75 s/16 samples, et replay `groove-ab` identique ; les lineups de virage antérieurs
+  (-9,39/-21,50° à 3/4 NM, -7,53° à 1/2 NM) ne déclenchent plus prématurément. Le trap final n'entre
+  justement pas en groove (lineup encore 3,51° à 1/2 puis 2,64° à 1/4), cohérent avec le `GRADE:C`
+  DCS, mais sa track fusionnée empêche d'évaluer séparément les deux waveoffs précédents. Reste à
+  vérifier avec un binaire propre : autres pilotes/types, vent de travers, correction tardive
+  légitime et absence de faux négatif. Les seuils sont `PROJECT-DERIVED`; ne pas les desserrer ni
   forcer artificiellement 15–18 s à partir de ce seul corpus.
 - `cargo audit` reste à exécuter dès qu'un outil autorisé est disponible localement (la CI l'exécute
   déjà).
