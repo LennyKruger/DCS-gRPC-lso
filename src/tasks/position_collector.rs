@@ -4,6 +4,7 @@
 //! The unary implementation is retained as an explicit diagnostic rollback.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use stubs::recovery::v0::recovery_service_client::RecoveryServiceClient;
 use stubs::recovery::v0::{
@@ -14,7 +15,10 @@ use stubs::recovery::v0::{
 
 use crate::client::{request_with_deadline, GrpcChannel, GrpcResult, UnitClient};
 use crate::metrics::RpcKind;
-use crate::telemetry::{TelemetryAligner, TelemetrySample};
+use crate::telemetry::{
+    InvalidSourceObservation, ScoringSegmentAttribution, SourceObservationEntity, TelemetryAligner,
+    TelemetrySample,
+};
 use crate::track::{OnlineMetricStats, PositionCollectionMetrics};
 use crate::transform::Transform;
 
@@ -31,10 +35,18 @@ pub struct BufferedCollectionDiagnostics {
     pub snapshots_received: u64,
     pub invalid_snapshots: u64,
     pub lost_snapshots: u64,
+    /// Reader-observed missing sequence count. Unlike ring churn counters, non-zero means the
+    /// client actually requested data that was no longer available.
+    pub observed_reader_sequence_losses: u64,
+    pub reader_sequence_contiguous: bool,
     pub overflow_count: u64,
     pub missed_capture_intervals: u64,
     pub retention_expiration_count: u64,
     pub capacity_overflow_count: u64,
+    /// Explicit semantic alias: source-side capacity evictions/churn, not snapshots proven lost
+    /// by this reader. Kept alongside the legacy field for schema-v3 compatibility.
+    pub source_ring_capacity_evictions: u64,
+    pub source_ring_retention_evictions: u64,
     pub high_water_mark: u32,
     pub configured_period_ms: f64,
     pub retention_seconds: f64,
@@ -46,6 +58,7 @@ pub struct PositionBatch {
     pub samples: Vec<TelemetrySample>,
     pub lost_snapshots: u64,
     pub invalid_snapshots: u64,
+    pub invalid_observations: Vec<InvalidSourceObservation>,
 }
 
 enum PositionCollectorKind {
@@ -118,6 +131,7 @@ impl PositionCollector {
                     configured_period_ms: started.configured_period * 1_000.0,
                     retention_seconds: started.retention_seconds,
                     capacity: started.capacity,
+                    reader_sequence_contiguous: true,
                     ..BufferedCollectionDiagnostics::default()
                 };
                 tracing::info!(
@@ -353,6 +367,8 @@ async fn read_buffered(
 
     let mut samples = Vec::with_capacity(response.snapshots.len());
     let mut invalid_snapshots = 0_u64;
+    let mut invalid_observations = Vec::new();
+    let received_unix_ms = unix_time_ms();
     let mut previous_sequence = if lost_snapshots == 0 {
         *after_sequence
     } else {
@@ -361,6 +377,13 @@ async fn read_buffered(
     for snapshot in response.snapshots {
         previous_sequence = advance_sequence(previous_sequence, snapshot.sequence)?;
         diagnostics.last_capture_tick = snapshot.capture_tick;
+        let source_invalid =
+            invalid_observations_in_snapshot(&snapshot, response.read_time, received_unix_ms)?;
+        if !source_invalid.is_empty() {
+            invalid_snapshots = invalid_snapshots.saturating_add(1);
+            invalid_observations.extend(source_invalid);
+            continue;
+        }
         match snapshot_to_sample(snapshot, response.read_time, *previous_capture_time) {
             Ok(sample) => {
                 *previous_capture_time = Some(sample.carrier.time.max(sample.plane.time));
@@ -390,6 +413,8 @@ async fn read_buffered(
         .invalid_snapshots
         .saturating_add(invalid_snapshots);
     diagnostics.lost_snapshots = diagnostics.lost_snapshots.saturating_add(lost_snapshots);
+    diagnostics.observed_reader_sequence_losses = diagnostics.lost_snapshots;
+    diagnostics.reader_sequence_contiguous &= lost_snapshots == 0;
     diagnostics.overflow_count = response.overflow_count;
     diagnostics.configured_period_ms = response.configured_period * 1_000.0;
     diagnostics.retention_seconds = response.retention_seconds;
@@ -398,6 +423,8 @@ async fn read_buffered(
         diagnostics.missed_capture_intervals = source.missed_capture_intervals;
         diagnostics.retention_expiration_count = source.retention_expiration_count;
         diagnostics.capacity_overflow_count = source.capacity_overflow_count;
+        diagnostics.source_ring_retention_evictions = source.retention_expiration_count;
+        diagnostics.source_ring_capacity_evictions = source.capacity_overflow_count;
         diagnostics.high_water_mark = source.high_water_mark;
     }
 
@@ -405,7 +432,72 @@ async fn read_buffered(
         samples,
         lost_snapshots,
         invalid_snapshots,
+        invalid_observations,
     })
+}
+
+fn invalid_observations_in_snapshot(
+    snapshot: &RecoveryTelemetrySnapshot,
+    read_time: f64,
+    received_unix_ms: u64,
+) -> GrpcResult<Vec<InvalidSourceObservation>> {
+    let capture_time_dcs = snapshot
+        .capture_time
+        .is_finite()
+        .then_some(snapshot.capture_time);
+    let source_read_time_dcs = read_time.is_finite().then_some(read_time);
+    let mut invalid = Vec::new();
+    for (entity, observation) in [
+        (
+            SourceObservationEntity::Aircraft,
+            snapshot.aircraft.as_ref(),
+        ),
+        (SourceObservationEntity::Carrier, snapshot.carrier.as_ref()),
+    ] {
+        let observation = observation.ok_or_else(|| {
+            Box::new(tonic::Status::data_loss(format!(
+                "missing {entity:?} observation in telemetry snapshot"
+            )))
+        })?;
+        let status_code = observation.status;
+        let status = unit_observation_status_name(status_code);
+        if status_code != UnitObservationStatus::Valid as i32 {
+            invalid.push(InvalidSourceObservation {
+                sequence: snapshot.sequence,
+                capture_tick: snapshot.capture_tick,
+                capture_time_dcs,
+                entity,
+                status_code,
+                status: status.clone(),
+                reason: status,
+                source_read_time_dcs,
+                received_unix_ms,
+                attribution: ScoringSegmentAttribution::IndeterminateMissingSourceTime,
+                affects_scoring: false,
+            });
+        }
+    }
+    Ok(invalid)
+}
+
+fn unit_observation_status_name(status_code: i32) -> String {
+    match UnitObservationStatus::try_from(status_code) {
+        Ok(UnitObservationStatus::Unspecified) => "unspecified".to_string(),
+        Ok(UnitObservationStatus::Valid) => "valid".to_string(),
+        Ok(UnitObservationStatus::NotFound) => "not_found".to_string(),
+        Ok(UnitObservationStatus::IdMismatch) => "id_mismatch".to_string(),
+        Ok(UnitObservationStatus::ReadError) => "read_error".to_string(),
+        Ok(UnitObservationStatus::InvalidData) => "invalid_data".to_string(),
+        Err(_) => format!("unknown_status_{status_code}"),
+    }
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
 }
 
 fn reported_loss_count(
@@ -594,6 +686,56 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[test]
+    fn invalid_source_observations_preserve_side_status_sequence_and_clocks() {
+        let snapshot = RecoveryTelemetrySnapshot {
+            sequence: 17,
+            capture_tick: 91,
+            capture_time: 42.5,
+            aircraft: Some(RecoveryUnitObservation {
+                status: UnitObservationStatus::IdMismatch.into(),
+                ..RecoveryUnitObservation::default()
+            }),
+            carrier: Some(RecoveryUnitObservation {
+                status: UnitObservationStatus::ReadError.into(),
+                ..RecoveryUnitObservation::default()
+            }),
+            ..RecoveryTelemetrySnapshot::default()
+        };
+        let invalid = invalid_observations_in_snapshot(&snapshot, 47.0, 1_234).unwrap();
+        assert_eq!(invalid.len(), 2);
+        assert_eq!(invalid[0].entity, SourceObservationEntity::Aircraft);
+        assert_eq!(invalid[0].status, "id_mismatch");
+        assert_eq!(invalid[1].entity, SourceObservationEntity::Carrier);
+        assert_eq!(invalid[1].status, "read_error");
+        assert!(invalid.iter().all(|item| {
+            item.sequence == 17
+                && item.capture_tick == 91
+                && item.capture_time_dcs == Some(42.5)
+                && item.source_read_time_dcs == Some(47.0)
+                && item.received_unix_ms == 1_234
+                && item.reason == item.status
+        }));
+    }
+
+    #[test]
+    fn non_finite_source_time_is_explicitly_missing_not_replaced_by_read_time() {
+        let snapshot = RecoveryTelemetrySnapshot {
+            sequence: 3,
+            capture_time: f64::NAN,
+            aircraft: Some(RecoveryUnitObservation {
+                status: UnitObservationStatus::NotFound.into(),
+                ..RecoveryUnitObservation::default()
+            }),
+            carrier: Some(observation()),
+            ..RecoveryTelemetrySnapshot::default()
+        };
+        let invalid = invalid_observations_in_snapshot(&snapshot, 50.0, 5_000).unwrap();
+        assert_eq!(invalid[0].capture_time_dcs, None);
+        assert_eq!(invalid[0].source_read_time_dcs, Some(50.0));
+        assert_eq!(invalid[0].status, "not_found");
     }
 
     #[test]

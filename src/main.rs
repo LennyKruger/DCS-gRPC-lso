@@ -48,6 +48,10 @@ enum Command {
     /// pre-groove sampling cadence and compare the resulting gates/grade to the full cadence
     /// actually recorded. Never affects live recording or the fork.
     CadenceAb(commands::cadence_ab::Opts),
+
+    /// Offline diagnostic: compare recorded groove entry with the current stable-axis detector.
+    /// Reads schema-v3 JSON reports without modifying them.
+    GrooveAb(commands::groove_ab::Opts),
 }
 
 #[tokio::main]
@@ -79,6 +83,7 @@ async fn main() {
         Command::Run(opts) => commands::run::execute(*opts, shutdown_handle).await,
         Command::File(opts) => commands::file::execute(opts),
         Command::CadenceAb(opts) => commands::cadence_ab::execute(opts),
+        Command::GrooveAb(opts) => commands::groove_ab::execute(opts),
     };
     if let Err(err) = result {
         tracing::error!(error = %err, error_chain = ?err, "LSO terminated with an error");

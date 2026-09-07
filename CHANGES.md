@@ -7,6 +7,25 @@ This file records user-visible changes. The crate version remains `0.2.0`; chang
 
 ### Added
 
+- `groove_entry` in schema-v3 JSON records the exact DCS timestamp, receipt-clock evidence,
+  distance, lineup, bank, fitted track angle, lineup trend, persistence duration/sample count,
+  trigger and all active thresholds that latched CATOBAR groove entry. Because the current RPC
+  has no exact DCS-to-UTC anchor, the report says so explicitly instead of presenting receipt time
+  as capture UTC (`src/track.rs`, `src/tasks/record_recovery.rs`).
+- `lso.exe groove-ab <json-or-directory>` replays the production gate/trajectory/stable-axis
+  geometry from persisted schema-v3 `datums` and prints a read-only TSV before/after comparison of
+  entry, duration, geometric grade and maximum post-entry lineup. It cannot reconstruct events,
+  RPC timing, UTC mapping or velocities that the JSON did not persist (`src/commands/groove_ab.rs`).
+- Per-observation invalid-source evidence now retains source sequence/tick/time, aircraft versus
+  carrier entity, exact status code/name, source read time, client receipt time, scored-segment
+  attribution and verdict effect. Missing source time is explicit and never replaced by receipt
+  time (`src/telemetry.rs`, `src/tasks/position_collector.rs`, `src/track.rs`).
+- `arrest_confirmation` adds a structured Phase-A kinematic arrest signature: correlated contact,
+  deceleration onset, aircraft/carrier relative-speed stop and hold, capture continuity,
+  on-deck/bounce/departure checks, thresholds, provenance and rejection reason. Source snapshots
+  older than the contact are excluded even when their batch is delivered later. It is diagnostic
+  only: without a DCS `WIRE#` it is capped at `medium` and never lifts `unconfirmed_arrest`, invents
+  a wire or awards points (`src/track.rs`).
 - `arrest_deceleration_onset_time` (diagnostic-only, `wire_estimation`): `wire_estimate_at`
   (`src/track.rs`) now prefers the earliest wire-plane crossing at or after a detected sustained
   horizontal-speed deceleration (`WIRE_ARREST_DECELERATION_MPS2 = 5.0 m/s^2` over
@@ -59,13 +78,12 @@ This file records user-visible changes. The crate version remains `0.2.0`; chang
   sustained (>=3 consecutive samples) sink rate >=8.0 m/s or bank >=30 degrees inside the
   quarter-NM grades the pass `C`. `PROJECT-DERIVED`; NATOPS documents sink rate and bank as
   waveoff-judgment factors but codifies no numeric threshold for either.
-- CATOBAR groove-entry refinement (`is_rolled_out`, `src/track.rs`): in addition to the existing
-  distance/altitude/lineup box, `entered_groove` now also requires near-level bank
-  (`GROOVE_ROLLOUT_MAX_BANK_DEG = 15°`) and a ground track already aligned with the groove axis
-  (`GROOVE_ROLLOUT_MAX_TRACK_ANGLE_DEG = 15°`), confirmed over 2 consecutive samples — an observable
-  proxy for the NATOPS Case I "roll wings level on centerline with a centered ball" event that the
-  box alone could not distinguish from a transient pass through it during the final turn. CATOBAR
-  only; V/STOL keeps the box alone.
+- CATOBAR groove-entry stable-axis detector (`groove_stability_measurement`, `src/track.rs`): in
+  addition to the distance/altitude box, entry requires `|lineup| <= 2°`, `|bank| <= 10°`, fitted
+  ground-track error `<= 10°`, fitted one-second lineup trend `<= 0.5°/s`, all continuously true
+  for 0.75 source seconds with any capture gap above 300 ms resetting persistence. Calibrated over
+  all 12 F-14B(U) reports from 7 September 2026; it delays the two confirmed premature entries but
+  does not force a 15–18-second duration. CATOBAR only; V/STOL keeps the box alone.
 - A persistence guard on continuous-trajectory amplitude (`PERSISTENCE_MIN_CONSECUTIVE_SAMPLES =
   2`): an isolated frame above the slight/significant threshold no longer counts alone. Never
   applied to the Cut threshold or the late-approach weighting, which stay sensitive to a single
@@ -168,6 +186,13 @@ This file records user-visible changes. The crate version remains `0.2.0`; chang
 
 ### Fixed
 
+- Invalid buffered unit observations were reduced to an aggregate count and attributed using the
+  track's state when a late batch arrived; post-touch errors could therefore revoke an otherwise
+  usable pass. Attribution now runs at finish from each observation's own source capture time:
+  before-groove and post-touch are diagnostic only, in-groove is blocking, and genuinely missing
+  source time is explicitly indeterminate with conservative unavailability. Source statuses are
+  preserved rather than relabelled `TimeWentBackwards` (`src/tasks/position_collector.rs`,
+  `src/track.rs`).
 - `wire_estimated` could diverge from the diagnostic `wire_estimation` when the `Land` event
   correlation raced ahead of the positional wire-crossing update that produced the same value;
   `cable_estimated` is now always reconciled once, in `Track::finish()`, against the full
@@ -210,13 +235,8 @@ This file records user-visible changes. The crate version remains `0.2.0`; chang
   that the aircraft actually stopped there — confirmed live 5 September 2026 (evening) on
   survols/bolters with no arrest at all reading a semantically false "high" wire estimate. `"high"`
   now additionally requires a DCS-confirmed arrest (a parsed LQM `WIRE#`); without one, confidence
-  is capped at `"medium"`. The other half of the same live-confirmed bias — the estimator retaining
-  the highest-numbered wire crossing recorded before a late `Land`/`runway_touch` event — remains
-  unresolved: correlating on `first_hook_ground_contact_time` instead was tried and reverted, since
-  it discarded a still-correct wire-4 crossing on a clean straight-in trap (`wire_4_01_FA18C`) where
-  the hook geometrically swept past wires 1-3 while still airborne, before the later, only-genuine
-  contact. See `tasking-roadmap.md` for the decision this leaves open (likely needs a deceleration
-  proxy, e.g. `touchdown_horizontal_speed_mps`, rather than a hard first-contact cutoff).
+  is capped at `"medium"`. Wire selection separately uses the sustained-deceleration onset and its
+  1.2 s crossing window described under Added; both remain pending fresh live revalidation.
 - Event-stream errors and clean closure no longer become positional `telemetry_gap`; existing gates
   remain intact while outcome availability is assessed separately.
 - Plane/carrier respawns with a changed ID abort every stale same-name task within the current
@@ -270,17 +290,19 @@ This file records user-visible changes. The crate version remains `0.2.0`; chang
 
 ### Changed
 
-- CATOBAR groove-entry roll-out check (`is_rolled_out`, `src/track.rs`): the ground-track-angle
-  proxy for "tracking down the groove axis" now fits a least-squares linear regression of position
-  against time over the whole buffered `gate_samples` window (`track_velocity_regression`), instead
-  of comparing only the two endpoint samples of that buffer. A single noisy or skewed telemetry
-  frame sitting right at either edge of the window can no longer swing the whole estimate on its
-  own, since every sample in the window now contributes to the fit. Precision improvement only:
-  `GROOVE_ROLLOUT_MAX_TRACK_ANGLE_DEG`/`GROOVE_ROLLOUT_MAX_BANK_DEG` and the underlying doctrine
-  (NAVAIR 00-80T-105 groove entry as a "roll wings level" event, not a fixed distance) are
-  unchanged; no new `PROJECT-DERIVED` threshold introduced. An "on speed" (AoA) proxy was
-  considered and explicitly rejected: this project's AoA is only a geometric approximation, never
-  a value exposed by DCS-gRPC, and was judged too unreliable to gate groove-entry detection on.
+- Telemetry health now reports source capture spacing and delivery age as separate maxima, scored
+  maxima, warning ratios and p50/p95/p99 distributions while retaining legacy worst-of gap fields.
+  Reader-observed sequence loss/continuity is separate from source ring capacity/retention churn;
+  no 300 ms/1,000 ms rule was relaxed and delayed capture is not interpolated
+  (`src/track.rs`, `src/tasks/position_collector.rs`).
+- Hook history is a documented recent-evidence ring of 2,048 entries (~8.5 minutes at 4 Hz), with
+  capacity, policy, retained DCS interval, truncation reason and dropped count in JSON. It preserves
+  final-window/contact evidence and remains independent from position collection; polarity and
+  stability logic are unchanged (`src/track.rs`).
+- The CATOBAR ground-track proxy fits least-squares position over all valid inbound samples in its
+  two-second buffer rather than relying on two endpoints. The stricter stable-axis contract is
+  documented under Added. The geometric AoA remains excluded because it is not a reliable on-speed
+  signal (`src/track.rs`).
 - CATOBAR `_OK_`/`OK`/`(OK)` no longer unconditionally requires the 3/4 NM gate
   (`GateDeviations::all_valid`/`three_quarter_counts`, `src/track.rs`; `grade_from_gates`,
   `src/grading.rs`): when that gate was captured *before* roll-out-confirmed groove entry

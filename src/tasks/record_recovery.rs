@@ -99,6 +99,10 @@ struct RecoveryReport<'a> {
     /// ever surfaced in the Discord embed, making it impossible to audit `_OK_` eligibility from
     /// the JSON report alone when Discord is not configured.
     groove_time_secs: Option<f64>,
+    /// Stable-axis measurements and exact PROJECT-DERIVED thresholds that latched CATOBAR groove
+    /// entry. Absent from legacy reports and V/STOL box-only detection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    groove_entry: Option<&'a crate::track::GrooveEntryEvidence>,
     lso_version: &'static str,
     lso_commit: &'static str,
     lso_dirty: bool,
@@ -126,6 +130,7 @@ struct RecoveryReport<'a> {
     wire_divergent: bool,
     wire_primary: &'static str,
     wire_estimation: &'a crate::track::WireEstimateEvidence,
+    arrest_confirmation: &'a crate::track::ArrestConfirmationEvidence,
     grading_availability: &'static str,
     telemetry_quality: &'a crate::track::TelemetryQuality,
     events: &'a [crate::track::EventEvidence],
@@ -579,7 +584,7 @@ pub async fn record_recovery(params: TaskParams<'_>) -> Result<(), crate::error:
                     datums.mark_source_buffer_loss(batch.lost_snapshots);
                 }
                 if batch.invalid_snapshots > 0 {
-                    datums.mark_invalid_source_observations(batch.invalid_snapshots);
+                    datums.record_invalid_source_observations(batch.invalid_observations);
                     pending_invalid_batches = pending_invalid_batches.saturating_add(1);
                     pending_invalid_snapshots =
                         pending_invalid_snapshots.saturating_add(batch.invalid_snapshots);
@@ -1294,6 +1299,7 @@ pub async fn record_recovery(params: TaskParams<'_>) -> Result<(), crate::error:
         completed_at: &completed_at,
         touchdown_time_dcs: track.touchdown_time_dcs,
         groove_time_secs: track.groove_time_secs,
+        groove_entry: track.groove_entry.as_ref(),
         lso_version: env!("CARGO_PKG_VERSION"),
         lso_commit: option_env!("GIT_COMMIT_HASH").unwrap_or("unknown"),
         lso_dirty: option_env!("GIT_DIRTY") == Some("true"),
@@ -1334,6 +1340,7 @@ pub async fn record_recovery(params: TaskParams<'_>) -> Result<(), crate::error:
         wire_divergent,
         wire_primary,
         wire_estimation: &track.wire_estimation,
+        arrest_confirmation: &track.arrest_confirmation,
         grading_availability,
         telemetry_quality: &track.telemetry_quality,
         events: &track.events,

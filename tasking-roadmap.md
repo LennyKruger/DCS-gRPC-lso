@@ -8,7 +8,7 @@
 > racine", pour la règle complète. Pour le détail narratif des sessions de test passées (dates,
 > corpus, discussions de conception ayant mené aux points encore ouverts ci-dessous), `git log`/
 > `git show` sur les commits correspondants fait foi ; ce document ne le duplique pas. Dernière
-> purge/fusion : 6 septembre 2026.
+> purge/fusion : 7 septembre 2026.
 
 ## À faire en priorité (P0)
 
@@ -30,11 +30,11 @@
   contrat de télémétrie (voir AGENTS.md, "Contrat de télémétrie" : jamais inventer un point sous un
   gap >1 000 ms), donc **pas un bug de règle de notation** — mais l'obtention réelle de ce gap coûte
   la note d'un vrai trap, ce qui en fait une régression de disponibilité prioritaire à instrumenter.
-  Signal corroborant déjà noté en P2 ci-dessous : `recovery_telemetry.overflow_count` vaut 2962/2661
-  sur ces deux rapports (`snapshots_received - 600` exactement, `high_water_mark` à 600/600,
-  `lost_snapshots: 0`) — le ring source ne perd rien côté DCS-gRPC, ce qui pointe le doigt vers le
-  **consommateur LSO** (boucle de lecture par lots `after_sequence`, ou contention Tokio/CPU sur la
-  machine de ce test) plutôt que vers le fork ou le réseau. **Topologie confirmée par l'utilisateur
+  Signal corroborant à qualifier : `recovery_telemetry.overflow_count` vaut 2962/2661 sur ces deux
+  rapports (`snapshots_received - 600` exactement, `high_water_mark` à 600/600,
+  `lost_snapshots: 0`). Ce compteur prouve du churn/une éviction interne du ring, **pas** des
+  snapshots perdus par le lecteur : aucune rupture de séquence n'est démontrée. **Topologie
+  confirmée par l'utilisateur
   (6 septembre 2026)** : `lso.exe` tournait sur le serveur DCS dédié lui-même (boucle locale
   `127.0.0.1:50051`, comme pour le test IA de la veille) ; le client de Justice était sur un poste
   distinct, connecté au serveur par le réseau. Le canal gRPC `lso.exe`↔serveur était donc en boucle
@@ -61,8 +61,34 @@
   seuil dur de 1 000 ms qui coûte réellement une note semble marginal/intermittent plutôt que garanti
   à chaque passe. Le test avec `-vv` recommandé ci-dessus reste à faire.
 
+  **Instrumentation locale ajoutée après le corpus du 7 septembre, non revalidée live** : les
+  rapports séparent désormais `capture_gap_*`, `delivery_age_*`, continuité/pertes observées par le
+  curseur et évictions capacité/rétention du ring. La sémantique d'invalidation et les seuils
+  300/1 000 ms sont inchangés. Prochain test : déterminer si les séquences restent continues et les
+  gaps de capture proches de 50 ms malgré une livraison tardive ; ne discuter un assouplissement de
+  fraîcheur qu'après preuve qu'il n'utilise aucune information future et ne masque aucune vraie
+  interruption de capture.
+
 ## P1 — bugs confirmés à corriger, décisions à prendre
 
+- **Phase B de la confirmation cinématique d'arrestation : ne pas l'activer sans nouveau corpus
+  discriminant.** La Phase A expose désormais dans `arrest_confirmation` une signature structurée
+  (contact DCS, onset de décélération, vitesse avion-navire basse maintenue 2 s, continuité, hauteur
+  de crosse, rebond/départ/verdict contradictoire), avec seuils et motifs ; même acceptée, elle reste
+  `medium` et `diagnostic_only_no_grading_change`. Les fixtures déterministes distinguent arrêt
+  soutenu, bolter/T&G, remise en avant, rebond et télémétrie trop courte, mais le corpus du 7
+  septembre ne persiste pas les vitesses nécessaires pour rejouer exactement la signature après
+  coup. Avant de lever `unconfirmed_arrest` sans `WIRE#`, obtenir plusieurs captures live avec vérité
+  indépendante couvrant chaque cas, quantifier les faux positifs et confirmer que le maintien à
+  faible vitesse relative n'est pas un artefact de disparition/gel de l'unité. Ne jamais promouvoir
+  cette Phase B sur la seule passe 09:34 ni sur les tests synthétiques.
+- **Attribution temporelle des observations unité invalides et nouvelle santé structurée :
+  revalidation live requise.** Le correctif conserve maintenant temps source/séquence/entité/statut
+  et n'invalide que `[entrée groove, touchdown]`; après-touch et avant-groove restent diagnostics,
+  temps source absent reste indéterminé et conservateur. Rejouer un cas semblable à 09:56 avec le
+  nouveau binaire et vérifier que les statuts source exacts, les 11 instants et leur arrivée tardive
+  apparaissent sans `TimeWentBackwards` inventé, et que les métriques capture/livraison/perte restent
+  cohérentes entre JSON et log `-vv`.
 - **Estimation Rust du brin systématiquement décalée par rapport à l'événement DCS — les deux
   moitiés du correctif sont désormais implémentées (6 septembre 2026), reste entièrement à
   revalider en mission live.** Mécanisme confirmé le 5 septembre soir : sur un rapport où Rust
@@ -159,7 +185,9 @@
   déjà capturé, pas d'un nouveau test live) — à confirmer sur une prochaine session que `wire:
   Some(1)` est bien produit dans des cas équivalents, et que la tolérance élargie (1,2 s) ne
   provoque pas de faux positif sur un pilotage/avion différent (biais plus faible, franchissements
-  plus espacés dans le temps, etc.).
+  plus espacés dans le temps, etc.). Le corpus humain du 7 septembre ne lève pas ce point : son
+  binaire venait d'un working tree dirty au commit `b6308bc` et semble antérieur à la dernière
+  variante de la corrélation par onset.
 
   **Historique de la divergence Rust/DCS avant ce correctif (test IA du 6 septembre après-midi, 6
   arrests)** : divergence observée sur 3 estimations sur 5 nommées (F14-2-1 DCS 4/Rust 3 confiance
@@ -411,21 +439,13 @@
   rechargement complet, en cohérence avec l'erreur Lua `grpc.lua:288` côté DCS pendant le
   rechargement (voir aussi le point d'observabilité en P1 ci-dessus). Un backoff progressif
   réduirait le bruit de logs lors d'une pause prolongée.
-- **Signal à surveiller sur `recovery_telemetry.overflow_count`** (purge du ring Lua sur
-  `after_sequence` acquitté et bornage de `telemetryObservationErrors`, voir AGENTS.md,
-  "Architecture courante"). Le test du 5 septembre soir apporte un signal négatif à
-  surveiller (pas une régression confirmée) : `recovery_telemetry.overflow_count` correspond
-  exactement à `snapshots_received - 600` sur les 8 rapports, et `high_water_mark` reste à `600/600`
-  en permanence — le ring semble rester plein et évincer par capacité plutôt que par purge sur
-  acquittement, ou alors le compteur comptabilise les évictions post-acquittement comme des
-  débordements. Aucune perte réelle ce soir (`lost_snapshots: 0`), mais la métrique est aujourd'hui
-  inexploitable telle quelle. Côté fork, ne pas modifier sans demande explicite — mais à
-  instrumenter avant de conclure. **Mise à jour 6 septembre après-midi** : voir le nouveau point P0
-  ci-dessus — le même signal (`overflow_count` = `snapshots_received - 600`, `lost_snapshots: 0`)
-  réapparaît sur le test humain `Justice-20260906`, cette fois corrélé à un vrai `TelemetryGap` ayant
-  coûté sa note à un trap confirmé. Toujours pas de perte confirmée côté source, mais l'hypothèse
-  d'un consommateur LSO qui prend du retard sur le ring devient nettement plus crédible qu'un simple
-  artefact de comptage.
+- **Sémantique du ring à confirmer avec les nouvelles métriques.** Les anciens rapports montrent
+  beaucoup d'overflow/capacity churn mais `lost_snapshots: 0`, sans rupture de séquence prouvée. Le
+  JSON courant sépare maintenant évictions capacité/rétention, pertes réellement observées par le
+  curseur, continuité du temps source et retard de livraison. Sur un prochain test `-vv`, comparer
+  ces quatre familles avant toute conclusion sur le producteur ou le consommateur. Une amélioration
+  du fork ne serait justifiée que si cette instrumentation prouve une ambiguïté restante ; aucune
+  modification Lua/DCS-gRPC n'est autorisée ni nécessaire à ce stade.
 - **Tentatives d'approche avortées avant le groove, invisibles hors logs DEBUG.** Déjà listé ;
   reconfirmé avec des chiffres concrets le 5 septembre soir : 3 faux départs de détection sur la
   soirée (un au catapultage T-45 lui-même : 55 s puis 2 s de flux bufferisé + échantillonnage crosse
@@ -447,30 +467,13 @@
   ci-dessus n'aurait rien changé à ces 6 cas précis (altitude minimale toujours > 220 m) ; une piste
   plus pertinente pour ce corpus serait d'exiger une tendance d'altitude décroissante sur la fenêtre
   d'armement plutôt qu'un simple seuil de position pont.
-- **`hook_history_truncated` remonté comme cause secondaire sur 6 rapports sur 8** dans le test du 5
-  septembre soir, alors que la fenêtre finale de notation (35 à 79 échantillons) reste toujours
-  intacte : la timeline crosse est plafonnée à 512 entrées (`MAX_HOOK_EVIDENCE`), et un pattern
-  humain dure 2,5-3 min entre détection et toucher (4 Hz × 180 s = 720 échantillons attendus), donc
-  la troncature des échantillons **pré-groove** est structurelle pour un pilote humain — elle ne
-  retire jamais d'évidence utile à la notation, mais pollue `causes` sans raison. Piste : compacter
-  les échantillons pré-groove (ne garder que les transitions, comme le fait une autre lignée
-  antérieure du programme) plutôt que les tronquer par FIFO, ou ne plus remonter la troncature dans
-  `causes` quand `samples_in_final_window` est déjà complet. **Mise à jour 6 septembre après-midi
-  (test IA)** : présent sur **8 rapports sur 8** cette fois, y compris sur les 2 waveoffs qui n'ont
-  jamais atteint le groove — ce qui **infirme l'explication "structurel seulement pour un pattern
-  humain long"** : un échantillonnage crosse démarré dès l'armement du détecteur (avant même de
-  savoir si l'approche ira jusqu'au groove) peut visiblement dépasser 512 échantillons bien avant un
-  toucher, y compris sur un circuit IA plus resserré. Fait monter la priorité du correctif de
-  compaction ci-dessus : ce n'est pas un cas de bord humain rare mais un bruit systématique sur ce
-  corpus.
-
-  **Mise à jour 7 septembre 2026 (corpus humain `Justice`, 6 recoveries)** : présent sur **6 rapports
-  sur 6**, à nouveau sans exception, y compris sur les 4 T&G/bolters (`hook_up_near_deck`) qui
-  n'atteignent jamais un vrai toucher. `samples_in_final_window` reste dans chaque cas nettement sous
-  les 512 (24-51 échantillons), donc toujours aucune perte d'évidence utile — troisième corpus
-  consécutif (IA puis deux corpus humains) où ce diagnostic pollue systématiquement `causes` sans
-  jamais refléter un vrai problème de notation. Continue de confirmer la priorité du correctif de
-  compaction, sans rien y ajouter de nouveau.
+- **Timeline crosse portée à 2 048 entrées : revalidation live et optimisation éventuelle.** Le ring
+  récent couvre désormais ~8,5 min à 4 Hz et expose capacité, politique, intervalle DCS retenu,
+  motif et nombre exact d'évictions ; un test de 3 min/720 samples confirme l'absence de troncature.
+  Vérifier en mission longue que les observations proches du contact restent présentes et que la
+  séparation sampler/positions n'est pas dégradée. L'activation seulement pendant groove/dernier
+  quart reste une optimisation ouverte : ne l'envisager qu'avec warm-up mesuré et sans perdre les
+  transitions pré-groove utiles ni rendre le sampler dépendant du détecteur de groove.
 - **Incohérence `datums[].alt` (clampé à 0) vs `trajectory_deviations[].alt_m` (non clampé)** :
   observé à la même position/au même instant dans plusieurs rapports du 5 septembre soir (ex. `alt =
   0.00` vs `alt_m = -0.8` pour la même approche), ce qui masque justement l'information « crosse sous
@@ -481,11 +484,11 @@
 - **Nommage `aircraft_id` trompeur** : vaut un index de type (0 pour T-45, 3 pour F-14B(U)), pas un
   ID d'unité, dans un rapport qui porte par ailleurs `carrier_id` = vrai ID d'unité — source de
   confusion pour un consommateur externe du JSON.
-- **Taille des JSON de rapport (0,94 à 1,50 Mo)** : ~90 % provient de `datums` (883-1 566 points
-  malgré le sous-échantillonnage 1/4 pré-groove) et de `hook_observation.timeline` (512 entrées, dont
-  ~430 pré-groove sans intérêt une fois la fenêtre finale connue). Compacter la timeline crosse hors
-  groove (même piste que `hook_history_truncated` ci-dessus) diviserait la taille par ~2 sans perte
-  d'évidence utile.
+- **Taille des JSON de rapport** : `datums` et `hook_observation.timeline` dominent déjà les rapports
+  de 0,94–1,50 Mo ; porter la timeline à 2 048 protège le diagnostic mais peut augmenter ce coût sur
+  les longues sessions. Mesurer la taille sur un nouveau corpus avant d'envisager une compaction
+  pré-groove ; toute compaction doit préserver transitions, erreurs et warm-up, sans dépendance
+  fragile envers le détecteur de groove.
 - **Script `run-live-buffered.ps1` non autonome pour un déploiement hors du poste de développement**
   (observé le 5 septembre soir, sur la machine de test qui n'a pas le lecteur `E:` du dépôt de
   développement) : exige `--baseline-manifest live-baseline.json` dans son propre dossier sans que ce
@@ -664,33 +667,16 @@ changement), mais la preuve DCS live disponible reste partielle :
   `OSCILLATION_MIN_SWING_DEG`/`OSCILLATION_MIN_REVERSALS`) : jamais rejoués sur un corpus de
   rapports live pour vérifier qu'ils ne masquent pas de vrais écarts ni ne déclenchent de faux
   positifs sur des approches réelles.
-- **`GROOVE_ROLLOUT_MAX_BANK_DEG`/`GROOVE_ROLLOUT_MAX_TRACK_ANGLE_DEG` (= 15° chacun)** : testé
-  unitairement, puis **confirmé une première fois en conditions live** le 5 septembre soir sur les 8
-  passes humaines — entrée en groove toujours détectée entre 870 et 1 384 m, jamais en plein virage
-  (bank au premier échantillon continu entre -7,4° et -14,5°, donc toujours sous le seuil de 15° une
-  fois l'entrée retenue). Reste à confirmer que ces seuils n'excluent jamais à tort une entrée en
-  groove sur un virage large ou un fort vent de travers non rencontré sur ce corpus. **Effet de bord
-  découvert par la même occasion, désormais traité séparément** : la doctrine qui place l'entrée en
-  groove après la porte 3/4 NM rendait cette porte structurellement invalide/hors-boîte sur un
-  pattern Case I humain standard — voir plus bas l'entrée dédiée sur la relaxation de la porte 3/4
-  NM, elle aussi non revalidée en mission live, avant de considérer ce raffinement comme
-  complètement validé pour un usage humain.
-- **Précision du proxy de route sol (`is_rolled_out`) : régression linéaire plutôt que deux points
-  d'extrémité** (implémenté le 6 septembre 2026, suite à une recherche documentaire sur la façon
-  dont les LSO US Navy détectent réellement le début du groove). La recherche a confirmé que le
-  début du groove Case I est bien un événement chez NATOPS **et** chez deux historiens de
-  l'aviation navale convergents (virage terminé, ailes à plat, aligné, en palier) — aucune remise
-  en cause de l'approche événementielle déjà en place (`is_rolled_out`, bank + track angle). Deux
-  pistes d'amélioration de la mesure elle-même ont été évaluées : (1) remplacer la comparaison des
-  deux échantillons aux extrémités du buffer `gate_samples` par une régression linéaire sur toute
-  la fenêtre (`track_velocity_regression`) — implémentée, aucun nouveau seuil `PROJECT-DERIVED`,
-  amélioration pure de robustesse au bruit ; (2) ajouter un critère "on speed" (AoA) — écartée
-  explicitement par l'utilisateur, l'AoA du projet n'étant qu'une approximation géométrique jamais
-  exposée par DCS-gRPC, jugée insuffisamment fiable pour conditionner une détection. Reste à
-  revalider en mission live que la régression ne décale jamais l'instant d'entrée en groove détecté
-  de façon perceptible par rapport à l'ancienne méthode sur un corpus réel (aucun changement
-  observé sur les corpus synthétiques des tests unitaires, mais jamais rejouée sur les rapports
-  live du 5 septembre).
+- **Détecteur d'entrée en groove stable-axis du 7 septembre : revalidation live nécessaire.** Les
+  seuils courants (`|lineup| <=2°`, bank/route `<=10°`, pente de lineup `<=0,5°/s`, persistance
+  `0,75 s`, gap max `300 ms`) ont été calibrés par replay exact de la géométrie `datums` sur les 12
+  passes F-14B(U) du 7 septembre. Ils retardent notamment 09:24 de 23,19 à 17,39 s et 09:28 de
+  21,49 à 17,14 s, sans uniformiser le reste du corpus (13,76–28,41 s sur les durées calculables).
+  La passe 09:28 reste géométriquement `--` à cause d'un défaut tardif (`max |lineup|` 2,79°) : le
+  détecteur ne blanchit donc pas cet écart. Reste à vérifier avec un nouveau binaire en mission :
+  autres pilotes/types, vent de travers, correction tardive légitime, absence de faux négatif et
+  cohérence de `groove_entry`/logs `-vv`. Les seuils sont `PROJECT-DERIVED`; ne pas les desserrer ni
+  forcer artificiellement 15–18 s à partir de ce seul corpus.
 - `cargo audit` reste à exécuter dès qu'un outil autorisé est disponible localement (la CI l'exécute
   déjà).
 - Revalider sur données live le Cut sink-rate/bank-angle (`SINK_RATE_CUT_MPS = 8.0 m/s`,

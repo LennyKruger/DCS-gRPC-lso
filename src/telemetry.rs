@@ -33,6 +33,42 @@ pub enum TelemetryInvalidReason {
     TelemetryGap,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceObservationEntity {
+    Aircraft,
+    Carrier,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScoringSegmentAttribution {
+    BeforeGroove,
+    InScoredSegment,
+    AfterTouchdown,
+    IndeterminateMissingSourceTime,
+}
+
+/// One source-side unit observation that could not produce a paired position sample. The source
+/// capture clock and client receipt clock stay separate; attribution is filled only after the
+/// final groove/touchdown bounds are known.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct InvalidSourceObservation {
+    pub sequence: u64,
+    pub capture_tick: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_time_dcs: Option<f64>,
+    pub entity: SourceObservationEntity,
+    pub status_code: i32,
+    pub status: String,
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_read_time_dcs: Option<f64>,
+    pub received_unix_ms: u64,
+    pub attribution: ScoringSegmentAttribution,
+    pub affects_scoring: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct TelemetrySample {
     pub carrier_raw: Transform,

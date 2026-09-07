@@ -2,42 +2,16 @@
 
 > Document de continuité, à tenir à jour à chaque changement significatif de code ou de contrat.
 > Dépôt `E:\DCS stuffs\Initiative ESG\DCS-gRPC-lso`, branche `feature/refonte-v3-lua-buffer`.
-> Dernier commit : HEAD `5f52e13` ("Dernière modification avant test humans 05/09/2026"). Working
-> tree actuellement **non propre** : trois correctifs de classification P0, issus de l'analyse d'un
-> test live CVN-72 humain du 5 septembre 2026 (soir), sont appliqués mais pas encore committés — un
-> `Bolter` géométrique sans preuve de contact (survol confirmé à 8,7 m classé `Bolter`) exige
-> désormais soit un contact confirmé (`DECK_CONTACT_CONFIRMATION_ALT_M = 1,0 m`), soit un événement
-> DCS, sinon retombe sur `WaveoffUnknown` ; un `GRADE:WO` du LQM DCS refuse désormais un `Bolter`
-> déduit de la seule géométrie ; le point de crosse F-14 (toutes variantes) reçoit une correction
-> verticale empirique de +1,0 m (biais ~0,8-1,1 m confirmé live) ; et la lecture de crosse est
-> désormais figée au premier contact géométrique (`alt <= 0`) plutôt qu'à l'événement DCS tardif.
-> Un quatrième changement, distinct des trois correctifs P0 ci-dessus (décision de conception, pas
-> un bug), est appliqué dans la même passe : la porte 3/4 NM n'est plus exigée pour `_OK_`/`OK`/
-> `(OK)` CATOBAR lorsqu'elle a été capturée avant l'entrée en groove confirmée (roll-out). Un
-> cinquième change la précision de cette détection de roll-out elle-même sans toucher sa doctrine :
-> `is_rolled_out` compare désormais une régression linéaire sur toute la fenêtre `gate_samples`
-> plutôt que les deux seuls échantillons aux extrémités du buffer, moins sensible à un échantillon
-> isolé bruité sur un bord. Un sixième corrige partiellement le biais de brin confirmé le même soir
-> (voir P1 dans [tasking-roadmap.md](tasking-roadmap.md)) : `wire_estimate_at` n'accorde plus jamais
-> `confidence: "high"` sans un brin confirmé par DCS (`WIRE#` du LQM) ; l'autre moitié du biais
-> (sélection du brin lui-même, systématiquement trop haut quand l'événement DCS est en retard) a été
-> tentée via le premier contact géométrique puis abandonnée (casse le fixture `wire_4_01_FA18C`) et
-> reste ouverte. Un septième, purement diagnostique et sans impact sur la notation, instrumente la
-> référence de vent (P1, "référence de vent incohérente") : les deux réponses `GetWind` de l'entrée
-> en groove sont désormais loggées individuellement en DEBUG et exposées dans le JSON
-> (`wind_reference_probes`), et la requête `GetWind` séparée de fin de rapport logue de même sa
-> réponse — objectif : tracer, sur le prochain test live, laquelle des trois requêtes produit la
-> valeur `180°/0,0 m/s` aberrante déjà observée. Voir "Gates, outcomes et câble" plus bas pour le
-> détail complet des sept changements, et [CHANGES.md](CHANGES.md)
-> (`Unreleased`) pour la version changelog. Le commit `5f52e13` contenait par ailleurs, entre
-> autres, le raffinement CATOBAR de l'entrée en groove par confirmation de roulis/route, le
-> correctif de la désynchronisation `wire_estimated`/`wire_estimation`, le plancher de distance sous
-> lequel `trajectory_deviations` n'est plus poussé (évite l'explosion `atan2` près du toucher) puis
-> son complément `NEAR_TOUCHDOWN_ANGLE_REFERENCE_M`, le Cut sink-rate/bank-angle soutenu près du
-> pont, `_OK_` automatique (amplitude MOOSE-inspirée + temps de groove NATOPS 15-18 s), la
-> calibration de la position de crosse (T&G vs Bolter) étendue au T-45 et aux F-14 via leurs propres
-> index de draw argument, et `groove_time_secs` désormais exposé dans le JSON. Ce qui reste à
-> revalider en mission live est dans [tasking-roadmap.md](tasking-roadmap.md). Crate `lso` 0.2.0,
+> Dernier commit : HEAD `8e1228a` ("Commit pre-dev tests 07/09/2026"). Working tree actuellement
+> **non propre** : les corrections issues du corpus humain F-14B(U) du 7 septembre 2026 sont
+> appliquées mais non committées. L'entrée en groove CATOBAR exige maintenant un axe réellement
+> stabilisé (lineup, bank, route et tendance resserrés, maintenus 0,75 s) ; les observations unité
+> invalides conservent séquence, horodatage source, côté, statut et réception afin d'être attribuées
+> au vrai segment temporel ; la santé sépare cadence de capture, âge de livraison et pertes de
+> séquence ; une preuve cinématique d'arrestation structurée est exposée à titre diagnostique sans
+> lever `unconfirmed_arrest` ; la timeline de crosse est un ring récent de 2 048 entrées ; et
+> `lso.exe groove-ab` compare en lecture seule l'ancien et le nouveau détecteur sur des JSON v3.
+> Tous ces changements restent à revalider dans une nouvelle mission live. Crate `lso` 0.2.0,
 > Rust 2021 ; les changements postérieurs au tag `0.2.0` sont sous `Unreleased` dans
 > [CHANGES.md](CHANGES.md).
 
@@ -107,43 +81,25 @@ privée, ou déplacer silencieusement le métier dans Lua.
 
 ## État exécutable vérifié
 
-Dernière validation locale complète au commit `5f52e13` (5 septembre 2026) :
+Baseline exécutée avant modification sur le HEAD propre `8e1228a` :
 
-- `cargo test --locked --no-fail-fast` : **196 réussis, 0 échec** (194 tests du binaire + 2 tests
+- `cargo test --locked --no-fail-fast` : **230 réussis, 0 échec** (228 tests du binaire + 2 tests
   de provenance de build) ;
+- `cargo fmt --check` et `cargo clippy --locked --all-targets -- -D warnings` propres.
+
+Sur le working tree courant non committé :
+
+- `cargo test --locked --no-fail-fast` : **244 réussis, 0 échec** (242 tests du binaire + 2 tests
+  de provenance) ;
 - `cargo fmt --check` et `cargo clippy --locked --all-targets -- -D warnings` propres ;
-- Working tree propre à ce commit (aucune modification de code en attente).
+- `lso.exe groove-ab .ignore/tests-20260907-human` traite les 12 rapports sans les modifier et
+  retrouve une entrée avec le nouveau détecteur sur les 12 ; deux durées restent `N/A` faute de
+  touchdown DCS exploitable.
 
-Sur le working tree courant (non committé, voir en tête de document pour le détail des sept
-changements) : `cargo test --locked --no-fail-fast` **208 réussis, 0 échec** (206 tests du binaire
-+ 2 tests de provenance de build, dont 4 nouveaux tests pour les correctifs P0, 6 nouveaux tests
-pour le changement de règle 3/4 NM, 2 nouveaux tests pour la régression linéaire de
-`is_rolled_out`, 1 nouveau test pour le plafonnement de confiance `wire_estimate_at` et 1 nouveau
-test pour `wind_reference_probes`), `cargo fmt --check` et
-`cargo clippy --locked --all-targets -- -D warnings` propres. Rien de tout cela n'a encore été
-revalidé en mission live (voir [tasking-roadmap.md](tasking-roadmap.md)).
-
-Depuis, un huitième changement (6-7 septembre 2026, non committé au moment de cette mise à jour) a
-été ajouté par-dessus, en deux temps : la préférence de brin par décélération continue décrite
-ci-dessus ("Gates, outcomes et câble") avec son champ diagnostic
-`wire_estimation.arrest_deceleration_onset_time`, puis, après analyse d'un log `-vv` live déposé par
-l'utilisateur (session humaine du 6 septembre soir), le recalibrage de `WIRE_ARREST_ONSET_TOLERANCE_S`
-(0,5→1,2 s) et le changement de la porte de corrélation événement/brin pour s'appuyer sur cet onset.
-`cargo test --locked --no-fail-fast` **230 réussis, 0 échec** (228 tests du binaire, dont 3 nouveaux
-pour ce huitième changement, + 2 tests de provenance de build), `cargo fmt --check` et
-`cargo clippy --locked --all-targets -- -D warnings` propres. Non revalidé en mission live — la
-seconde moitié a été dérivée d'un log déjà capturé, pas d'un nouveau test (voir
-[tasking-roadmap.md](tasking-roadmap.md), P1) ; note : le HEAD/nombre de tests ci-dessus pour les
-sept premiers changements n'a pas été revérifié contre l'historique Git au moment de cette mise à
-jour — à recouper avec `git log`/`git show` avant de s'y fier pour autre chose que ce huitième
-changement.
-
-Un test live CVN-72 (4×F-14 + 4×F-18 IA) a été mené le 5 septembre 2026 au soir sur ce commit et a
-confirmé l'absence de régression sur les correctifs déjà en place à ce moment-là, mais chacun des
-changements listés en tête de document reste **non revalidé sur un enregistrement live postérieur à
-son propre correctif** — voir [tasking-roadmap.md](tasking-roadmap.md), "Décisions encore
-ouvertes", pour le détail de ce qui reste à confirmer en mission et sur quelles preuves live
-passées.
+La session humaine du 7 septembre a été capturée avec un binaire issu d'un working tree dirty au
+commit `b6308bc`, sans `-vv`. Elle fournit le corpus de calibration, mais ne constitue une
+revalidation live ni des changements courants ni de la dernière corrélation de brin par onset.
+Voir [tasking-roadmap.md](tasking-roadmap.md) pour les validations en mission encore nécessaires.
 
 ## Produit et périmètre métier
 
@@ -156,8 +112,8 @@ débrief (JSON, PNG, ACMI, SQLite, Discord, board HTTP).
 - V/STOL expérimental : AV-8B NA sur LHA Tarawa uniquement (voir [VSTOL.md](VSTOL.md)).
 - Humains ; IA seulement avec `--ki`.
 - Multi-avions/navires/recoveries isolé par session et génération.
-- `lso run` live ; `lso file` rejoue seulement un ACMI créé par LSO ; `lso cadence-ab` est un
-  diagnostic hors-ligne, ne rejoue rien en live.
+- `lso run` live ; `lso file` rejoue seulement un ACMI créé par LSO ; `lso cadence-ab` et
+  `lso groove-ab` sont des diagnostics hors-ligne en lecture seule, jamais des rejeux live.
 
 Le grade est un score **PROJECT-DERIVED** `project-derived-v4`, jamais une certification
 USN/USMC. Puissance moteur, mouvement du pont, et auteur réel du waveoff ne sont pas notés. AoA et
@@ -249,6 +205,10 @@ Frontières implémentées (fichiers vérifiés présents) :
 - [src/commands/cadence_ab.rs](src/commands/cadence_ab.rs) : commande `lso.exe cadence-ab`,
   diagnostic hors-ligne rejouant des `datums` déjà enregistrés avec un sous-échantillonnage
   artificiel, sans jamais modifier la capture live ni les fichiers d'entrée.
+- [src/commands/groove_ab.rs](src/commands/groove_ab.rs) : commande `lso.exe groove-ab`, comparaison
+  hors-ligne en lecture seule entre l'entrée/durée enregistrée et le détecteur stable-axis courant
+  sur les `datums` JSON v3. Elle rejoue exactement la géométrie disponible, mais ne peut pas
+  reconstruire un UTC de capture, les RPC/événements ni les vitesses absentes de `datums`.
 - [src/tasks/detect_recovery_attempt.rs](src/tasks/detect_recovery_attempt.rs) : détecteur par
   paire, vérifié toutes les 2 s. Enveloppe de repérage d'un début d'approche (`is_recovery_attempt`)
   : altitude avion `<= 1100 ft`, distance au porte-avions `<= 3.5 NM` et `> 200 m` (exclut un avion
@@ -294,6 +254,26 @@ Contrat `telemetry-contract-v1`, PROJECT-DERIVED :
 - watchdog sans progression source : 2 s ;
 - reset de l'aligneur après erreur ;
 - timestamps DCS, réception Unix et horloge monotone distincts.
+
+La santé distingue désormais explicitement :
+
+- `capture_gap_*` : espacement du temps de capture source ;
+- `delivery_age_*` : âge du snapshot lorsqu'il est livré/lu ;
+- `observed_reader_sequence_losses`/`reader_sequence_contiguous` : pertes réellement observées par
+  le curseur lecteur ;
+- `source_ring_capacity_evictions`/`source_ring_retention_evictions` : churn/évictions internes du
+  ring, jamais assimilés seuls à des snapshots perdus.
+
+Les anciens champs `sample_gap_ms`, `gap_*`, `overflow_count`, `capacity_overflow_count` et
+`lost_snapshots` restent sérialisés pour compatibilité. `sample_gap_ms`/`gap_*` gardent la valeur la
+plus défavorable entre capture et livraison ; les nouveaux champs sont la source à utiliser pour
+les distinguer. Les observations unité invalides du buffer conservent individuellement séquence,
+`capture_tick`, `capture_time_dcs` si fini, côté avion/navire, code+nom de statut source,
+`source_read_time_dcs` et `received_unix_ms`. L'attribution au segment est faite dans
+`Track::finish()` avec le temps source : avant groove et après touchdown = diagnostic seulement ;
+dans `[groove_entry_time, landing_time]` = `InvalidTelemetry` ; temps source absent = attribution
+`indeterminate_missing_source_time` et indisponibilité conservatrice, sans substituer le temps de
+réception.
 
 Aucune baseline live récente n'est revalidée dans ce document — voir
 [tasking-roadmap.md](tasking-roadmap.md) pour les dernières mesures live datées et leurs limites.
@@ -341,32 +321,23 @@ l'état du code (voir "Règles de vérité" plus haut).
 - Formule au seuil `x` : `ideal_alt = base_alt + x * tan(pente_avion)` ;
   `gs_deg = atan2(observed_alt - ideal_alt, x)` ; `lineup = atan2(écart_latéral, x)` (voir
   "Near-touchdown geometry" plus bas pour le cas `x` proche de zéro).
-- Entrée en groove CATOBAR (`entered_groove`) : la boîte géométrique historique (`x <= 3/4 NM`,
-  `alt <= 300 ft`, lineup `<= ±10°`) est nécessaire mais plus suffisante. Elle est empruntée à la
-  distance de transition au contrôle LSO du **Case III** (NAVAIR 00-80T-104 §6.6.3.1), pas à un
-  seuil Case I ; NAVAIR 00-80T-105 §6.2.4.2/6.2.4.3 définit le début du groove Case I comme un
-  événement ("roll wings level on centerline with a centered ball"), jamais une distance/altitude
-  fixe. `is_rolled_out()` (`src/track.rs`) ajoute donc deux proxies observables de cet événement,
-  vérifiés sur `GROOVE_ROLLOUT_MIN_CONSECUTIVE_SAMPLES = 2` échantillons consécutifs une fois déjà
-  dans la boîte : roulis quasi nul (`GROOVE_ROLLOUT_MAX_BANK_DEG = 15°`, échantillon courant) et
-  route sol déjà pointée dans l'axe du groove (`GROOVE_ROLLOUT_MAX_TRACK_ANGLE_DEG = 15°`, sans
-  nouveau champ de télémétrie). Ce dernier proxy est calculé par régression linéaire (moindres
-  carrés) de la position sur le temps sur toute la fenêtre `gate_samples` déjà bufferisée pour les
-  gates (`track_velocity_regression`), plutôt qu'en comparant seulement les deux échantillons aux
-  extrémités du buffer (ancienne méthode) : un seul échantillon bruité/skewé en bord de fenêtre ne
-  peut plus à lui seul faire basculer l'estimation. Purement une amélioration de précision de
-  mesure, sans changer les seuils `GROOVE_ROLLOUT_MAX_TRACK_ANGLE_DEG`/`GROOVE_ROLLOUT_MAX_BANK_DEG`
-  eux-mêmes ni introduire de nouvelle hypothèse `PROJECT-DERIVED`. Un troisième proxy candidat
-  ("on speed", via l'AoA) a été explicitement écarté : l'AoA de ce projet n'est qu'une
-  approximation géométrique (voir plus bas, "AoA dans `datums`..."), jamais une donnée exposée par
-  DCS-gRPC, donc pas assez fiable pour conditionner une détection d'entrée en groove. Seuils
-  `PROJECT-DERIVED`, non chiffrés par NATOPS, jamais revalidés en live. **CATOBAR uniquement** :
-  V/STOL (Tarawa AV-8B) garde la boîte seule, son profil d'approche (hover/cross/VL, voir
-  VSTOL.md) n'ayant pas de virage final CATOBAR à distinguer d'un survol transitoire de la boîte.
-  Cette même géométrie de boîte reste, comme avant, non revue pour un éventuel Case II/III (non
-  modélisé par ce projet — voir README.md, "Case I pattern") : n'étendre le raisonnement ci-dessus
-  à Case II/III ou à un futur Case I V/STOL/LHA sans le revalider séparément contre leur propre
-  doctrine.
+- Entrée en groove CATOBAR (`entered_groove`) : la boîte (`x <= 3/4 NM`, `alt <= 300 ft`, lineup
+  `<= ±10°`) est nécessaire mais non suffisante. NAVAIR 00-80T-105 §6.2.4.2/6.2.4.3 définit le
+  début du groove Case I comme l'événement « wings level on centerline », pas comme une distance.
+  Le détecteur stable-axis (`groove_stability_measurement`, `src/track.rs`) exige donc, sur des
+  samples valides/inbound : `|lineup| <= 2°`, `|bank| <= 10°`, `|track angle| <= 10°`, et une
+  régression du lineup sur la dernière seconde de pente absolue `<= 0,5°/s`. La route sol est une
+  régression linéaire sur la fenêtre `gate_samples` de 2 s, exploitable seulement avec au moins 1 s
+  d'historique. Tous les critères doivent rester vrais pendant `0,75 s` de temps source ; un gap de
+  capture `>300 ms` remet la persistance à zéro. Ces seuils `PROJECT-DERIVED` ont été calibrés sur
+  les 12 passes F-14B(U) du 7 septembre : ils retardent les deux entrées problématiques sans imposer
+  artificiellement un groove de 15–18 s, et conservent les écarts tardifs dans la trajectoire notée.
+  Ils sont testés aux frontières mais non revalidés dans une mission live postérieure au correctif.
+  `groove_entry` sérialise l'instant DCS, distance, lineup, bank, angle de route, pente de lineup,
+  durée/nombre de samples, trigger et seuils exacts. Le contrat RPC ne fournit pas d'ancre exacte
+  DCS→UTC : `utc_mapping_status` l'indique et le temps Unix de réception reste distinct, jamais
+  présenté comme l'UTC de capture. **CATOBAR uniquement** : V/STOL conserve la boîte seule. Le Case
+  II/III n'est pas modélisé et ne doit pas hériter de ces critères sans validation dédiée.
 - Franchissement du seuil de pont (`crossed_deck_threshold`, distingue `Bolter` de `WO?`) : ne se
   déclenche que si l'avion est proche du niveau du pont au moment du franchissement
   (`DECK_CROSSING_ALT_CAP_FT = 50 ft`, relatif au pont, crosse comprise) — sinon `WaveoffUnknown`.
@@ -557,6 +528,17 @@ valeurs restent calibrées sur seulement 2 échantillons (même pilote/avion) �
 nouvel enregistrement live (ce correctif a été dérivé d'un log déjà capturé, pas d'un nouveau test).
 Voir [tasking-roadmap.md](tasking-roadmap.md), P1, pour l'historique complet et ce qui reste à
 confirmer en mission live.
+
+`arrest_confirmation` fournit en plus une preuve cinématique structurée **diagnostique seulement**.
+Elle exige simultanément : contact `Land`/`RunwayTouch` corrélé ; onset de décélération à `<=1,2 s`
+du contact ; vitesse horizontale avion-navire `<=5 m/s` maintenue au moins `2,0 s` et 3 samples ;
+gaps de capture `<=300 ms` ; crosse `<=3 m` au-dessus du pont ; aucun rebond, départ vers l'avant
+(`>10 m/s`) ni verdict Bolter/T&G/WO contradictoire. Le JSON expose mesures, seuils, sources et motif
+d'acceptation/rejet. Sans `WIRE#`, une signature acceptée est `source:
+"kinematic_diagnostic"`, confiance `medium`, `verdict_effect:
+"diagnostic_only_no_grading_change"` : elle ne lève jamais `UnconfirmedArrest`, ne crée aucun brin
+et n'accorde aucun point. Seul un brin DCS/LQM produit `source: "dcs_lqm"`, confiance `high` et une
+confirmation autoritative. La Phase B reste ouverte dans [tasking-roadmap.md](tasking-roadmap.md).
 
 V/STOL reste AV-8B/Tarawa, spot intentionnel 7.5, formule locale expérimentale décrite dans
 [VSTOL.md](VSTOL.md). Intended spot, nearest active spot et distance sont séparés. Jamais de note
@@ -772,9 +754,13 @@ Le stream superviseur Birth/session reste nécessaire à la découverte et l'iso
 
 Capacités des buffers bornés en mémoire (`src/track.rs`) : `datums`/`pattern_datums` 72 000
 échantillons chacun (`MAX_TRACK_SAMPLES`), `trajectory_deviations` 4 000 (`MAX_TRAJECTORY_SAMPLES`),
-preuves d'événements 256 (`MAX_EVENT_EVIDENCE`), observations de hook 512 (`MAX_HOOK_EVIDENCE`) ;
-file du superviseur 16 (`queue_high_watermark`, voir "Observabilité runtime"). Un dépassement est
-explicite, compté, et bascule la complétude en `BufferLimit` — jamais silencieux.
+preuves d'événements 256 (`MAX_EVENT_EVIDENCE`), timeline d'observations source invalides 512,
+observations de hook 2 048 (`MAX_HOOK_EVIDENCE`, ~8,5 min à 4 Hz) ; file du superviseur 16
+(`queue_high_watermark`, voir "Observabilité runtime"). Les timelines hook/source-invalide sont des
+rings/diagnostics explicites avec booléen et compteur de troncature ; le hook évince le plus ancien
+afin de préserver prioritairement le dernier quart de nautique et le contact. Leur dépassement ne
+modifie pas la complétude positionnelle. Seule une perte/débordement de positions dans le segment
+noté produit `BufferLimit`.
 
 SQLite : migrations additives 2–6 (`schema_migrations`), index unique partiel `recovery_id`,
 `INSERT OR IGNORE`. Discord seulement pour une nouvelle ligne. UCID uniquement SQLite/API privée,
@@ -836,7 +822,10 @@ vérification a posteriori de l'éligibilité `_OK_`. `wind_reference_probes` (a
 `GetWind` (altitude/heading/speed) derrière `wind_reference_established`, purement diagnostique.
 `wire_estimation.arrest_deceleration_onset_time` (ajout du 6 septembre 2026, absent si aucune
 décélération soutenue n'a été détectée) : instant de l'estimateur de brin par décélération, lui
-aussi purement diagnostique — voir "Gates, outcomes et câble" ci-dessus pour les deux.
+aussi purement diagnostique. Les ajouts du 7 septembre sont `groove_entry`,
+`arrest_confirmation`, les champs `capture_gap_*`/`delivery_age_*`/continuité lecteur,
+`telemetry_quality.invalid_source_observations` et la sémantique de troncature de
+`hook_observation`. Voir "Gates, outcomes et câble" et "Contrat de télémétrie" ci-dessus.
 
 SQLite utilise le vocabulaire snake_case du JSON. L'absence d'un nouveau champ signifie
 legacy/unknown, jamais favorable. `points_awarded` (`src/db.rs`, booléen) distingue explicitement
@@ -867,6 +856,9 @@ des dépendances, pas seulement à l'exécution.
   (fixtures de test réellement présentes dans `tests/recordings/`). Une invariance live/replay est
   couverte par un test, mais le replay ne peut pas reproduire le timing réseau, l'UCID, la livraison
   d'événements DCS ni la performance serveur.
+- Comparaison stable-axis sur un rapport ou dossier JSON v3 : `lso.exe groove-ab <chemin>`. Sortie
+  TSV sur stdout ; entrées jamais modifiées. La note `new_geometric_grade` est la note géométrique
+  avant application des causes techniques/événementielles du rapport original.
 
 ## Déploiement et rollback
 
