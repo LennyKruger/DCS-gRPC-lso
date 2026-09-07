@@ -191,6 +191,52 @@ const GROOVE_ROLLOUT_MIN_CONSECUTIVE_SAMPLES: u32 = 2;
 /// until the Tarawa spot geometry is validated against the future live corpus.
 const VSTOL_SPOT_OBSERVATION_RADIUS_M: f64 = 15.0;
 
+// ---------------------------------------------------------------------------
+// Wire-estimate arrest deceleration proxy.
+//
+// `wire_estimate_at` used to always take the last (highest-numbered) hook-plane crossing
+// recorded before the correlated touchdown event. On a real trap the hook can geometrically
+// sweep across several wire thresholds while the aircraft is still airborne on short final
+// (still at approach speed, no deceleration), then a late DCS `Land`/`RunwayTouch` correlation
+// let the estimator pick whichever of those was numerically highest, rather than the wire
+// actually caught -- confirmed live as a systematic bias (see tasking-roadmap.md, P1). The
+// proxy below distinguishes "still airborne, sweeping over wire thresholds" from "already
+// arrested, decelerating on deck" directly from the continuous horizontal ground speed, without
+// depending on the event correlation at all.
+
+/// Horizontal deceleration rate (m/s^2, ground speed only) above which the aircraft is treated
+/// as actively decelerating after an arrestment, rather than merely varying speed in normal
+/// flight (throttle changes, turbulence, natural approach-speed bleed). PROJECT-DERIVED, not
+/// NATOPS-numbered: a CATOBAR trap sheds most of its ~65-75 m/s approach speed within a ~2-3 s,
+/// ~90-150 m roll-out, averaging well above 20 m/s^2 -- this sits far enough below that peak
+/// rate to catch the onset promptly while staying well above plausible in-flight speed noise.
+/// Confirmed live on 2 DCS-confirmed wire-1 arrests (6 September 2026, same pilot/aircraft type,
+/// F-14B(U)): observed horizontal speed stayed within +/-1.2 m/s^2 of noise for ~0.6-0.7 s after
+/// the hook geometrically swept past all four wire thresholds, then climbed sharply through this
+/// threshold over 2-3 consecutive samples both times -- see tasking-roadmap.md for the full trace
+/// and `WIRE_ARREST_ONSET_TOLERANCE_S` below for what this live data changed.
+const WIRE_ARREST_DECELERATION_MPS2: f64 = 5.0;
+/// How many consecutive samples must show deceleration above `WIRE_ARREST_DECELERATION_MPS2`
+/// before the onset is accepted. PROJECT-DERIVED, the same value and rationale as
+/// `GROOVE_ROLLOUT_MIN_CONSECUTIVE_SAMPLES`/`PERSISTENCE_MIN_CONSECUTIVE_SAMPLES`: rules out a
+/// single noisy/skewed telemetry frame without meaningfully delaying detection at scoring
+/// cadence.
+const WIRE_ARREST_DECELERATION_MIN_CONSECUTIVE_SAMPLES: u32 = 2;
+/// Tolerance (seconds) by which a wire crossing may precede the detected deceleration onset and
+/// still count as the wire that was actually caught. PROJECT-DERIVED. Originally 0.5 s (absorbing
+/// only the onset's own detection lag: about one sample interval plus a brief load build-up), but
+/// confirmed live on 6 September 2026 to be roughly half of what real DCS cable-arrest data needs:
+/// on the 2 DCS-confirmed wire-1 arrests available (same pilot/aircraft type, F-14B(U)), the
+/// aircraft coasted at essentially constant speed for **0.895 s and 0.990 s** after the hook
+/// geometrically crossed wire 1's threshold -- and had already geometrically crossed *all four*
+/// wire thresholds (spanning only ~0.62-0.66 s) -- before deceleration became measurable. Widened
+/// to 1.2 s to comfortably cover this "free-rollout before the cable loads" phase and correctly
+/// select the earliest (actually caught) crossing rather than a later one the hook merely slid
+/// past. Calibrated on only 2 samples from a single pilot/aircraft type; needs reconfirmation on a
+/// broader live corpus (other aircraft types, other pilots) before this value is trusted generally
+/// -- see tasking-roadmap.md, P1.
+const WIRE_ARREST_ONSET_TOLERANCE_S: f64 = 1.2;
+
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct Datum {
     /// Legacy display time; equal to corrected aircraft DCS time.
@@ -304,6 +350,13 @@ pub struct WireEstimateEvidence {
     pub confidence: &'static str,
     pub reason: &'static str,
     pub crossings: Vec<WireCrossingEvidence>,
+    /// Diagnostic only, never used for grading: the DCS simulation time at which a sustained
+    /// post-arrest horizontal deceleration was first detected (see
+    /// `WIRE_ARREST_DECELERATION_MPS2`), if any. Lets a report reader see directly whether
+    /// `wire` was chosen via the deceleration-onset proxy or the older last-crossing-before-event
+    /// fallback, to monitor the effect of this correction on the still-open wire-bias question
+    /// (see tasking-roadmap.md, P1).
+    pub arrest_deceleration_onset_time: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -477,6 +530,22 @@ pub struct Track {
     health_red_announced: bool,
     previous_wire_plane: [Option<(f64, f64)>; 4],
     wire_crossings: Vec<WireCrossingEvidence>,
+    /// Last observed (horizontal ground speed, time) pair, used by
+    /// `observe_horizontal_deceleration` to compute a per-sample deceleration rate. Updated on
+    /// every valid arrested-recovery sample, independent of `wire_crossings`/hook evidence.
+    previous_horizontal_speed: Option<(f64, f64)>,
+    /// Consecutive samples so far showing deceleration at or above
+    /// `WIRE_ARREST_DECELERATION_MPS2`, reset to 0 whenever a sample falls below it.
+    deceleration_run_count: u32,
+    /// Time of the first sample in the current consecutive deceleration run (the last known
+    /// "still fast" sample before the run started), cleared alongside `deceleration_run_count`.
+    deceleration_run_start_time: Option<f64>,
+    /// Frozen the first time `deceleration_run_count` reaches
+    /// `WIRE_ARREST_DECELERATION_MIN_CONSECUTIVE_SAMPLES`; never overwritten afterwards, the same
+    /// "first occurrence wins" posture as `first_hook_ground_contact_time`. `None` until a
+    /// sustained post-arrest deceleration is observed (including for a bolter/touch-and-go/
+    /// waveoff, which never decelerates this way).
+    arrest_deceleration_onset_time: Option<f64>,
     recent_health_samples: VecDeque<(f64, f64)>,
     telemetry_gap_stats: OnlineMetricStats,
     first_sample_time: Option<f64>,
@@ -1134,6 +1203,10 @@ impl Track {
             health_red_announced: false,
             previous_wire_plane: [None; 4],
             wire_crossings: Vec::new(),
+            previous_horizontal_speed: None,
+            deceleration_run_count: 0,
+            deceleration_run_start_time: None,
+            arrest_deceleration_onset_time: None,
             recent_health_samples: VecDeque::new(),
             telemetry_gap_stats: OnlineMetricStats::default(),
             first_sample_time: None,
@@ -1374,6 +1447,7 @@ impl Track {
             }
             if sample.is_valid() {
                 self.observe_wire_crossings(carrier, plane, sample.sample_gap_ms);
+                self.observe_horizontal_deceleration(plane);
             }
         }
 
@@ -1906,6 +1980,10 @@ impl Track {
         self.previous_wire_plane = [None; 4];
         self.wire_crossings.clear();
         self.trajectory_deviations.clear();
+        self.previous_horizontal_speed = None;
+        self.deceleration_run_count = 0;
+        self.deceleration_run_start_time = None;
+        self.arrest_deceleration_onset_time = None;
     }
 
     pub fn finish(mut self) -> TrackResult {
@@ -1915,21 +1993,19 @@ impl Track {
             self.grading = Some(Grading::WaveoffUnknown);
         }
 
-        // Still correlated on the event-reported touchdown time (`landing_time`), not yet on a
-        // geometric/deceleration proxy: a same-approach fixture (`wire_4_01_FA18C`, a clean
-        // straight-in trap with no bolter/bounce) shows the hook's ground-plane crossings for
-        // wires 1-3 recorded *before* `first_hook_ground_contact_time`, purely because the hook
-        // sweeps forward across their thresholds while still airborne on short final -- so
-        // freezing evidence at first geometric contact discarded the correct (later, wire 4)
-        // crossing on that fixture. The live-confirmed bias this is meant to fix (retaining the
-        // highest-numbered crossing recorded before a *late* DCS event, `AGENTS.md`/P1) needs a
-        // proxy that distinguishing "still airborne, sweeping over wire thresholds" from
-        // "already arrested, carried forward past them by cable stretch" -- e.g. the onset of the
-        // sharp post-catch deceleration in `touchdown_horizontal_speed_mps` -- which is not
-        // implemented here yet; left as an open decision (see tasking-roadmap.md). What *is*
-        // implemented below is the second, independent half of the fix that does not depend on
-        // resolving that question: a wire estimate can no longer read "high" confidence without
-        // a DCS-confirmed arrest.
+        // Still correlated on the event-reported touchdown time (`landing_time`) for the upper
+        // eligibility bound and the event-lag sanity check, but the wire number itself now
+        // prefers the earliest crossing at/after a detected arrest-deceleration onset over the
+        // plain last-before-event crossing (see `WIRE_ARREST_DECELERATION_MPS2` and
+        // `wire_estimate_at`) -- this is what lets a same-approach fixture (`wire_4_01_FA18C`, a
+        // clean straight-in trap with no bolter/bounce) still resolve to the correct wire 4 even
+        // though the hook sweeps geometrically across wires 1-3 while still airborne on short
+        // final: those earlier crossings occur before any deceleration is observed, and are no
+        // longer preferred. An earlier attempt to filter on `first_hook_ground_contact_time`
+        // alone (a single geometric instant, not a deceleration proxy) discarded the correct wire
+        // 4 crossing on this same fixture and was reverted; see tasking-roadmap.md for the
+        // decision history. This does not change the second, independent half of the fix: a wire
+        // estimate can still no longer read "high" confidence without a DCS-confirmed arrest.
         let dcs_wire = self.dcs_grading.as_deref().and_then(parse_dcs_wire);
         let wire_estimation = self.wire_estimate_at(
             self.landing_time
@@ -2190,6 +2266,64 @@ impl Track {
         }
     }
 
+    /// Track the onset of a sustained horizontal-speed deceleration (see
+    /// `WIRE_ARREST_DECELERATION_MPS2`), used by `wire_estimate_at` to tell a wire crossing
+    /// recorded while still airborne apart from the one actually caught. Frozen at first
+    /// detection, like `first_hook_ground_contact_time`; a no-op once already set.
+    ///
+    /// Relies on `plane.velocity`, which only the live DCS-gRPC path populates
+    /// (`Transform::from` the gRPC `Velocity` message). `lso.exe file` (ACMI/Tacview replay,
+    /// including the `tests/recordings/*.zip.acmi` fixtures) never sets it, the same
+    /// pre-existing gap `touchdown_horizontal_speed_mps` already has there (see its own test
+    /// asserting `0.0`): every offline-replayed recovery therefore falls back to the old
+    /// last-crossing-before-event selection below, onset never detected, no regression either
+    /// way. This proxy is only exercised by the live path and by the dedicated unit tests
+    /// (`wire_estimate_prefers_the_crossing_at_deceleration_onset_over_a_later_stretch_crossing`/
+    /// `wire_estimate_ignores_a_crossing_recorded_while_still_airborne_before_any_deceleration`)
+    /// that call it directly with synthetic velocity; it still needs live revalidation (see
+    /// tasking-roadmap.md).
+    fn observe_horizontal_deceleration(&mut self, plane: &Transform) {
+        if self.arrest_deceleration_onset_time.is_some() {
+            return;
+        }
+        let speed =
+            (plane.velocity.x * plane.velocity.x + plane.velocity.z * plane.velocity.z).sqrt();
+        if let Some((previous_speed, previous_time)) = self.previous_horizontal_speed {
+            let dt = plane.time - previous_time;
+            if dt > 0.0 {
+                let deceleration = (previous_speed - speed) / dt;
+                tracing::trace!(
+                    time = plane.time,
+                    speed,
+                    dt,
+                    deceleration,
+                    run_count = self.deceleration_run_count,
+                    "horizontal deceleration sample"
+                );
+                if deceleration >= WIRE_ARREST_DECELERATION_MPS2 {
+                    if self.deceleration_run_count == 0 {
+                        self.deceleration_run_start_time = Some(previous_time);
+                    }
+                    self.deceleration_run_count += 1;
+                    if self.deceleration_run_count
+                        >= WIRE_ARREST_DECELERATION_MIN_CONSECUTIVE_SAMPLES
+                    {
+                        self.arrest_deceleration_onset_time = self.deceleration_run_start_time;
+                        tracing::debug!(
+                            onset = ?self.arrest_deceleration_onset_time,
+                            deceleration_mps2 = deceleration,
+                            "arrest deceleration onset detected"
+                        );
+                    }
+                } else {
+                    self.deceleration_run_count = 0;
+                    self.deceleration_run_start_time = None;
+                }
+            }
+        }
+        self.previous_horizontal_speed = Some((speed, plane.time));
+    }
+
     fn wire_estimate_at(&self, event_time: f64, arrest_confirmed: bool) -> WireEstimateEvidence {
         let mut eligible = self
             .wire_crossings
@@ -2212,15 +2346,28 @@ impl Track {
                 confidence: "insufficient",
                 reason: "no_fresh_hook_plane_crossing",
                 crossings: self.wire_crossings.clone(),
+                arrest_deceleration_onset_time: self.arrest_deceleration_onset_time,
             };
         };
-        let event_lag_ms = (event_time - last.timestamp_dcs) * 1_000.0;
-        // A late RunwayTouch position is not moved backwards by a magic offset.
-        // If the event does not closely correlate with a continuously observed
-        // crossing, keep every crossing as evidence but decline to name a wire.
+        // A late RunwayTouch position is not moved backwards by a magic offset. If the event
+        // does not closely correlate with fresh evidence, keep every crossing but decline to
+        // name a wire. Anchored on the arrest deceleration onset when one was observed, rather
+        // than on the last raw crossing: confirmed live 6 September 2026 that the last geometric
+        // crossing (the hook merely sweeping past a wire threshold) sits 505-1953 ms before the
+        // DCS touchdown event on every pass in a 6-recovery human session -- always outside
+        // `SAMPLE_GAP_WARNING_MS`, blocking every single estimate including both DCS-confirmed
+        // arrests -- while the onset itself sat only 180-280 ms before that same event on those
+        // two arrests, comfortably inside it. Falls back to the last-crossing anchor whenever no
+        // onset was observed (every bolter/touch-and-go/waveoff, and any arrest whose
+        // deceleration signature was lost to a telemetry gap), unchanged from before.
+        let event_lag_ms = match self.arrest_deceleration_onset_time {
+            Some(onset) => (event_time - onset) * 1_000.0,
+            None => (event_time - last.timestamp_dcs) * 1_000.0,
+        };
         if !(0.0..=SAMPLE_GAP_WARNING_MS).contains(&event_lag_ms) {
             tracing::debug!(
                 event_lag_ms,
+                arrest_deceleration_onset_time = ?self.arrest_deceleration_onset_time,
                 reason = "wire_crossing_not_time_correlated_with_event",
                 "wire estimate: none"
             );
@@ -2229,32 +2376,51 @@ impl Track {
                 confidence: "insufficient",
                 reason: "wire_crossing_not_time_correlated_with_event",
                 crossings: self.wire_crossings.clone(),
+                arrest_deceleration_onset_time: self.arrest_deceleration_onset_time,
             };
         }
+        // Prefer the earliest crossing at or after the arrest deceleration onset (see
+        // `WIRE_ARREST_DECELERATION_MPS2`) over the plain last-before-event crossing: cable
+        // stretch can carry the hook geometrically past the wire actually caught and into the
+        // next one's threshold while the aircraft is already decelerating, and a crossing
+        // recorded before any deceleration at all is still airborne on short final, not a catch.
+        // Falls back to the last eligible crossing (previous behaviour) whenever no onset was
+        // observed -- including every bolter/touch-and-go/waveoff, which never decelerates this
+        // way, and any arrest whose deceleration signature was lost to a telemetry gap.
+        let selected = match self.arrest_deceleration_onset_time {
+            Some(onset) => eligible
+                .iter()
+                .find(|crossing| crossing.timestamp_dcs >= onset - WIRE_ARREST_ONSET_TOLERANCE_S)
+                .unwrap_or(last),
+            None => last,
+        };
         // "high" additionally requires a DCS-confirmed arrest (a parsed LQM wire): tight
         // brackets alone describe how well the crossing was *measured*, not whether the
         // aircraft actually stopped, and a late `runway_touch`/`Land` correlation used to let
         // this read "high" on a bolter/touch-and-go whose last geometric crossing was simply
         // the highest-numbered wire the hook happened to pass before the event fired.
         let confidence =
-            if arrest_confirmed && last.bracket_gap_ms <= 150.0 && event_lag_ms <= 150.0 {
+            if arrest_confirmed && selected.bracket_gap_ms <= 150.0 && event_lag_ms <= 150.0 {
                 "high"
             } else {
                 "medium"
             };
         tracing::debug!(
-            wire = last.wire,
+            wire = selected.wire,
             confidence,
             arrest_confirmed,
-            bracket_gap_ms = last.bracket_gap_ms,
+            bracket_gap_ms = selected.bracket_gap_ms,
             event_lag_ms,
+            arrest_deceleration_onset_time = ?self.arrest_deceleration_onset_time,
+            selected_via_deceleration_onset = selected.timestamp_dcs != last.timestamp_dcs,
             "wire estimate"
         );
         WireEstimateEvidence {
-            wire: Some(last.wire),
+            wire: Some(selected.wire),
             confidence,
             reason: "continuous_hook_plane_crossing",
             crossings: self.wire_crossings.clone(),
+            arrest_deceleration_onset_time: self.arrest_deceleration_onset_time,
         }
     }
 
@@ -4404,6 +4570,267 @@ mod tests {
         assert_eq!(
             estimate.reason,
             "wire_crossing_not_time_correlated_with_event"
+        );
+    }
+
+    #[test]
+    fn wire_estimate_prefers_the_crossing_at_deceleration_onset_over_a_later_stretch_crossing() {
+        // Regression for the confirmed live bias: cable stretch can carry the hook
+        // geometrically past the wire actually caught (wire 3 here) into the next wire's
+        // threshold (wire 4) while the aircraft is already decelerating on deck. The old
+        // last-crossing-before-event logic would have reported wire 4; the deceleration-onset
+        // proxy must instead recognise wire 3 as the earliest crossing at/after the onset.
+        let carrier_info = CarrierInfo::by_type("CVN_71").unwrap();
+        let plane_info = AirplaneInfo::by_type("FA-18C_hornet").unwrap();
+        let carrier = Transform {
+            forward: DVec3::unit_z(),
+            ..Transform::default()
+        };
+        let hook_offset = plane_info.hook;
+        let midpoint3 = (carrier_info.cable3.0 + carrier_info.cable3.1) / 2.0;
+        let midpoint4 = (carrier_info.cable4.0 + carrier_info.cable4.1) / 2.0;
+        let mut track = Track::new("pilot", carrier_info, plane_info);
+
+        // Approach speed is steady up to the catch.
+        track.observe_horizontal_deceleration(&Transform {
+            velocity: DVec3::new(0.0, 0.0, 70.0),
+            time: 4.9,
+            ..Transform::default()
+        });
+        track.observe_horizontal_deceleration(&Transform {
+            velocity: DVec3::new(0.0, 0.0, 70.0),
+            time: 5.0,
+            ..Transform::default()
+        });
+
+        // Wire 3 crossing at ~5.05, right as the cable catches.
+        track.observe_wire_crossings(
+            &carrier,
+            &Transform {
+                position: midpoint3 - hook_offset - DVec3::unit_z(),
+                time: 5.0,
+                ..Transform::default()
+            },
+            100.0,
+        );
+        track.observe_wire_crossings(
+            &carrier,
+            &Transform {
+                position: midpoint3 - hook_offset + DVec3::unit_z(),
+                time: 5.1,
+                ..Transform::default()
+            },
+            100.0,
+        );
+
+        // Sharp, sustained deceleration confirms the onset at 5.0.
+        track.observe_horizontal_deceleration(&Transform {
+            velocity: DVec3::new(0.0, 0.0, 20.0),
+            time: 5.1,
+            ..Transform::default()
+        });
+        track.observe_horizontal_deceleration(&Transform {
+            velocity: DVec3::new(0.0, 0.0, 5.0),
+            time: 5.2,
+            ..Transform::default()
+        });
+
+        // Cable stretch then carries the hook across wire 4's threshold too, at ~5.25, while
+        // already decelerating.
+        track.observe_wire_crossings(
+            &carrier,
+            &Transform {
+                position: midpoint4 - hook_offset - DVec3::unit_z(),
+                time: 5.2,
+                ..Transform::default()
+            },
+            100.0,
+        );
+        track.observe_wire_crossings(
+            &carrier,
+            &Transform {
+                position: midpoint4 - hook_offset + DVec3::unit_z(),
+                time: 5.3,
+                ..Transform::default()
+            },
+            100.0,
+        );
+
+        let estimate = track.wire_estimate_at(5.3, true);
+        assert_eq!(
+            estimate.wire,
+            Some(3),
+            "must report the wire actually caught, not the one stretch carried the hook past"
+        );
+        assert_eq!(estimate.arrest_deceleration_onset_time, Some(5.0));
+    }
+
+    #[test]
+    fn wire_estimate_correlates_via_deceleration_onset_when_the_last_crossing_lags_the_event_too_far(
+    ) {
+        // Regression reproducing the shape of a confirmed live human trap (6 September 2026,
+        // F-14B(U), DCS-confirmed WIRE# 1 both times available): the aircraft coasts at
+        // essentially constant speed for close to a second after the hook geometrically crosses
+        // wire 1 -- and after it has already swept past all four wire thresholds too -- before a
+        // sustained deceleration becomes measurable. The DCS touchdown event correlates tightly
+        // with that late deceleration onset (event_lag well under 300 ms), but the *last* raw
+        // crossing (wire 4) sits far outside 300 ms of the event -- confirmed live on 6/6 passes
+        // in that session, blocking every wire estimate that evening, including both confirmed
+        // arrests. Anchoring the correlation check on the onset instead of the last crossing must
+        // let this resolve to wire 1, not `None`.
+        let carrier_info = CarrierInfo::by_type("CVN_71").unwrap();
+        let plane_info = AirplaneInfo::by_type("FA-18C_hornet").unwrap();
+        let carrier = Transform {
+            forward: DVec3::unit_z(),
+            ..Transform::default()
+        };
+        let hook_offset = plane_info.hook;
+        let midpoints = [
+            (carrier_info.cable1.0 + carrier_info.cable1.1) / 2.0,
+            (carrier_info.cable2.0 + carrier_info.cable2.1) / 2.0,
+            (carrier_info.cable3.0 + carrier_info.cable3.1) / 2.0,
+            (carrier_info.cable4.0 + carrier_info.cable4.1) / 2.0,
+        ];
+        let mut track = Track::new("pilot", carrier_info, plane_info);
+
+        // All four wires are swept geometrically within ~0.66 s, well before any deceleration.
+        for (i, midpoint) in midpoints.iter().enumerate() {
+            let base = i as f64 * 0.22;
+            track.observe_wire_crossings(
+                &carrier,
+                &Transform {
+                    position: *midpoint - hook_offset - DVec3::unit_z(),
+                    time: base,
+                    ..Transform::default()
+                },
+                100.0,
+            );
+            track.observe_wire_crossings(
+                &carrier,
+                &Transform {
+                    position: *midpoint - hook_offset + DVec3::unit_z(),
+                    time: base + 0.05,
+                    ..Transform::default()
+                },
+                100.0,
+            );
+        }
+
+        // Steady coast (real cable load has not built up yet) until just before 0.9 s.
+        for t in [0.0_f64, 0.2, 0.4, 0.6, 0.8, 0.85] {
+            track.observe_horizontal_deceleration(&Transform {
+                velocity: DVec3::new(0.0, 0.0, 65.0),
+                time: t,
+                ..Transform::default()
+            });
+        }
+        // Sustained deceleration becomes measurable close to 0.9 s.
+        track.observe_horizontal_deceleration(&Transform {
+            velocity: DVec3::new(0.0, 0.0, 20.0),
+            time: 0.95,
+            ..Transform::default()
+        });
+        track.observe_horizontal_deceleration(&Transform {
+            velocity: DVec3::new(0.0, 0.0, 5.0),
+            time: 1.0,
+            ..Transform::default()
+        });
+
+        // The DCS touchdown event correlates tightly with the onset, not with the long-past last
+        // crossing (wire 4 at ~0.71 s, over 400 ms away).
+        let estimate = track.wire_estimate_at(1.05, true);
+        assert_eq!(
+            estimate.wire,
+            Some(1),
+            "must resolve via the deceleration onset instead of bailing out on the stale last crossing"
+        );
+        assert_eq!(estimate.arrest_deceleration_onset_time, Some(0.85));
+    }
+
+    #[test]
+    fn wire_estimate_ignores_a_crossing_recorded_while_still_airborne_before_any_deceleration() {
+        // Same fixture-derived shape as `wire_4_01_FA18C`: an early wire is crossed
+        // geometrically while the aircraft is still airborne on short final (no deceleration
+        // yet at all), and only a later wire is crossed at the real, decelerating catch.
+        let carrier_info = CarrierInfo::by_type("CVN_71").unwrap();
+        let plane_info = AirplaneInfo::by_type("FA-18C_hornet").unwrap();
+        let carrier = Transform {
+            forward: DVec3::unit_z(),
+            ..Transform::default()
+        };
+        let hook_offset = plane_info.hook;
+        let midpoint3 = (carrier_info.cable3.0 + carrier_info.cable3.1) / 2.0;
+        let midpoint4 = (carrier_info.cable4.0 + carrier_info.cable4.1) / 2.0;
+        let mut track = Track::new("pilot", carrier_info, plane_info);
+
+        // Wire 3's threshold is swept over while still airborne, well before any deceleration.
+        track.observe_wire_crossings(
+            &carrier,
+            &Transform {
+                position: midpoint3 - hook_offset - DVec3::unit_z(),
+                time: 1.0,
+                ..Transform::default()
+            },
+            100.0,
+        );
+        track.observe_wire_crossings(
+            &carrier,
+            &Transform {
+                position: midpoint3 - hook_offset + DVec3::unit_z(),
+                time: 1.1,
+                ..Transform::default()
+            },
+            100.0,
+        );
+
+        // Steady approach speed until the real catch, much later.
+        track.observe_horizontal_deceleration(&Transform {
+            velocity: DVec3::new(0.0, 0.0, 70.0),
+            time: 9.9,
+            ..Transform::default()
+        });
+        track.observe_horizontal_deceleration(&Transform {
+            velocity: DVec3::new(0.0, 0.0, 70.0),
+            time: 10.0,
+            ..Transform::default()
+        });
+
+        // Wire 4 is the real catch, at ~10.05.
+        track.observe_wire_crossings(
+            &carrier,
+            &Transform {
+                position: midpoint4 - hook_offset - DVec3::unit_z(),
+                time: 10.0,
+                ..Transform::default()
+            },
+            100.0,
+        );
+        track.observe_wire_crossings(
+            &carrier,
+            &Transform {
+                position: midpoint4 - hook_offset + DVec3::unit_z(),
+                time: 10.1,
+                ..Transform::default()
+            },
+            100.0,
+        );
+
+        track.observe_horizontal_deceleration(&Transform {
+            velocity: DVec3::new(0.0, 0.0, 20.0),
+            time: 10.1,
+            ..Transform::default()
+        });
+        track.observe_horizontal_deceleration(&Transform {
+            velocity: DVec3::new(0.0, 0.0, 5.0),
+            time: 10.2,
+            ..Transform::default()
+        });
+
+        let estimate = track.wire_estimate_at(10.2, true);
+        assert_eq!(
+            estimate.wire,
+            Some(4),
+            "must not report the wire swept over while still airborne"
         );
     }
 

@@ -123,6 +123,21 @@ test pour `wind_reference_probes`), `cargo fmt --check` et
 `cargo clippy --locked --all-targets -- -D warnings` propres. Rien de tout cela n'a encore été
 revalidé en mission live (voir [tasking-roadmap.md](tasking-roadmap.md)).
 
+Depuis, un huitième changement (6-7 septembre 2026, non committé au moment de cette mise à jour) a
+été ajouté par-dessus, en deux temps : la préférence de brin par décélération continue décrite
+ci-dessus ("Gates, outcomes et câble") avec son champ diagnostic
+`wire_estimation.arrest_deceleration_onset_time`, puis, après analyse d'un log `-vv` live déposé par
+l'utilisateur (session humaine du 6 septembre soir), le recalibrage de `WIRE_ARREST_ONSET_TOLERANCE_S`
+(0,5→1,2 s) et le changement de la porte de corrélation événement/brin pour s'appuyer sur cet onset.
+`cargo test --locked --no-fail-fast` **230 réussis, 0 échec** (228 tests du binaire, dont 3 nouveaux
+pour ce huitième changement, + 2 tests de provenance de build), `cargo fmt --check` et
+`cargo clippy --locked --all-targets -- -D warnings` propres. Non revalidé en mission live — la
+seconde moitié a été dérivée d'un log déjà capturé, pas d'un nouveau test (voir
+[tasking-roadmap.md](tasking-roadmap.md), P1) ; note : le HEAD/nombre de tests ci-dessus pour les
+sept premiers changements n'a pas été revérifié contre l'historique Git au moment de cette mise à
+jour — à recouper avec `git log`/`git show` avant de s'y fier pour autre chose que ce huitième
+changement.
+
 Un test live CVN-72 (4×F-14 + 4×F-18 IA) a été mené le 5 septembre 2026 au soir sur ce commit et a
 confirmé l'absence de régression sur les correctifs déjà en place à ce moment-là, mais chacun des
 changements listés en tête de document reste **non revalidé sur un enregistrement live postérieur à
@@ -512,9 +527,36 @@ confirmé par DCS (`WIRE#` du LQM parsé) : une fenêtre de corrélation serrée
 franchissement a été mesuré précisément, jamais que l'avion s'est réellement arrêté à ce brin, ce qui
 produisait une confiance « high » sémantiquement fausse sur un survol/bolter sans aucun accrochage
 (confirmé live 5 septembre 2026, corrigé le 6 septembre 2026). Le biais de fond distinct (brin retenu
-systématiquement trop haut quand l'événement DCS est en retard, la crosse étant entraînée
-au-delà de son brin réel par l'élongation du câble) reste non corrigé — voir
-[tasking-roadmap.md](tasking-roadmap.md), P1, pour l'analyse et la piste de décélération envisagée.
+systématiquement trop haut quand l'événement DCS est en retard, la crosse étant entraînée au-delà de
+son brin réel par l'élongation du câble) est désormais traité par un second correctif indépendant
+(6 septembre 2026) : `wire_estimate_at` préfère le premier franchissement de brin survenu au moment
+ou après le début d'une décélération horizontale soutenue détectée en continu
+(`observe_horizontal_deceleration`, `WIRE_ARREST_DECELERATION_MPS2 = 5,0 m/s²` sur
+`WIRE_ARREST_DECELERATION_MIN_CONSECUTIVE_SAMPLES = 2` échantillons consécutifs,
+`PROJECT-DERIVED`, non chiffré NATOPS) plutôt que le dernier franchissement avant l'événement DCS ;
+retombe sur ce dernier comportement dès qu'aucune décélération n'a été observée (bolter/touch-and-go/
+waveoff, ou arrêt dont la signature de décélération a été perdue dans un gap). Dépend de
+`plane.velocity`, que seul le chemin gRPC live remplit : `lso.exe file` (rejeu ACMI/Tacview) laisse
+`velocity` à zéro comme `touchdown_horizontal_speed_mps`, donc ce proxy n'est jamais exercé par un
+rejeu hors-ligne. Nouveau champ diagnostic additif `wire_estimation.arrest_deceleration_onset_time`
+(JSON, jamais noté) expose l'instant détecté.
+
+La porte de corrélation temporelle événement/brin, en amont de la sélection ci-dessus, s'appuie
+désormais sur cet onset quand il est disponible, plutôt que sur le dernier franchissement brut
+uniquement (correctif du 7 septembre 2026, suite à l'analyse d'un log `-vv` live) : confirmé sur une
+session humaine du 6 septembre (6 recoveries, F-14B(U)) que le dernier franchissement brut se situe
+systématiquement 505-1953 ms avant l'événement DCS (au-delà de `SAMPLE_GAP_WARNING_MS = 300 ms`),
+bloquant toute estimation cette soirée-là y compris sur les deux arrestations confirmées `WIRE# 1` —
+alors que l'onset, lui, ne se situait qu'à 180-280 ms de ce même événement. Repli inchangé sur
+l'ancienne vérification (dernier franchissement vs événement) si aucun onset n'est détecté. La même
+session a aussi montré que l'avion reste à vitesse quasi constante 0,9-1,0 s après le franchissement
+géométrique du brin réellement accroché (le premier des quatre franchis, pas le dernier) avant
+qu'une décélération mesurable n'apparaisse ; `WIRE_ARREST_ONSET_TOLERANCE_S` est donc élargi de 0,5
+à 1,2 s pour continuer à sélectionner ce premier franchissement plutôt qu'un suivant. Les deux
+valeurs restent calibrées sur seulement 2 échantillons (même pilote/avion) — non revalidées sur un
+nouvel enregistrement live (ce correctif a été dérivé d'un log déjà capturé, pas d'un nouveau test).
+Voir [tasking-roadmap.md](tasking-roadmap.md), P1, pour l'historique complet et ce qui reste à
+confirmer en mission live.
 
 V/STOL reste AV-8B/Tarawa, spot intentionnel 7.5, formule locale expérimentale décrite dans
 [VSTOL.md](VSTOL.md). Intended spot, nearest active spot et distance sont séparés. Jamais de note
@@ -791,8 +833,10 @@ dans le JSON la donnée déjà utilisée pour `_OK_` automatique, auparavant cal
 seulement dans l'embed Discord — un rapport live sans Discord configuré ne permettait alors aucune
 vérification a posteriori de l'éligibilité `_OK_`. `wind_reference_probes` (ajout du 6 septembre
 2026, absent si la référence de vent n'a jamais été établie) : les deux réponses brutes
-`GetWind` (altitude/heading/speed) derrière `wind_reference_established`, purement diagnostique — voir
-"Gates, outcomes et câble" ci-dessus.
+`GetWind` (altitude/heading/speed) derrière `wind_reference_established`, purement diagnostique.
+`wire_estimation.arrest_deceleration_onset_time` (ajout du 6 septembre 2026, absent si aucune
+décélération soutenue n'a été détectée) : instant de l'estimateur de brin par décélération, lui
+aussi purement diagnostique — voir "Gates, outcomes et câble" ci-dessus pour les deux.
 
 SQLite utilise le vocabulaire snake_case du JSON. L'absence d'un nouveau champ signifie
 legacy/unknown, jamais favorable. `points_awarded` (`src/db.rs`, booléen) distingue explicitement

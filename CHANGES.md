@@ -7,6 +7,34 @@ This file records user-visible changes. The crate version remains `0.2.0`; chang
 
 ### Added
 
+- `arrest_deceleration_onset_time` (diagnostic-only, `wire_estimation`): `wire_estimate_at`
+  (`src/track.rs`) now prefers the earliest wire-plane crossing at or after a detected sustained
+  horizontal-speed deceleration (`WIRE_ARREST_DECELERATION_MPS2 = 5.0 m/s^2` over
+  `WIRE_ARREST_DECELERATION_MIN_CONSECUTIVE_SAMPLES = 2` samples, `PROJECT-DERIVED`) over the
+  previous plain last-crossing-before-event selection — this is the deceleration proxy the P1
+  wire-bias fix left open on 6 September 2026 (see `tasking-roadmap.md`): cable stretch can carry
+  the hook geometrically past the wire actually caught into the next wire's threshold while the
+  aircraft is already decelerating on deck, and the old logic would report that later, higher
+  crossing. Falls back to the previous behaviour whenever no onset was observed (every bolter/
+  touch-and-go/waveoff, and any arrest whose deceleration signature was lost to a gap). Relies on
+  `plane.velocity`, populated only by the live DCS-gRPC path; `lso.exe file` (ACMI/Tacview replay)
+  never sets it, so every offline-replayed fixture still resolves through the fallback path
+  unchanged.
+- Wire-estimate event correlation (`wire_estimate_at`, `src/track.rs`) now anchors on
+  `arrest_deceleration_onset_time` when one was observed, instead of always comparing the DCS
+  touchdown event to the last raw wire-plane crossing. Confirmed live 6 September 2026 (evening,
+  human F-14B(U) session, 6 recoveries) that the last raw crossing sits 505-1953 ms before the DCS
+  event on every single pass — always outside `SAMPLE_GAP_WARNING_MS` (300 ms) — blocking every
+  wire estimate that evening, including both DCS-confirmed `WIRE# 1` arrests; the onset itself sat
+  only 180-280 ms before that same event on those two arrests. Falls back to the previous
+  last-crossing anchor whenever no onset was observed, unchanged. The same live data showed the
+  aircraft coasting at near-constant speed for 0.895-0.990 s after the hook geometrically crossed
+  wire 1 — well after it had already swept past all four wire thresholds (in ~0.62-0.66 s) — before
+  a measurable deceleration began, so `WIRE_ARREST_ONSET_TOLERANCE_S` is widened from 0.5 to 1.2 s
+  to still select that earliest (actually caught) crossing rather than a later one the hook merely
+  slid past. Both changes are `PROJECT-DERIVED`, calibrated on only 2 live samples (same pilot/
+  aircraft type), and still need revalidation on a broader live corpus and on a fresh live
+  recording (this fix was derived from an already-captured log, not exercised by a new live test).
 - `groove_time_secs`: the recovery report now serializes the groove duration (previously computed
   but visible only in the Discord embed), so `_OK_` eligibility can be checked without Discord
   configured.

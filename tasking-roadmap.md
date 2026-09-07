@@ -5,38 +5,10 @@
 > tranché sans besoin de revalidation), il est retiré d'ici ; l'essentiel synthétique de ce qui a
 > été fait migre vers [CHANGES.md](CHANGES.md) (et [AGENTS.md](AGENTS.md) si ça touche l'état
 > durable du système) — voir [AGENTS.md](AGENTS.md), "Règles de maintenance des documents markdown
-> racine", pour la règle complète. Pour le détail narratif des sessions passées (dates, tests,
-> discussions de conception), `git log`/`git show` sur les commits correspondants fait foi ; ce
-> document ne le duplique plus. Dernière purge/fusion : 6 septembre 2026, intégrant l'analyse d'un
-> second test live CVN-72 du 5 septembre 2026 (soirée, pilotes humains `Ghost-72 | TT` et
-> `Justice`, 8 recoveries T-45/F-14B(U), commit `96fd52e` dirty), puis les trois correctifs P0 qui
-> en découlent, un changement de règle discuté et validé avec l'utilisateur (porte 3/4 NM plus
-> exigée pour `_OK_`/`OK`/`(OK)` quand elle précède l'entrée en groove), et une amélioration de
-> précision de la détection de roll-out elle-même (régression linéaire remplaçant la comparaison à
-> deux points), tous implémentés et testés unitairement le 6 septembre 2026 (working tree non
-> committé au moment de cette mise à jour — voir
-> [AGENTS.md](AGENTS.md) en tête de document).
->
-> Mise à jour du 6 septembre 2026 (après-midi) : troisième test live CVN-72, entièrement IA cette
-> fois (4×F-14B(U) + 4×F/A-18C, vent 5 nds/360° vrai), 8 recoveries capturées avant arrêt volontaire
-> du test (dossier `test-runs/20260906T123251Z-cvn72-8ai-wind360-5kt/`, commit de ce document
-> dirty). Journalisation DEBUG/TRACE enrichie pour l'occasion (décision `wire_estimate_at`,
-> éligibilité porte 3/4 NM, résumé timing groove/toucher, check roll-out, refus `Bolter`/`GRADE:WO`,
-> compteur de recoveries concurrentes, abandons de détection promus INFO) — `cargo test` (208),
-> `cargo fmt --check`, `cargo clippy -D warnings` propres avant le test, working tree toujours non
-> committé. Apporte des preuves nouvelles sur six points ci-dessous (vent, estimation de brin, temps
-> de groove, écart latéral constant, chevauchement multi-recoveries, faux départs/`hook_history_truncated`)
-> et une reconfirmation d'un point opérationnel déjà documenté (foul deck suspecté, `WOFDIC`).
->
-> Mise à jour du 6 septembre 2026 (fin d'après-midi) : 4 passes humaines supplémentaires (pilote
-> `Justice`, 3 touch-and-go + 1 arrestation, code/commit identique au test IA du même après-midi,
-> dossier `.ignore/json-human-test/Justice-20260906/`, hors dépôt Git). Deux apports majeurs : (1)
-> confirmation live que le code actuel peut produire `(OK)` (une des 4 passes) — répond à la question
-> ouverte plus haut ; (2) le signe du lineup à 1/4 NM diffère d'une passe à l'autre pour ce même
-> pilote/navire, ce qui affaiblit l'hypothèse d'un bug géométrique partagé (`deck_angle`) évoquée pour
-> expliquer le biais unanime du test IA. Révèle aussi un nouveau problème, promu P0 : une dégradation
-> sévère du cadencement position sur cette session précise (absente du test IA de la veille sur le
-> même commit) a fait perdre sa note à un trap réellement accroché (`TelemetryGap`).
+> racine", pour la règle complète. Pour le détail narratif des sessions de test passées (dates,
+> corpus, discussions de conception ayant mené aux points encore ouverts ci-dessous), `git log`/
+> `git show` sur les commits correspondants fait foi ; ce document ne le duplique pas. Dernière
+> purge/fusion : 6 septembre 2026.
 
 ## À faire en priorité (P0)
 
@@ -75,61 +47,144 @@
   réseau du serveur dédié pendant la session, pour confirmer que la contention vient bien du serveur
   DCS lui-même sous charge client humaine plutôt que de `lso.exe`.
 
+  **Mise à jour 7 septembre 2026** : un second corpus déposé par l'utilisateur (même pilote
+  `Justice`, même soirée du 6 septembre, `.ignore/tests-20260906-human/`, hors dépôt Git) — mais une
+  session distincte de celle ci-dessus (6 passes réparties en deux groupes de 3, ~21h00 et ~23h15,
+  pas 4 passes sur ~11 minutes) — **reconfirme la dégradation sur un échantillon plus large sans
+  jamais atteindre le seuil dur cette fois** : `position_poll_p95_latency_ms` 659-785 ms,
+  `position_poll_p99_latency_ms` 747-909 ms, `position_poll_max_latency_ms` 768,6-972,8 ms et
+  `max_scoring_sample_gap_ms` 829,9-949,9 ms sur les 6 passes sans exception — toujours très
+  au-dessus de la baseline IA (~120-160 ms), mais aucune des 6 n'a cette fois franchi le seuil dur de
+  1 000 ms (la plus proche, 972,8/949,9 ms, en reste à ~5 %). Aucun `TelemetryGap` déclenché sur ce
+  corpus. Renforce la conclusion déjà écrite : la dégradation est un trait systémique de cette
+  configuration (client humain + serveur dédié), pas un incident isolé, mais son passage au-dessus du
+  seuil dur de 1 000 ms qui coûte réellement une note semble marginal/intermittent plutôt que garanti
+  à chaque passe. Le test avec `-vv` recommandé ci-dessus reste à faire.
+
 ## P1 — bugs confirmés à corriger, décisions à prendre
 
-- **Estimation Rust du brin systématiquement décalée par rapport à l'événement DCS — partiellement
-  corrigé le 6 septembre 2026, la sélection du brin reste ouverte.** Précédemment listé ici comme
-  « possible biais de -1 brin » sur 2 échantillons (F14-4-1, F18-2-1) — le test du 5 septembre soir a
-  apporté un 3e cas et un **mécanisme identifié** : sur le rapport où Rust (brin 4, confiance
-  `medium`) diverge de DCS (brin 1), le `runway_touch` DCS arrive après les 4 franchissements
-  géométriques successifs ; l'estimateur (`continuous_hook_plane_crossing`) retient le **dernier brin
-  franchi avant l'événement DCS**, donc systématiquement le plus haut numéroté quand l'événement DCS
-  est en retard. Deux pistes avaient été envisagées : corréler sur le début de la décélération
-  (`touchdown_horizontal_speed_mps`) ou sur le premier contact géométrique, et ne jamais produire de
-  confiance « high » sans preuve d'arrêt. **Seule la seconde moitié est faite** :
-  `wire_estimate_at` (`src/track.rs`) exige désormais un brin confirmé par DCS (`WIRE#` du LQM) pour
-  retourner `confidence: "high"` ; sans confirmation, la confiance plafonne à `"medium"`, même avec
-  des fenêtres de corrélation serrées — corrige directement le cas confirmé où un survol/bolter sans
-  aucun accrochage produisait une estimation « high » sémantiquement fausse. **La première moitié a
-  été tentée puis abandonnée** : corréler sur `first_hook_ground_contact_time` (premier contact
-  géométrique) au lieu de l'événement DCS casse le test de fixture `wire_4_01_FA18C` (un trap franc
-  sans rebond) — la crosse y franchit géométriquement les brins 1 à 3 alors que l'avion est encore en
-  l'air en courte finale, avant le contact réel proche du brin 4 ; figer l'évidence au premier contact
-  géométrique aurait donc écarté à tort le franchissement du brin 4, réellement accroché. Le biais
-  confirmé en vol reste donc entier : distinguer « encore en l'air, survole les seuils de brin » de
-  « déjà accroché, entraîné au-delà par l'élongation du câble » demande une vraie détection de
-  décélération (piste `touchdown_horizontal_speed_mps` toujours ouverte), pas un simple seuil de
-  premier contact. Probablement aggravé par l'offset vertical de crosse F-14 (voir "Décisions encore
-  ouvertes" ci-dessous, corrigé le 6 septembre 2026 mais non revalidé en mission live). À rejouer avec
-  `cadence-ab` une fois une piste de décélération implémentée pour voir si le biais de -1 brin
-  disparaît.
+- **Estimation Rust du brin systématiquement décalée par rapport à l'événement DCS — les deux
+  moitiés du correctif sont désormais implémentées (6 septembre 2026), reste entièrement à
+  revalider en mission live.** Mécanisme confirmé le 5 septembre soir : sur un rapport où Rust
+  (brin 4, confiance `medium`) divergeait de DCS (brin 1), le `runway_touch` DCS arrivait après 4
+  franchissements géométriques successifs, et l'estimateur retenait alors systématiquement le
+  **dernier brin franchi avant l'événement DCS** plutôt que celui réellement accroché. Deux
+  correctifs indépendants sont maintenant en place : (1) `wire_estimate_at` (`src/track.rs`)
+  n'accorde plus jamais `confidence: "high"` sans brin confirmé par DCS (`WIRE#` du LQM) — corrige
+  le cas confirmé où un survol/bolter sans accrochage produisait une confiance "high" sémantiquement
+  fausse. (2) `wire_estimate_at` préfère désormais le premier franchissement de brin survenu au
+  moment ou après le début d'une décélération horizontale soutenue détectée en continu
+  (`observe_horizontal_deceleration`, `WIRE_ARREST_DECELERATION_MPS2 = 5,0 m/s²` sur
+  `WIRE_ARREST_DECELERATION_MIN_CONSECUTIVE_SAMPLES = 2` échantillons, `PROJECT-DERIVED`, non
+  chiffré NATOPS) plutôt que le dernier franchissement avant l'événement DCS — distingue "encore en
+  l'air, survole les seuils de brin" de "déjà accroché, entraîné au-delà par l'élongation du câble".
+  Une première tentative (corréler sur `first_hook_ground_contact_time`, un seul instant géométrique
+  plutôt qu'un proxy de décélération) avait été abandonnée car elle cassait le fixture
+  `wire_4_01_FA18C` ; la nouvelle approche par décélération continue résout ce même fixture
+  correctement (`cargo test tests::wire_4_01`) et sans régression sur les 4 autres fixtures de
+  brin, plus deux nouveaux tests dédiés
+  (`wire_estimate_prefers_the_crossing_at_deceleration_onset_over_a_later_stretch_crossing`,
+  `wire_estimate_ignores_a_crossing_recorded_while_still_airborne_before_any_deceleration`).
+  **Limite de validation locale importante** : ce proxy dépend de `plane.velocity`, que seul le
+  chemin gRPC live remplit (`Transform::from` du message `Velocity`) — `lso.exe file` (rejeu ACMI/
+  Tacview, dont tous les fixtures `tests/recordings/*.zip.acmi`) laisse `velocity` à zéro (même
+  lacune préexistante que `touchdown_horizontal_speed_mps`, dont le test attend déjà `0.0` sur
+  rejeu), donc **aucun enregistrement local ne peut exercer ce nouveau proxy** : il retombe sur
+  l'ancien comportement (dernier franchissement) sur toute source ACMI, sans régression, mais aussi
+  sans validation contre un vrai trap enregistré. `lso.exe cadence-ab` n'est pas non plus applicable
+  à ce point : il ne rejoue que la géométrie gates/trajectoire depuis `datums`, jamais les
+  franchissements de brin ni la vitesse. **Seule une nouvelle session live peut valider ce
+  correctif** : vérifier sur un prochain trap enregistré (1) que `arrest_deceleration_onset_time`
+  (nouveau champ diagnostic JSON, `wire_estimation`) est bien détecté proche du contact réel, (2)
+  que le brin rapporté converge alors avec celui du LQM DCS plus souvent qu'avant sur les cas où ils
+  divergeaient jusqu'ici.
 
-  **Mise à jour 6 septembre après-midi (test IA, 6 arrests)** : divergence Rust/DCS observée sur 3
-  estimations sur 5 nommées (F14-2-1 DCS 4/Rust 3 confiance `medium` ; F/A-18C-2-1 DCS 4/Rust 3
-  confiance `high` ; F/A-18C-1-1 DCS 1/Rust 2 confiance `high`) ; concordantes sur les 2 autres
-  (F14-3-1 3/3, F14-4-1 1/1, toutes deux `high`) ; une sixième estimation reste `insufficient` (aucune
-  franchissement fraîche corrélée). Deux apports : (1) **le biais n'est pas systématiquement "Rust
-  trop haut"** comme formulé jusqu'ici — ce corpus montre les deux sens (2× Rust en dessous de DCS,
-  1× Rust au-dessus), à nuancer dans la piste de décélération à venir. (2) **Nouveau mode de
-  confiance "high" trompeuse, distinct de celui déjà corrigé** : le correctif du 6 septembre matin
-  empêche `"high"` quand *aucun* brin n'est confirmé par DCS (survol/bolter) ; mais ici DCS confirme
-  bel et bien *un* brin (arrêt réel), et pourtant 2 des 3 divergences ci-dessus (F/A-18C-2-1,
-  F/A-18C-1-1) affichent quand même `confidence: "high"` sur le brin *erroné* nommé par Rust, parce
-  que `"high"` ne vérifie que le respect des fenêtres de corrélation serrées et la présence d'un
-  arrêt confirmé quelque part dans la passe — jamais que le brin nommé par Rust coïncide avec celui
-  confirmé par DCS. Un consommateur du rapport lisant `confidence: "high"` peut donc toujours se fier
-  à un numéro de brin faux dans ce cas précis, exactement le type de confiance sémantiquement fausse
-  que le correctif du 6 septembre matin visait à éliminer, via un chemin différent (arrêt confirmé
-  mais brin erroné, plutôt qu'arrêt non confirmé). Décision à prendre avec l'utilisateur : plafonner
-  `"high"` à `"medium"` quand un `dcs_wire` est connu et diffère du brin estimé (comparaison directe,
-  pas seulement présence d'un arrêt), plutôt que d'ajouter un correctif unilatéral.
+  **Mise à jour 7 septembre 2026 — première preuve live du correctif, et deux constats
+  supplémentaires plus sérieux que prévu.** L'utilisateur a déposé les 6 rapports JSON/PNG plus le
+  log `-vv` complet d'une session humaine du 6 septembre au soir (pilote `Justice`, F-14B(U),
+  `.ignore/tests-20260906-human/`, hors dépôt Git) : 4 T&G/bolters (`hook_up_near_deck`) et 2
+  arrestations confirmées par le LQM DCS (`WIRE# 1` les deux fois). Le log couvrait en réalité
+  plusieurs mois (14 juin-6 septembre) dans un seul fichier `lso.log` de 106 Mo, **encodé pour moitié
+  en UTF-8 et pour moitié en UTF-16LE** (bascule visible autour du 5 septembre, ~13h) — probablement
+  `Tee-Object -FilePath ... -Append` dans `run-live-buffered.ps1` qui prend l'encodage par défaut
+  (UTF-16LE en PowerShell 5.1) sur un fichier commencé ailleurs en UTF-8 ; un `grep`/`Select-String`
+  naïf ne voit donc qu'une partie du log. **Corrigé le 7 septembre 2026** : `Tee-Object` dans
+  `.ignore/run-live-buffered.ps1` force désormais `-Encoding utf8`. Comme chaque exécution du script
+  écrit dans son propre fichier horodaté (`$runStamp-$PositionSource.log`), ce `lso.log` unique
+  couvrant plusieurs mois n'a pu être obtenu que par une concaténation manuelle de plusieurs fichiers
+  de sessions séparées ; si une telle concaténation est refaite pour un futur dépôt de preuve, la
+  faire avec un outil qui préserve l'UTF-8 (ex. `Get-Content -Raw | Out-File -Encoding utf8`), pas un
+  simple `cat`/`type` qui recopierait des encodages mixtes.
+
+  (1) **`arrest_deceleration_onset_time` est bien détecté sur les deux arrestations confirmées**
+  (3694.87 s et 11757.19 s), à partir d'une vraie décélération continue (`plane.velocity` bien
+  peuplé en live, confirmant que le proxy est actif hors ACMI comme prévu) — mais **la porte de
+  corrélation temporelle en amont bloque les six passes sans exception, avant même d'atteindre la
+  sélection par décélération** : `wire_estimate_at` retourne `wire: None` /
+  `wire_crossing_not_time_correlated_with_event` sur les 6/6 rapports (`event_lag_ms` observés :
+  505,5 / 554,5 / 770,9 / 804,3 / 864,8 / 1953,3 ms), très au-dessus des `SAMPLE_GAP_WARNING_MS`
+  (300 ms) réutilisés pour cette vérification. **Sur ce corpus, l'estimation Rust du brin est donc
+  actuellement non-fonctionnelle à 100 %** (0/6, y compris sur les deux arrestations dont le LQM
+  confirme pourtant `WIRE# 1`) — plus sévère que le biais de -1 brin déjà connu, qui produisait au
+  moins un numéro (faux). Cette porte n'a pas été touchée par le correctif du 6 septembre (elle
+  s'applique avant la sélection par décélération) ; elle réutilise `SAMPLE_GAP_WARNING_MS`, pensé à
+  l'origine pour la fraîcheur générale de télémétrie, pas pour la corrélation événement DCS/brin.
+
+  (2) **Le log `-vv` révèle le mécanisme complet, sur les deux arrestations confirmées** (mêmes
+  pilote/avion, même soirée — deux échantillons seulement, donc à reconfirmer sur un corpus plus
+  divers) : la vitesse horizontale reste quasi constante (variation < 1 m/s² de bruit) pendant que le
+  crochet franchit géométriquement les 4 brins en ~0,62-0,66 s, et la décélération réellement
+  significative (>5 m/s² soutenue) ne démarre que **~0,9-1,0 s après le franchissement du brin 1**
+  (écarts mesurés : 0,990 s et 0,895 s) — donc après que les 4 brins ont déjà été franchis
+  géométriquement dans les deux cas. Le brin réellement accroché (brin 1, confirmé LQM) est le
+  *premier* franchi, pas le dernier ; le crochet continue de glisser sur les brins suivants pendant
+  cette phase de "roulement libre" avant que la tension du câble ne produise une décélération
+  mesurable. **Conséquence pratique** : `WIRE_ARREST_ONSET_TOLERANCE_S = 0,5` (choisi sans base
+  empirique) est environ deux fois trop court pour rattacher l'onset au bon brin sur ce corpus — avec
+  une tolérance couvrant ~1,0-1,2 s, les 4 franchissements entreraient dans la fenêtre et le premier
+  (brin 1) serait sélectionné, correctement, dans les deux cas.
+
+  **Correctif implémenté le 7 septembre 2026** (validé avec l'utilisateur) : (a)
+  `WIRE_ARREST_ONSET_TOLERANCE_S` élargi de 0,5 à 1,2 s (toujours `PROJECT-DERIVED`, calibré sur
+  seulement 2 échantillons du même pilote/avion — à reconfirmer sur un corpus plus large) ; (b) la
+  porte de corrélation événement/brin dans `wire_estimate_at` (`src/track.rs`) s'appuie désormais sur
+  `arrest_deceleration_onset_time` quand il est disponible plutôt que sur le dernier franchissement
+  brut — repli inchangé sur l'ancienne vérification (dernier franchissement vs événement,
+  `SAMPLE_GAP_WARNING_MS`) quand aucun onset n'est détecté (bolter/T&G/gap). Testé unitairement avec
+  un nouveau test dédié reproduisant la forme exacte du corpus live
+  (`wire_estimate_correlates_via_deceleration_onset_when_the_last_crossing_lags_the_event_too_far`),
+  sans régression sur les 5 fixtures ACMI ni les tests existants (`cargo test` 228, `cargo fmt`/
+  `cargo clippy -D warnings` propres). **Non encore revalidé en mission live** : ce correctif n'a
+  jamais tourné sur un enregistrement réel (seulement rejoué manuellement à partir des traces du log
+  déjà capturé, pas d'un nouveau test live) — à confirmer sur une prochaine session que `wire:
+  Some(1)` est bien produit dans des cas équivalents, et que la tolérance élargie (1,2 s) ne
+  provoque pas de faux positif sur un pilotage/avion différent (biais plus faible, franchissements
+  plus espacés dans le temps, etc.).
+
+  **Historique de la divergence Rust/DCS avant ce correctif (test IA du 6 septembre après-midi, 6
+  arrests)** : divergence observée sur 3 estimations sur 5 nommées (F14-2-1 DCS 4/Rust 3 confiance
+  `medium` ; F/A-18C-2-1 DCS 4/Rust 3 confiance `high` ; F/A-18C-1-1 DCS 1/Rust 2 confiance `high`) ;
+  concordantes sur les 2 autres (F14-3-1 3/3, F14-4-1 1/1, toutes deux `high`) ; une sixième
+  estimation restait `insufficient`. Deux enseignements retenus pour le correctif ci-dessus : (1) le
+  biais n'est pas systématiquement "Rust trop haut" — ce corpus montrait les deux sens (2× Rust en
+  dessous de DCS, 1× Rust au-dessus). (2) Un mode de confiance "high" trompeuse distinct de celui
+  déjà corrigé le 6 septembre matin existait quand DCS confirmait bel et bien un brin (arrêt réel)
+  mais un brin *différent* de celui nommé par Rust — 2 des 3 divergences ci-dessus affichaient quand
+  même `confidence: "high"` sur le brin erroné. **Ce point est devenu sans objet** : les surfaces
+  pilote (Discord, PNG, dashboard) n'affichent jamais la confiance à côté du numéro de brin
+  (`pilot_facing_outcome`, voir AGENTS.md) — elle n'existe que dans le JSON complet et l'API SQLite
+  privée (loopback), réservées au diagnostic. Pas de plafonnement `"high"`→`"medium"` supplémentaire
+  à ajouter pour cette seule raison ; le correctif par décélération ci-dessus s'attaque directement à
+  la cause du mauvais numéro plutôt qu'à l'étiquette de confiance qui l'accompagnait.
 - **`baseline_manifest` sérialisé entièrement `null` dans le JSON malgré un manifeste valide fourni
   au démarrage.** Le manifeste (6 clés, aucune erreur de validation) est accepté puis perdu entre
   `run.rs` et `RecoveryReport`, ou le champ du rapport est alimenté depuis une source jamais remplie.
   La provenance de build (`lso_commit`/`lso_dirty`/`dcs_grpc_version`), elle, est correcte. À noter
   aussi : un manifeste chargé une fois au démarrage ne peut pas suivre un changement de mission en
   cours de session (observé le 5 septembre : `_A` → `_B` après coup) — envisager d'horodater la
-  lecture du manifeste dans le JSON, ou de le recharger à chaque nouvelle session DCS.
+  lecture du manifeste dans le JSON, ou de le recharger à chaque nouvelle session DCS. Reconfirmé
+  `null` sur les 6 rapports du corpus humain `Justice` du 7 septembre 2026 (aucune information
+  nouvelle, juste une récidive de plus).
 - **Référence de vent incohérente : `180°/0,0 m/s` intermittent — cause désormais fortement
   circonscrite (6 septembre 2026, après-midi, test IA 8 recoveries, vent mission 5 nds/360° vrai).**
   Grâce à l'instrumentation `wind_reference_probes` ajoutée le 6 septembre matin, les trois requêtes
@@ -154,6 +209,19 @@
   — décision de conception, pas un correctif à appliquer unilatéralement ; (3) si possible, isoler
   côté DCS-gRPC/mission (hors périmètre de ce dépôt) pourquoi `GetWind` dégrade près du niveau de la
   mer.
+
+  **Mise à jour 7 septembre 2026 (corpus humain `Justice`, 6 recoveries, 6 septembre soir)** :
+  nouvelle occurrence isolée, avec un profil différent du test IA de l'après-midi précédent. Sur les
+  6 rapports, les deux probes `wind_reference_probes` (haute et basse altitude) sont **toutes les 12
+  cohérentes** (`32°/1,2-8,2 m/s`, jamais `180°/0,0`) ; seule la requête **séparée de fin de rapport**
+  est aberrante, et seulement sur **1 rapport sur 6** (`wind_heading_deg`/`wind_speed_mps` =
+  `180°/0,0` sur `LSO-20260906-231534-...json`, contre `32°/~1,5-1,9 m/s` sur les 5 autres). Sur ce
+  corpus précis, c'est donc l'inverse du test IA (où la probe basse altitude était la plus souvent
+  fautive) : une nouvelle confirmation que **n'importe laquelle** des trois requêtes near-zero-altitude
+  peut être touchée de façon apparemment aléatoire, cohérent avec l'hypothèse déjà retenue
+  (corrélation avec l'altitude de la requête, pas avec son identité), mais renforce aussi le besoin
+  d'un garde-fou de plausibilité générique (point (2) ci-dessus) plutôt qu'un correctif ciblé sur une
+  seule des trois requêtes.
 - **Fenêtre de temps de groove `_OK_` (15-18 s NATOPS) jamais atteinte par un pilote humain sur ce
   test** : `groove_time_secs` mesuré à 19,8 / 20,3 / 22,4 / 23,0 / 26,1 s sur les 5 passes où il est
   connu, y compris sur le F-14 le plus rapide (138 kt, 19,8 s). Le temps est compté depuis le
@@ -175,6 +243,19 @@
   autres — roll-out détecté trop large/précoce, ou borne haute `OK_PERFECT_GROOVE_TIME_MAX_S` à
   revoir (par type ou globalement) pour la géométrie de pattern réellement volée dans DCS. À trancher
   avant toute promotion de `_OK_`.
+
+  **Mise à jour 7 septembre 2026 (corpus humain `Justice`, 6 recoveries, 6 septembre soir) — premier
+  signal dans l'autre sens.** `groove_time_secs` connu sur 5 des 6 passes : **12,99 / 13,88 / 14,12**
+  (groupe de 21h00) puis **20,08 / 21,88** (groupe de 23h15). Les trois premières valeurs sont **sous
+  15 s** — jamais observé jusqu'ici sur aucun corpus (IA ou humain), qui n'avait montré que des
+  valeurs au-dessus de 18 s. Casse l'hypothèse jusque-là dominante d'un roll-out "toujours détecté
+  trop large/précoce" (qui prédirait un biais uniquement vers le haut) : ce même pilote, la même
+  soirée, produit des groove times tantôt bien en dessous, tantôt bien au-dessus de la fenêtre
+  15-18 s selon le groupe de passes (avant/après 23h). Aucune des 5 valeurs ne tombe dans la fenêtre.
+  Piste à considérer : une différence de conditions entre les deux groupes (espacement de circuit,
+  vent, fatigue/style de pilotage) plutôt qu'un biais systématique de détection dans un seul sens ;
+  aucune conclusion encore possible sur le nombre de causes en jeu avec un échantillon aussi mélangé.
+  Renforce simplement la conclusion déjà écrite : ne pas promouvoir `_OK_` avant d'avoir tranché.
 - **Observabilité manquante confirmée sur ce test** (aucune ligne au niveau par défaut ne permet de
   diagnostiquer trois situations vécues ce soir) : (1) deux générations de superviseur consommées
   sans une seule ligne INFO/WARN pendant un rechargement de mission (à côté, côté DCS,
@@ -281,6 +362,22 @@
   produire mieux que `--`** — le doute exprimé plus haut ("0/14 passes vivantes n'ont jamais dépassé
   `--`") est levé pour `(OK)` au moins ; `_OK_`/`OK` restent, eux, toujours sans preuve live à ce
   jour.
+
+  **Mise à jour 7 septembre 2026 — troisième corpus humain indépendant, même conclusion.** 6
+  nouvelles passes du même pilote `Justice`, même soirée mais session/génération différente de celle
+  ci-dessus (`.ignore/tests-20260906-human/`, hors dépôt Git) : lineup à 1/4 NM = **+1,60° / -3,00° /
+  -1,48° / +3,20° / +0,35° / ~0,00°** — de nouveau les deux signes représentés (3 positifs, 2
+  négatifs, 1 quasi nul), sur un troisième échantillon indépendant du même pilote/porte-avions. Ajoute
+  du poids à la conclusion déjà écrite (coïncidence propre au test IA, pas un bug géométrique
+  partagé) sans rien changer d'autre. À l'inverse, aucune des 6 passes ne dépasse `--` cette fois
+  (toutes `NoGrade`/2,0 pts) : ne remet pas en cause la confirmation déjà obtenue que `(OK)` est
+  atteignable, mais n'apporte rien de neuf pour `_OK_`/`OK`, toujours sans preuve live.
+
+  **Sur la porte 3/4 NM** (voir "Décisions encore ouvertes" plus bas pour la décision elle-même) : le
+  lineup à cette porte est négatif sur les 6/6 passes de ce corpus (-7,78° / -16,64° / -12,18° /
+  -6,65° / -4,20° / -2,90°) — cohérent avec le constat déjà écrit ("7 passes sur 8" sur le corpus du 5
+  septembre soir) que cette porte tombe structurellement dans le virage base-à-finale pour ce
+  pilote/ce porte-avions, une reconfirmation de plus plutôt qu'un signal nouveau.
 - **Déclin de l'AoA corrigée dans le groove** (~1,5-3° entre ¾ NM et ¼ NM, systématique sur 3-4 F-14
   dans un test avec vent nul, matin du 5 septembre). Le vent nul dans cette mission exclut un
   artefact de la correction vent introduite pour l'AoA ; reste à savoir si c'est un comportement de
@@ -314,8 +411,9 @@
   rechargement complet, en cohérence avec l'erreur Lua `grpc.lua:288` côté DCS pendant le
   rechargement (voir aussi le point d'observabilité en P1 ci-dessus). Un backoff progressif
   réduirait le bruit de logs lors d'une pause prolongée.
-- **Purge du ring Lua sur `after_sequence` acquitté** et **`telemetryObservationErrors` bornée à 128
-  entrées** : implémentées côté fork. Le test du 5 septembre soir apporte un signal négatif à
+- **Signal à surveiller sur `recovery_telemetry.overflow_count`** (purge du ring Lua sur
+  `after_sequence` acquitté et bornage de `telemetryObservationErrors`, voir AGENTS.md,
+  "Architecture courante"). Le test du 5 septembre soir apporte un signal négatif à
   surveiller (pas une régression confirmée) : `recovery_telemetry.overflow_count` correspond
   exactement à `snapshots_received - 600` sur les 8 rapports, et `high_water_mark` reste à `600/600`
   en permanence — le ring semble rester plein et évincer par capacité plutôt que par purge sur
@@ -336,9 +434,10 @@
   Piste additionnelle par rapport à la version précédente de ce point : exclure de l'armement du
   détecteur un avion qui vient de se trouver sur le pont (position proche de zéro, altitude proche de
   zéro, vitesse < 30 m/s) pendant une fenêtre de N secondes, ou exiger une vitesse verticale négative
-  et une distance déjà positive pour armer `detect_recovery_attempt`. **Fait le 6 septembre 2026** :
-  les deux motifs d'abandon (jamais sous 100 m MSL, grading `Unknown`) sont désormais loggés en INFO
-  avec durée écoulée et altitude minimale atteinte. **Mise à jour 6 septembre après-midi (test IA)** :
+  et une distance déjà positive pour armer `detect_recovery_attempt` (les deux motifs d'abandon
+  sont déjà loggés en INFO avec durée écoulée et altitude minimale atteinte, voir
+  [CHANGES.md](CHANGES.md) — reste ouvert : la compaction/exclusion elle-même n'est pas
+  implémentée). **Mise à jour 6 septembre après-midi (test IA)** :
   6 abandons supplémentaires mesurés (27-100 s, altitude minimale systématiquement 220-241 m —
   jamais proche du pont) **sur un corpus 100 % IA**, ce qui nuance l'hypothèse initiale : ces faux
   départs ne sont pas spécifiques à un comportement humain (pattern overhead, hésitation) mais
@@ -364,6 +463,14 @@
   toucher, y compris sur un circuit IA plus resserré. Fait monter la priorité du correctif de
   compaction ci-dessus : ce n'est pas un cas de bord humain rare mais un bruit systématique sur ce
   corpus.
+
+  **Mise à jour 7 septembre 2026 (corpus humain `Justice`, 6 recoveries)** : présent sur **6 rapports
+  sur 6**, à nouveau sans exception, y compris sur les 4 T&G/bolters (`hook_up_near_deck`) qui
+  n'atteignent jamais un vrai toucher. `samples_in_final_window` reste dans chaque cas nettement sous
+  les 512 (24-51 échantillons), donc toujours aucune perte d'évidence utile — troisième corpus
+  consécutif (IA puis deux corpus humains) où ce diagnostic pollue systématiquement `causes` sans
+  jamais refléter un vrai problème de notation. Continue de confirmer la priorité du correctif de
+  compaction, sans rien y ajouter de nouveau.
 - **Incohérence `datums[].alt` (clampé à 0) vs `trajectory_deviations[].alt_m` (non clampé)** :
   observé à la même position/au même instant dans plusieurs rapports du 5 septembre soir (ex. `alt =
   0.00` vs `alt_m = -0.8` pour la même approche), ce qui masque justement l'information « crosse sous
@@ -586,14 +693,6 @@ changement), mais la preuve DCS live disponible reste partielle :
   live du 5 septembre).
 - `cargo audit` reste à exécuter dès qu'un outil autorisé est disponible localement (la CI l'exécute
   déjà).
-- **Désynchronisation `wire_estimated`/`wire_estimation`** : corrigée et testée unitairement, puis
-  **confirmée résolue en live** le 5 septembre soir — `wire_estimated == wire_estimation.wire` sur
-  les 8 rapports du test humain, aucune récidive de désynchronisation observée. Reste ouvert : le
-  biais de fond de l'estimation elle-même (voir le point P1 dédié "Estimation Rust du brin
-  systématiquement décalée" ci-dessus), qui est un problème différent de la désynchronisation
-  maintenant résolue.
-- **Explosion `atan2` de `trajectory_deviations`** : voir `NEAR_TOUCHDOWN_ANGLE_REFERENCE_M`
-  ci-dessus, désormais confirmée résolue sur deux corpus live indépendants.
 - Revalider sur données live le Cut sink-rate/bank-angle (`SINK_RATE_CUT_MPS = 8.0 m/s`,
   `BANK_ANGLE_CUT_DEG = 30°`) : contrairement à la plupart des autres seuils de ce module, celui-ci
   n'a **aucune base doctrinale chiffrée** à valider — seulement à confirmer, sur un corpus de
@@ -615,6 +714,24 @@ changement), mais la preuve DCS live disponible reste partielle :
   de faux positif apparent. Reste entièrement à faire : un enregistrement avec un pilotage plus
   agressif ou dégradé (vent fort, correction tardive) pour tester si le seuil déclenche au bon
   moment plutôt que seulement l'absence de faux positif.
+
+  **Mise à jour 7 septembre 2026 (corpus humain `Justice`, 6 recoveries, 6 septembre soir)** : les
+  deux seules arrestations confirmées de ce corpus (`WIRE# 1` les deux fois) ont **toutes les deux**
+  été jugées `GRADE:C` par le LQM DCS avec le commentaire `_TMRDAR_` ("too much rate of descent") —
+  troisième et quatrième points de calibration humaine sur ce seuil, dans la continuité du signal déjà
+  noté le 5 septembre soir. Sink rate max Rust observé sur ces deux passes : **6,40 m/s** (80 % du
+  seuil, `LSO-...-t3695050.json`) et **8,00 m/s** (100 % du seuil pile, `LSO-...-t11757470.json`) —
+  ni l'un ni l'autre n'a déclenché le Cut `dangerous_sink_rate_or_bank` (les deux notées `NoGrade`/
+  2,0 pts, pas `C`/0,0 pts), très probablement faute des `>=3` échantillons consécutifs requis à
+  l'intérieur du 1/4 NM plutôt que d'un seuil jamais atteint. **Quatre points de calibration humaine
+  sur quatre pointent désormais dans le même sens** (5 septembre soir : 6,0 m/s jugé fautif par DCS,
+  Cut Rust resterait silencieux ; ici : deux nouveaux cas TMRDAR à 6,4 et 8,0 m/s, Cut toujours
+  silencieux) : DCS semble sanctionner un sink rate excessif nettement avant que notre seuil/garde de
+  persistance ne s'active. Ne change rien à la garde anti-faux-positif (toujours aucun cas où notre
+  Cut se serait déclenché à tort), mais renforce l'hypothèse que `SINK_RATE_CUT_MPS = 8,0 m/s` et/ou
+  l'exigence de 3 échantillons consécutifs sont trop permissifs par rapport au jugement LSO DCS —
+  décision à prendre avec l'utilisateur avant tout resserrement (aucune base NATOPS chiffrée pour
+  arbitrer, voir plus haut).
 - Revalider en mission live l'automatisation de `_OK_` (bande d'amplitude MOOSE-inspirée + fenêtre
   de temps de groove NATOPS 15-18 s) : deux points distincts à confirmer séparément. (1) La bande
   d'amplitude resserrée n'a, comme le Cut sink-rate/bank, aucune base NATOPS chiffrée — à vérifier
