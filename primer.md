@@ -147,11 +147,16 @@ DCS qui s'interrompt, et un paquet complet simplement livré en retard. Un grand
 signifie donc plus à lui seul « positions perdues ». Les seuils de sécurité restent inchangés : le
 programme n'interpole jamais une longue coupure et ne fabrique aucune trajectoire.
 
-Si DCS signale qu'une lecture d'avion ou de porte-avions était invalide, le JSON garde désormais
-l'instant de capture, le côté concerné, le motif exact et l'instant séparé où l'erreur a été reçue.
-Une erreur prouvée avant le groove ou après le toucher reste un diagnostic ; une erreur située dans
-le groove empêche la note. Si l'heure de capture manque réellement, le programme le dit et reste
-prudent : il ne remplace pas silencieusement cette heure par celle de réception.
+Si DCS signale qu'une lecture d'avion ou de porte-avions était invalide, le JSON garde l'instant de
+capture, le côté concerné, le motif exact et l'instant séparé où l'erreur a été reçue. Une erreur
+prouvée avant le groove ou après le toucher reste un diagnostic. Dans le groove, une erreur isolée
+ne retire plus automatiquement la note lorsque les deux vraies captures qui l'encadrent prouvent
+qu'au plus 300 ms se sont écoulées et qu'aucune porte de mesure ne tombe dans ce trou. Le programme
+ne recrée aucune position manquante : il constate seulement que la couverture réelle reste assez
+serrée. Plusieurs erreurs de suite, un intervalle plus long ou une porte touchée restent bloquants.
+Si l'heure de capture manque, la séquence, le tick DCS et les captures voisines peuvent seulement
+servir de bornes prudentes ; l'heure de réception n'est jamais utilisée à sa place. Sans bornes
+fiables, la note reste indisponible et le rapport l'indique explicitement.
 
 ### Une fréquence identique du début à la fin — est-ce pertinent ?
 
@@ -572,7 +577,10 @@ deux rapports en double si jamais deux processus tournaient en même temps) :
 2. **Un fichier ACMI** — un rejeu du passage, ouvrable dans Tacview, pour revoir l'approche en
    3D.
 3. **Une image PNG** — un petit graphique visuel de l'écart glideslope/lineup pendant
-   l'approche, et un schéma du circuit d'approche (le "pattern").
+   l'approche, et un schéma du circuit d'approche (le "pattern"). Si un même suivi contient
+   plusieurs circuits avant la finale, la branche réellement évaluée garde ses couleurs ; les
+   circuits antérieurs sont tracés séparément en gris fin pour rester visibles sans masquer la
+   finale ni créer de faux raccord entre deux tours.
 4. **Une ligne dans une base de données locale** — pour garder un historique de tous vos
    passages et calculer des moyennes dans le temps (le "greenie board").
 5. **Un message Discord** (si configuré) — avec la note, le graphique et le fichier de rejeu en

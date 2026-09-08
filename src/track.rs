@@ -9,8 +9,9 @@ use crate::grading::{
     compute_vstol_final_grade_from_points, PassGrade, SpotGrade,
 };
 use crate::telemetry::{
-    AlignmentMethod, InvalidSourceObservation, ScoringSegmentAttribution, TelemetryInvalidReason,
-    TelemetrySample, MAX_EXTRAPOLATION_MS, SAMPLE_GAP_WARNING_MS,
+    AlignmentMethod, InvalidSourceObservation, InvalidSourceVerdictEffect,
+    ScoringSegmentAttribution, SourceCaptureAnchor, SourceTimeAttributionBasis,
+    TelemetryInvalidReason, TelemetrySample, MAX_EXTRAPOLATION_MS, SAMPLE_GAP_WARNING_MS,
 };
 use crate::transform::Transform;
 use crate::utils::{m_to_ft, m_to_nm};
@@ -676,6 +677,9 @@ pub struct Track {
     /// invented a `TouchAndGo` on a real trap without the DCS LQM as a safety net).
     first_hook_ground_contact_time: Option<f64>,
     telemetry_quality: TelemetryQuality,
+    /// Valid buffered captures used only as real temporal bounds for source-side errors. No
+    /// position is reconstructed from these anchors.
+    source_capture_anchors: Vec<SourceCaptureAnchor>,
     events: Vec<EventEvidence>,
     spot_zone: SpotZoneObservation,
     touchdown_horizontal_speed_mps: Option<f64>,
@@ -756,6 +760,10 @@ pub struct GateQuality {
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bracket_gap_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bracket_start_time_dcs: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bracket_end_time_dcs: Option<f64>,
 }
 
 impl Default for GateQuality {
@@ -764,6 +772,8 @@ impl Default for GateQuality {
             status: GateStatus::Missing,
             reason: Some("not_observed".to_string()),
             bracket_gap_ms: None,
+            bracket_start_time_dcs: None,
+            bracket_end_time_dcs: None,
         }
     }
 }
@@ -1032,6 +1042,9 @@ pub struct TelemetryQuality {
     pub scoring_invalid_samples: u32,
     pub post_touchdown_invalid_source_observations: u32,
     pub indeterminate_invalid_source_observations: u32,
+    pub outside_segment_invalid_source_observations: u32,
+    pub covered_short_gap_invalid_source_observations: u32,
+    pub blocking_invalid_source_observations: u32,
     pub invalid_source_observation_timeline_truncated: bool,
     pub invalid_source_observation_timeline_dropped: u32,
     pub invalid_source_observations: Vec<InvalidSourceObservation>,
@@ -1088,6 +1101,9 @@ impl Default for TelemetryQuality {
             scoring_invalid_samples: 0,
             post_touchdown_invalid_source_observations: 0,
             indeterminate_invalid_source_observations: 0,
+            outside_segment_invalid_source_observations: 0,
+            covered_short_gap_invalid_source_observations: 0,
+            blocking_invalid_source_observations: 0,
             invalid_source_observation_timeline_truncated: false,
             invalid_source_observation_timeline_dropped: 0,
             invalid_source_observations: Vec::new(),
@@ -1431,6 +1447,7 @@ impl Track {
             deck_crossing_confirmed_contact: false,
             first_hook_ground_contact_time: None,
             telemetry_quality: TelemetryQuality::default(),
+            source_capture_anchors: Vec::new(),
             events: Vec::new(),
             spot_zone: SpotZoneObservation::default(),
             touchdown_horizontal_speed_mps: None,
@@ -1508,6 +1525,20 @@ impl Track {
         let carrier = &sample.carrier;
         let plane = &sample.plane;
         let sample_time = carrier.time.max(plane.time);
+        if sample.is_valid()
+            && sample_time.is_finite()
+            && self.source_capture_anchors.len() < MAX_TRACK_SAMPLES
+        {
+            if let (Some(sequence), Some(capture_tick)) =
+                (sample.source_sequence, sample.source_capture_tick)
+            {
+                self.source_capture_anchors.push(SourceCaptureAnchor {
+                    sequence,
+                    capture_tick,
+                    capture_time_dcs: sample_time,
+                });
+            }
+        }
         let observed_gap_ms = sample.sample_gap_ms.max(sample.source_age_ms);
         self.previous_sample_time = Some(sample_time);
         self.first_sample_time.get_or_insert(sample_time);
@@ -3198,54 +3229,31 @@ impl Track {
     }
 
     fn attribute_invalid_source_observations(&mut self) {
-        let entry = self.groove_entry_time;
-        let touchdown = self.landing_time;
-        let mut before = 0_u32;
-        let mut within = 0_u32;
-        let mut after = 0_u32;
-        let mut indeterminate = 0_u32;
-        for observation in &mut self.telemetry_quality.invalid_source_observations {
-            let (attribution, affects_scoring) = match (observation.capture_time_dcs, entry) {
-                (_, None) => (ScoringSegmentAttribution::BeforeGroove, false),
-                (None, Some(_)) => (
-                    ScoringSegmentAttribution::IndeterminateMissingSourceTime,
-                    true,
-                ),
-                (Some(time), Some(entry)) if time < entry => {
-                    (ScoringSegmentAttribution::BeforeGroove, false)
-                }
-                (Some(time), Some(_)) if touchdown.is_some_and(|touchdown| time > touchdown) => {
-                    (ScoringSegmentAttribution::AfterTouchdown, false)
-                }
-                (Some(_), Some(_)) => (ScoringSegmentAttribution::InScoredSegment, true),
-            };
-            observation.attribution = attribution;
-            observation.affects_scoring = affects_scoring;
-            match attribution {
-                ScoringSegmentAttribution::BeforeGroove => before = before.saturating_add(1),
-                ScoringSegmentAttribution::InScoredSegment => within = within.saturating_add(1),
-                ScoringSegmentAttribution::AfterTouchdown => after = after.saturating_add(1),
-                ScoringSegmentAttribution::IndeterminateMissingSourceTime => {
-                    indeterminate = indeterminate.saturating_add(1)
-                }
-            }
-        }
+        let summary = assess_invalid_source_observation_coverage(
+            &mut self.telemetry_quality.invalid_source_observations,
+            &self.source_capture_anchors,
+            self.groove_entry_time,
+            self.landing_time,
+            &self.gate_deviations,
+        );
         self.telemetry_quality.pattern_invalid_samples = self
             .telemetry_quality
             .pattern_invalid_samples
-            .saturating_add(before);
+            .saturating_add(summary.before_groove);
         self.telemetry_quality.scoring_invalid_samples = self
             .telemetry_quality
             .scoring_invalid_samples
-            .saturating_add(within);
+            .saturating_add(summary.in_scored_segment);
         self.telemetry_quality
-            .post_touchdown_invalid_source_observations = after;
+            .post_touchdown_invalid_source_observations = summary.after_touchdown;
         self.telemetry_quality
-            .indeterminate_invalid_source_observations = indeterminate;
-        // Missing source time cannot be silently replaced by receipt time. Once a scored segment
-        // exists, the conservative policy is to keep the attribution indeterminate and withhold
-        // points because the error cannot be proved outside that segment.
-        if within > 0 || (entry.is_some() && indeterminate > 0) {
+            .indeterminate_invalid_source_observations = summary.indeterminate;
+        self.telemetry_quality
+            .outside_segment_invalid_source_observations = summary.outside_segment;
+        self.telemetry_quality
+            .covered_short_gap_invalid_source_observations = summary.covered_short_gap;
+        self.telemetry_quality.blocking_invalid_source_observations = summary.blocking;
+        if summary.blocking > 0 {
             self.telemetry_quality
                 .add_unavailability_cause(Completeness::InvalidTelemetry);
         }
@@ -3384,6 +3392,241 @@ fn trajectory_deviation_angles_deg(
     )
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct InvalidSourceCoverageSummary {
+    before_groove: u32,
+    in_scored_segment: u32,
+    after_touchdown: u32,
+    indeterminate: u32,
+    outside_segment: u32,
+    covered_short_gap: u32,
+    blocking: u32,
+}
+
+/// Decide whether retained source-side errors materially remove coverage from the final scored
+/// segment. This function classifies evidence only: it never interpolates a transform or adds a
+/// trajectory sample. A non-blocking hole must be exactly one missing source sequence, bounded by
+/// the immediately adjacent valid source sequences/ticks, span at most 300 ms, and not intersect
+/// the real bracket of a valid gate.
+fn assess_invalid_source_observation_coverage(
+    observations: &mut [InvalidSourceObservation],
+    anchors: &[SourceCaptureAnchor],
+    groove_entry_time: Option<f64>,
+    touchdown_time: Option<f64>,
+    gates: &GateDeviations,
+) -> InvalidSourceCoverageSummary {
+    let mut summary = InvalidSourceCoverageSummary::default();
+    let mut invalid_sequences = observations
+        .iter()
+        .map(|observation| observation.sequence)
+        .collect::<Vec<_>>();
+    invalid_sequences.sort_unstable();
+    invalid_sequences.dedup();
+
+    let mut sorted_anchors = anchors
+        .iter()
+        .copied()
+        .filter(|anchor| anchor.capture_time_dcs.is_finite())
+        .collect::<Vec<_>>();
+    sorted_anchors.sort_by_key(|anchor| anchor.sequence);
+
+    let gate_brackets = [
+        &gates.three_quarter_quality,
+        &gates.half_quality,
+        &gates.quarter_quality,
+    ];
+
+    for observation in observations {
+        let anchor_index =
+            sorted_anchors.partition_point(|anchor| anchor.sequence < observation.sequence);
+        let previous = anchor_index
+            .checked_sub(1)
+            .and_then(|index| sorted_anchors.get(index));
+        let next = sorted_anchors.get(anchor_index);
+        let ordered_bounds = previous.zip(next).filter(|(previous, next)| {
+            previous.capture_time_dcs < next.capture_time_dcs
+                && previous.capture_tick < observation.capture_tick
+                && observation.capture_tick < next.capture_tick
+        });
+        let adjacent_bounds = ordered_bounds.filter(|(previous, next)| {
+            previous.sequence.checked_add(1) == Some(observation.sequence)
+                && observation.sequence.checked_add(1) == Some(next.sequence)
+        });
+
+        if let Some((previous, next)) = ordered_bounds {
+            observation.source_time_lower_bound_dcs = Some(previous.capture_time_dcs);
+            observation.source_time_upper_bound_dcs = Some(next.capture_time_dcs);
+            observation.coverage_gap_ms =
+                Some((next.capture_time_dcs - previous.capture_time_dcs).max(0.0) * 1_000.0);
+            observation.previous_valid_sequence = Some(previous.sequence);
+            observation.next_valid_sequence = Some(next.sequence);
+        }
+
+        let (attribution, basis) = if let Some(time) = observation.capture_time_dcs {
+            (
+                classify_source_time(time, groove_entry_time, touchdown_time),
+                SourceTimeAttributionBasis::CaptureTime,
+            )
+        } else if let Some((previous, next)) = ordered_bounds {
+            (
+                classify_source_time_bounds(
+                    previous.capture_time_dcs,
+                    next.capture_time_dcs,
+                    groove_entry_time,
+                    touchdown_time,
+                ),
+                SourceTimeAttributionBasis::SequenceAndCaptureTickBounds,
+            )
+        } else if groove_entry_time.is_none() {
+            (
+                ScoringSegmentAttribution::BeforeGroove,
+                SourceTimeAttributionBasis::Unresolved,
+            )
+        } else {
+            (
+                ScoringSegmentAttribution::IndeterminateMissingSourceTime,
+                SourceTimeAttributionBasis::Unresolved,
+            )
+        };
+
+        let isolated_sequence = !invalid_sequences
+            .contains(&observation.sequence.saturating_sub(1))
+            && observation
+                .sequence
+                .checked_add(1)
+                .is_none_or(|next| !invalid_sequences.contains(&next));
+        let exact_time_inside_bounds = observation.capture_time_dcs.is_none_or(|time| {
+            adjacent_bounds.is_some_and(|(previous, next)| {
+                previous.capture_time_dcs <= time && time <= next.capture_time_dcs
+            })
+        });
+        let coverage_gap_ms = adjacent_bounds.map(|(previous, next)| {
+            (next.capture_time_dcs - previous.capture_time_dcs).max(0.0) * 1_000.0
+        });
+        let short_real_gap = isolated_sequence
+            && exact_time_inside_bounds
+            && coverage_gap_ms.is_some_and(|gap_ms| gap_ms <= SAMPLE_GAP_WARNING_MS + 1.0e-6);
+        let touches_gate = match observation.capture_time_dcs {
+            Some(time) => gate_brackets
+                .iter()
+                .any(|quality| gate_contains_time(quality, time)),
+            None => ordered_bounds.is_some_and(|(previous, next)| {
+                gate_brackets.iter().any(|quality| {
+                    gate_intersects_interval(
+                        quality,
+                        previous.capture_time_dcs,
+                        next.capture_time_dcs,
+                    )
+                })
+            }),
+        };
+
+        let verdict_effect = match attribution {
+            ScoringSegmentAttribution::BeforeGroove | ScoringSegmentAttribution::AfterTouchdown => {
+                InvalidSourceVerdictEffect::DiagnosticOutsideScoredSegment
+            }
+            ScoringSegmentAttribution::InScoredSegment if short_real_gap && !touches_gate => {
+                InvalidSourceVerdictEffect::DiagnosticCoveredShortGap
+            }
+            ScoringSegmentAttribution::InScoredSegment => {
+                InvalidSourceVerdictEffect::BlockingCoverageGap
+            }
+            ScoringSegmentAttribution::IndeterminateMissingSourceTime => {
+                InvalidSourceVerdictEffect::BlockingIndeterminateMissingSourceTime
+            }
+        };
+        let affects_scoring = matches!(
+            verdict_effect,
+            InvalidSourceVerdictEffect::BlockingCoverageGap
+                | InvalidSourceVerdictEffect::BlockingIndeterminateMissingSourceTime
+        );
+
+        observation.attribution = attribution;
+        observation.attribution_basis = basis;
+        observation.verdict_effect = verdict_effect;
+        observation.affects_scoring = affects_scoring;
+
+        match attribution {
+            ScoringSegmentAttribution::BeforeGroove => {
+                summary.before_groove = summary.before_groove.saturating_add(1)
+            }
+            ScoringSegmentAttribution::InScoredSegment => {
+                summary.in_scored_segment = summary.in_scored_segment.saturating_add(1)
+            }
+            ScoringSegmentAttribution::AfterTouchdown => {
+                summary.after_touchdown = summary.after_touchdown.saturating_add(1)
+            }
+            ScoringSegmentAttribution::IndeterminateMissingSourceTime => {
+                summary.indeterminate = summary.indeterminate.saturating_add(1)
+            }
+        }
+        match verdict_effect {
+            InvalidSourceVerdictEffect::DiagnosticOutsideScoredSegment => {
+                summary.outside_segment = summary.outside_segment.saturating_add(1)
+            }
+            InvalidSourceVerdictEffect::DiagnosticCoveredShortGap => {
+                summary.covered_short_gap = summary.covered_short_gap.saturating_add(1)
+            }
+            InvalidSourceVerdictEffect::BlockingCoverageGap
+            | InvalidSourceVerdictEffect::BlockingIndeterminateMissingSourceTime => {
+                summary.blocking = summary.blocking.saturating_add(1)
+            }
+        }
+    }
+    summary
+}
+
+fn classify_source_time(
+    time: f64,
+    groove_entry_time: Option<f64>,
+    touchdown_time: Option<f64>,
+) -> ScoringSegmentAttribution {
+    match groove_entry_time {
+        None => ScoringSegmentAttribution::BeforeGroove,
+        Some(entry) if time < entry => ScoringSegmentAttribution::BeforeGroove,
+        Some(_) if touchdown_time.is_some_and(|touchdown| time > touchdown) => {
+            ScoringSegmentAttribution::AfterTouchdown
+        }
+        Some(_) => ScoringSegmentAttribution::InScoredSegment,
+    }
+}
+
+fn classify_source_time_bounds(
+    lower: f64,
+    upper: f64,
+    groove_entry_time: Option<f64>,
+    touchdown_time: Option<f64>,
+) -> ScoringSegmentAttribution {
+    let Some(entry) = groove_entry_time else {
+        return ScoringSegmentAttribution::BeforeGroove;
+    };
+    if upper < entry {
+        ScoringSegmentAttribution::BeforeGroove
+    } else if touchdown_time.is_some_and(|touchdown| lower > touchdown) {
+        ScoringSegmentAttribution::AfterTouchdown
+    } else if lower >= entry && touchdown_time.is_none_or(|touchdown| upper <= touchdown) {
+        ScoringSegmentAttribution::InScoredSegment
+    } else {
+        ScoringSegmentAttribution::IndeterminateMissingSourceTime
+    }
+}
+
+fn gate_contains_time(quality: &GateQuality, time: f64) -> bool {
+    quality.status == GateStatus::Valid
+        && quality
+            .bracket_start_time_dcs
+            .zip(quality.bracket_end_time_dcs)
+            .is_some_and(|(start, end)| start <= time && time <= end)
+}
+
+fn gate_intersects_interval(quality: &GateQuality, lower: f64, upper: f64) -> bool {
+    quality.status == GateStatus::Valid
+        && quality
+            .bracket_start_time_dcs
+            .zip(quality.bracket_end_time_dcs)
+            .is_some_and(|(start, end)| lower <= end && start <= upper)
+}
+
 fn capture_gate_from_window(
     samples: &VecDeque<ApproachSample>,
     current: &ApproachSample,
@@ -3437,6 +3680,8 @@ fn capture_gate(
     if !(previous.x > gate && current.x <= gate) {
         return;
     }
+    quality.bracket_start_time_dcs = Some(previous.time);
+    quality.bracket_end_time_dcs = Some(current.time);
     if !previous.valid || !current.valid {
         quality.status = GateStatus::Invalid;
         quality.reason = Some("invalid_or_non_inbound_bracketing_sample".to_string());
@@ -3776,6 +4021,7 @@ fn normalize_grading_for_recovery(grading: Grading, recovery: &CarrierRecovery) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::telemetry::SourceObservationEntity;
 
     #[test]
     fn wind_velocity_vector_matches_expected_world_frame_direction() {
@@ -3960,8 +4206,293 @@ mod tests {
             source_read_time_dcs: Some(99.0),
             received_unix_ms,
             attribution: ScoringSegmentAttribution::IndeterminateMissingSourceTime,
+            attribution_basis: SourceTimeAttributionBasis::Unresolved,
+            source_time_lower_bound_dcs: None,
+            source_time_upper_bound_dcs: None,
+            coverage_gap_ms: None,
+            previous_valid_sequence: None,
+            next_valid_sequence: None,
+            verdict_effect: InvalidSourceVerdictEffect::BlockingIndeterminateMissingSourceTime,
             affects_scoring: false,
         }
+    }
+
+    fn source_anchor(
+        sequence: u64,
+        capture_tick: u64,
+        capture_time_dcs: f64,
+    ) -> SourceCaptureAnchor {
+        SourceCaptureAnchor {
+            sequence,
+            capture_tick,
+            capture_time_dcs,
+        }
+    }
+
+    fn assess_source_errors(
+        observations: &mut [InvalidSourceObservation],
+        anchors: &[SourceCaptureAnchor],
+        gates: &GateDeviations,
+    ) -> InvalidSourceCoverageSummary {
+        assess_invalid_source_observation_coverage(
+            observations,
+            anchors,
+            Some(10.0),
+            Some(20.0),
+            gates,
+        )
+    }
+
+    #[test]
+    fn isolated_source_error_bounded_inside_300_ms_is_diagnostic_only() {
+        let mut observations = vec![invalid_source_observation(
+            10,
+            Some(15.1),
+            SourceObservationEntity::Aircraft,
+            "read_error",
+            90_000,
+        )];
+        let summary = assess_source_errors(
+            &mut observations,
+            &[source_anchor(9, 9, 15.0), source_anchor(11, 11, 15.2)],
+            &GateDeviations::default(),
+        );
+
+        assert_eq!(summary.covered_short_gap, 1);
+        assert_eq!(summary.blocking, 0);
+        assert!(observations[0]
+            .coverage_gap_ms
+            .is_some_and(|gap_ms| (gap_ms - 200.0).abs() < 1.0e-6));
+        assert_eq!(
+            observations[0].verdict_effect,
+            InvalidSourceVerdictEffect::DiagnosticCoveredShortGap
+        );
+        assert!(!observations[0].affects_scoring);
+    }
+
+    #[test]
+    fn isolated_source_error_accepts_exactly_300_ms_of_real_coverage() {
+        let mut observations = vec![invalid_source_observation(
+            10,
+            Some(15.15),
+            SourceObservationEntity::Carrier,
+            "read_error",
+            0,
+        )];
+        let summary = assess_source_errors(
+            &mut observations,
+            &[source_anchor(9, 9, 15.0), source_anchor(11, 11, 15.3)],
+            &GateDeviations::default(),
+        );
+        assert_eq!(summary.covered_short_gap, 1);
+        assert_eq!(summary.blocking, 0);
+    }
+
+    #[test]
+    fn isolated_source_error_above_300_ms_blocks() {
+        let mut observations = vec![invalid_source_observation(
+            10,
+            Some(15.151),
+            SourceObservationEntity::Aircraft,
+            "read_error",
+            0,
+        )];
+        let summary = assess_source_errors(
+            &mut observations,
+            &[source_anchor(9, 9, 15.0), source_anchor(11, 11, 15.301)],
+            &GateDeviations::default(),
+        );
+        assert_eq!(summary.covered_short_gap, 0);
+        assert_eq!(summary.blocking, 1);
+        assert_eq!(
+            observations[0].verdict_effect,
+            InvalidSourceVerdictEffect::BlockingCoverageGap
+        );
+    }
+
+    #[test]
+    fn consecutive_source_error_sequences_are_blocking() {
+        let mut observations = vec![
+            invalid_source_observation(
+                10,
+                Some(15.1),
+                SourceObservationEntity::Aircraft,
+                "read_error",
+                0,
+            ),
+            invalid_source_observation(
+                11,
+                Some(15.15),
+                SourceObservationEntity::Carrier,
+                "read_error",
+                0,
+            ),
+        ];
+        let summary = assess_source_errors(
+            &mut observations,
+            &[source_anchor(9, 9, 15.0), source_anchor(12, 12, 15.2)],
+            &GateDeviations::default(),
+        );
+        assert_eq!(summary.blocking, 2);
+        assert!(observations
+            .iter()
+            .all(|observation| observation.affects_scoring));
+    }
+
+    #[test]
+    fn source_errors_before_groove_and_after_touchdown_are_explicitly_outside() {
+        let mut observations = vec![
+            invalid_source_observation(
+                10,
+                Some(9.5),
+                SourceObservationEntity::Aircraft,
+                "read_error",
+                0,
+            ),
+            invalid_source_observation(
+                20,
+                Some(20.5),
+                SourceObservationEntity::Carrier,
+                "read_error",
+                0,
+            ),
+        ];
+        let summary = assess_source_errors(&mut observations, &[], &GateDeviations::default());
+        assert_eq!(summary.outside_segment, 2);
+        assert_eq!(summary.blocking, 0);
+        assert_eq!(
+            observations[0].attribution,
+            ScoringSegmentAttribution::BeforeGroove
+        );
+        assert_eq!(
+            observations[1].attribution,
+            ScoringSegmentAttribution::AfterTouchdown
+        );
+        assert!(observations.iter().all(|observation| {
+            observation.verdict_effect == InvalidSourceVerdictEffect::DiagnosticOutsideScoredSegment
+        }));
+    }
+
+    #[test]
+    fn source_error_inside_a_valid_gate_bracket_remains_blocking() {
+        let mut observations = vec![invalid_source_observation(
+            10,
+            Some(15.1),
+            SourceObservationEntity::Aircraft,
+            "read_error",
+            0,
+        )];
+        let gates = GateDeviations {
+            half_quality: GateQuality {
+                status: GateStatus::Valid,
+                reason: None,
+                bracket_gap_ms: Some(200.0),
+                bracket_start_time_dcs: Some(15.0),
+                bracket_end_time_dcs: Some(15.2),
+            },
+            ..GateDeviations::default()
+        };
+        let summary = assess_source_errors(
+            &mut observations,
+            &[source_anchor(9, 9, 15.0), source_anchor(11, 11, 15.2)],
+            &gates,
+        );
+        assert_eq!(summary.blocking, 1);
+        assert_eq!(
+            observations[0].verdict_effect,
+            InvalidSourceVerdictEffect::BlockingCoverageGap
+        );
+    }
+
+    #[test]
+    fn missing_source_time_can_be_bounded_by_adjacent_sequence_and_tick() {
+        let mut observation = invalid_source_observation(
+            10,
+            None,
+            SourceObservationEntity::Carrier,
+            "invalid_data",
+            999_999,
+        );
+        observation.capture_tick = 100;
+        let mut observations = vec![observation];
+        let summary = assess_source_errors(
+            &mut observations,
+            &[source_anchor(9, 99, 15.0), source_anchor(11, 101, 15.2)],
+            &GateDeviations::default(),
+        );
+        assert_eq!(summary.covered_short_gap, 1);
+        assert_eq!(
+            observations[0].attribution,
+            ScoringSegmentAttribution::InScoredSegment
+        );
+        assert_eq!(
+            observations[0].attribution_basis,
+            SourceTimeAttributionBasis::SequenceAndCaptureTickBounds
+        );
+        assert_eq!(observations[0].source_time_lower_bound_dcs, Some(15.0));
+        assert_eq!(observations[0].source_time_upper_bound_dcs, Some(15.2));
+        assert_eq!(observations[0].received_unix_ms, 999_999);
+    }
+
+    #[test]
+    fn missing_source_time_without_reliable_bounds_stays_indeterminate_and_blocking() {
+        let mut observations = vec![invalid_source_observation(
+            10,
+            None,
+            SourceObservationEntity::Carrier,
+            "invalid_data",
+            123_456,
+        )];
+        let summary = assess_source_errors(
+            &mut observations,
+            &[source_anchor(9, 99, 15.0)],
+            &GateDeviations::default(),
+        );
+        assert_eq!(summary.indeterminate, 1);
+        assert_eq!(summary.blocking, 1);
+        assert_eq!(
+            observations[0].attribution_basis,
+            SourceTimeAttributionBasis::Unresolved
+        );
+        assert_eq!(
+            observations[0].verdict_effect,
+            InvalidSourceVerdictEffect::BlockingIndeterminateMissingSourceTime
+        );
+    }
+
+    #[test]
+    fn covered_short_error_coexists_with_an_independent_completeness_cause() {
+        let carrier = CarrierInfo::by_type("CVN_71").unwrap();
+        let plane = AirplaneInfo::by_type("FA-18C_hornet").unwrap();
+        let mut track = Track::new("pilot", carrier, plane);
+        track.entered_groove = true;
+        track.groove_entry_time = Some(10.0);
+        track.landing_time = Some(20.0);
+        track.source_capture_anchors = vec![source_anchor(9, 9, 15.0), source_anchor(11, 11, 15.2)];
+        track.record_invalid_source_observations(vec![invalid_source_observation(
+            10,
+            Some(15.1),
+            SourceObservationEntity::Aircraft,
+            "read_error",
+            0,
+        )]);
+        track.mark_telemetry_gap(TelemetryInvalidReason::TelemetryGap);
+
+        let result = track.finish();
+        assert!(result
+            .telemetry_quality
+            .unavailability_causes
+            .contains(&Completeness::TelemetryGap));
+        assert!(!result
+            .telemetry_quality
+            .unavailability_causes
+            .contains(&Completeness::InvalidTelemetry));
+        assert_eq!(
+            result
+                .telemetry_quality
+                .covered_short_gap_invalid_source_observations,
+            1
+        );
     }
 
     fn observe_kinematic_point(
@@ -4099,6 +4630,7 @@ mod tests {
             status: GateStatus::Valid,
             reason: None,
             bracket_gap_ms: Some(100.0),
+            ..GateQuality::default()
         }
     }
 
@@ -4256,6 +4788,7 @@ mod tests {
             status: GateStatus::Invalid,
             reason: Some("stale_skewed_or_reordered_gate_bracket".to_string()),
             bracket_gap_ms: None,
+            ..GateQuality::default()
         };
         assert!(gates.all_valid(Some(1.5)));
 
@@ -4279,6 +4812,7 @@ mod tests {
                 status: GateStatus::Invalid,
                 reason: Some("stale_skewed_or_reordered_gate_bracket".to_string()),
                 bracket_gap_ms: None,
+                ..GateQuality::default()
             },
         };
         // Captured at t=1.0, after a groove entry at t=0.5: still required, and invalid.

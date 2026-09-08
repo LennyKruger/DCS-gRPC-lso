@@ -2,9 +2,10 @@
 
 > Document de continuité, à tenir à jour à chaque changement significatif de code ou de contrat.
 > Dépôt `E:\DCS stuffs\Initiative ESG\DCS-gRPC-lso`, branche `feature/refonte-v3-lua-buffer`.
-> Dernier commit : HEAD `e62506d` ("Corrections post tests phase 2 07/09/2026"). Working tree
-> actuellement **non propre** : la première tranche sûre du P0 de réduction des `Grading unavailable`
-> est implémentée, en plus de changements documentaires utilisateur préexistants. La correction de segmentation des waveoffs issue du
+> Dernier commit : HEAD `18c12c4` ("Préparation externalisation des variables de config"). Working tree
+> actuellement **non propre** : les tranches sûres du P0 sur la restitution graduée et la couverture
+> des observations source invalides sont implémentées ; le rendu du pattern sépare les circuits antérieurs de la branche
+> finale, en plus du ménage de roadmap courant. La correction de segmentation des waveoffs issue du
 > second corpus humain F-14B(U) du 7 septembre 2026 est incluse dans HEAD. L'entrée en groove
 > CATOBAR exige
 > un axe réellement
@@ -95,10 +96,20 @@ Sur le HEAD `e62506d`, qui inclut la correction de segmentation des waveoffs :
 
 - `cargo test --locked --no-fail-fast` : **246 réussis, 0 échec** (244 tests du binaire + 2 tests
   de provenance) ;
-- `cargo fmt --check` et `cargo clippy --locked --all-targets -- -D warnings` propres ;
+- `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings` et `git diff --check`
+  propres ;
 - `lso.exe groove-ab .ignore/tests-20260907-human` traite les 12 rapports sans les modifier et
   retrouve une entrée avec le nouveau détecteur sur les 12 ; deux durées restent `N/A` faute de
   touchdown DCS exploitable.
+
+Sur le working tree courant :
+
+- `cargo test --locked --no-fail-fast` : **259 réussis, 0 échec** (257 tests du binaire + 2 tests
+  de provenance) ;
+- `cargo fmt --check` et `cargo clippy --locked --all-targets -- -D warnings` propres ;
+- la segmentation pure du pattern couvre un circuit simple, deux survols suivis de la finale et une
+  discontinuité temporelle ; la revue visuelle d’un PNG nominal est propre ; le corpus multi-circuits
+  historique ne peut pas être rerendu depuis ses JSON, qui ne sérialisent pas `pattern_datums`.
 
 La première session humaine du 7 septembre a été capturée avec un binaire issu d'un working tree dirty au
 commit `b6308bc`, sans `-vv`. Elle fournit le corpus de calibration, mais ne constitue une
@@ -235,7 +246,10 @@ Frontières implémentées (fichiers vérifiés présents) :
 - [src/metrics.rs](src/metrics.rs) : instrumentation RPC/stream/queue/IO/rendu — voir
   "Observabilité runtime" plus bas.
 - [src/web.rs](src/web.rs) : dashboard privé loopback-only.
-- [src/draw.rs](src/draw.rs) : rendu PNG (approche + pattern), déporté en `spawn_blocking`.
+- [src/draw.rs](src/draw.rs) : rendu PNG (approche + pattern), déporté en `spawn_blocking`. Le
+  pattern est segmenté aux retournements approche/départ confirmés (>150 m) et aux discontinuités ;
+  la branche contenant l’entrée en groove, ou le touchdown/la plus récente en fallback, conserve
+  les couleurs AoA, tandis que les branches antérieures sont atténuées et jamais reliées entre elles.
 
 Le collecteur source bufferisé Lua/DCS-gRPC **est implémenté et actif par défaut**
 (`--position-source buffered`) : `PositionCollector` consomme
@@ -291,11 +305,19 @@ Les anciens champs `sample_gap_ms`, `gap_*`, `overflow_count`, `capacity_overflo
 plus défavorable entre capture et livraison ; les nouveaux champs sont la source à utiliser pour
 les distinguer. Les observations unité invalides du buffer conservent individuellement séquence,
 `capture_tick`, `capture_time_dcs` si fini, côté avion/navire, code+nom de statut source,
-`source_read_time_dcs` et `received_unix_ms`. L'attribution au segment est faite dans
-`Track::finish()` avec le temps source : avant groove et après touchdown = diagnostic seulement ;
-dans `[groove_entry_time, landing_time]` = `InvalidTelemetry` ; temps source absent = attribution
-`indeterminate_missing_source_time` et indisponibilité conservatrice, sans substituer le temps de
-réception.
+`source_read_time_dcs` et `received_unix_ms`. L'attribution et l'effet sur le verdict sont décidés
+dans `Track::finish()`, jamais à la réception. Avant groove et après touchdown restent diagnostiques.
+Dans le segment noté, une seule séquence invalide peut rester diagnostique uniquement si les deux
+séquences valides immédiatement adjacentes, leurs `capture_tick` strictement ordonnés et leurs temps
+source prouvent un intervalle total `<=300 ms`, sans intersection avec le bracket réel d'une gate.
+Les séries, intervalles plus longs, bornes incohérentes/manquantes et pertes touchant une gate
+produisent `InvalidTelemetry`. Si `capture_time_dcs` manque, les voisins séquence/tick/temps peuvent
+borner prudemment le segment sans fabriquer d'instant exact ; sinon l'attribution reste
+`indeterminate_missing_source_time` et bloquante. Le temps Unix de réception n'est jamais substitué.
+Chaque observation sérialise `attribution_basis`, les bornes/les séquences voisines disponibles,
+`coverage_gap_ms`, `verdict_effect` et `affects_scoring`; les compteurs agrégés distinguent hors
+segment, trou court couvert et trou bloquant. Cette tolérance ne crée ni position ni échantillon de
+trajectoire.
 
 Le second corpus humain F-14B(U) du 7 septembre 2026 confirme une capture source à 20 Hz
 (`capture_gap_max_ms = 50`), sans perte de séquence ni intervalle source manqué sur les quatre
@@ -328,7 +350,9 @@ l'état du code (voir "Règles de vérité" plus haut).
 - Gates : 3/4 NM 1 389 m, 1/2 926 m, 1/4 463 m.
 - États : `Missing`, `Late`, `Invalid`, `Valid`.
 - Validité : deux samples inbound encadrants, temps croissant, bracket <=300 ms, skew <=300 ms,
-  phase/altitude admissibles.
+  phase/altitude admissibles. `GateQuality` conserve aussi les temps source des deux extrémités :
+  une observation source invalide située dans ce bracket reste bloquante même si le bracket vaut
+  au plus 300 ms.
 - Trois gates valides et ordonnées sont obligatoires pour une note favorable **CATOBAR uniquement
   lorsque la porte 3/4 NM a été capturée après l'entrée en groove confirmée** (roll-out, voir
   ci-dessous). Quand la porte 3/4 NM (présente ou non, valide ou non) précède l'entrée en groove,
@@ -796,7 +820,8 @@ Le stream superviseur Birth/session reste nécessaire à la découverte et l'iso
   Discord.
 - Un artefact existant n'est jamais remplacé.
 
-Capacités des buffers bornés en mémoire (`src/track.rs`) : `datums`/`pattern_datums` 72 000
+Capacités des buffers bornés en mémoire (`src/track.rs`) : `datums`/`pattern_datums` et ancres
+valides séquence/tick/temps utilisées pour la couverture, 72 000
 échantillons chacun (`MAX_TRACK_SAMPLES`), `trajectory_deviations` 4 000 (`MAX_TRAJECTORY_SAMPLES`),
 preuves d'événements 256 (`MAX_EVENT_EVIDENCE`), timeline d'observations source invalides 512,
 observations de hook 2 048 (`MAX_HOOK_EVIDENCE`, ~8,5 min à 4 Hz) ; file du superviseur 16
@@ -868,8 +893,12 @@ vérification a posteriori de l'éligibilité `_OK_`. `wind_reference_probes` (a
 décélération soutenue n'a été détectée) : instant de l'estimateur de brin par décélération, lui
 aussi purement diagnostique. Les ajouts du 7 septembre sont `groove_entry`,
 `arrest_confirmation`, les champs `capture_gap_*`/`delivery_age_*`/continuité lecteur,
-`telemetry_quality.invalid_source_observations` et la sémantique de troncature de
-`hook_observation`. Voir "Gates, outcomes et câble" et "Contrat de télémétrie" ci-dessus.
+`telemetry_quality.invalid_source_observations` (attribution, base de bornage, intervalle couvert et
+effet explicite sur le verdict), les bornes source des brackets de gate et la sémantique de troncature de
+`hook_observation`. `pattern_rendering` ajoute le nombre de branches de circuit, l’index primaire
+compté à partir de zéro, son motif de sélection et le nombre de branches atténuées ; ce diagnostic décrit le
+rendu uniquement et n’affecte jamais le grading. Voir "Gates, outcomes et câble" et "Contrat de
+télémétrie" ci-dessus.
 
 SQLite utilise le vocabulaire snake_case du JSON. L'absence d'un nouveau champ signifie
 legacy/unknown, jamais favorable. `points_awarded` (`src/db.rs`, booléen) distingue explicitement

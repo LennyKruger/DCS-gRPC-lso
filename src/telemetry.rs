@@ -49,6 +49,30 @@ pub enum ScoringSegmentAttribution {
     IndeterminateMissingSourceTime,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceTimeAttributionBasis {
+    CaptureTime,
+    SequenceAndCaptureTickBounds,
+    Unresolved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InvalidSourceVerdictEffect {
+    DiagnosticOutsideScoredSegment,
+    DiagnosticCoveredShortGap,
+    BlockingCoverageGap,
+    BlockingIndeterminateMissingSourceTime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SourceCaptureAnchor {
+    pub sequence: u64,
+    pub capture_tick: u64,
+    pub capture_time_dcs: f64,
+}
+
 /// One source-side unit observation that could not produce a paired position sample. The source
 /// capture clock and client receipt clock stay separate; attribution is filled only after the
 /// final groove/touchdown bounds are known.
@@ -66,6 +90,18 @@ pub struct InvalidSourceObservation {
     pub source_read_time_dcs: Option<f64>,
     pub received_unix_ms: u64,
     pub attribution: ScoringSegmentAttribution,
+    pub attribution_basis: SourceTimeAttributionBasis,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_time_lower_bound_dcs: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_time_upper_bound_dcs: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coverage_gap_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_valid_sequence: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_valid_sequence: Option<u64>,
+    pub verdict_effect: InvalidSourceVerdictEffect,
     pub affects_scoring: bool,
 }
 
@@ -82,6 +118,10 @@ pub struct TelemetrySample {
     pub source_age_ms: f64,
     pub method: AlignmentMethod,
     pub invalid_reason: Option<TelemetryInvalidReason>,
+    /// Buffered-source identity used only to prove real capture coverage. Replay and unary
+    /// samples have no source sequence/tick and therefore never manufacture such an anchor.
+    pub source_sequence: Option<u64>,
+    pub source_capture_tick: Option<u64>,
 }
 
 impl TelemetrySample {
@@ -123,6 +163,8 @@ impl TelemetrySample {
                 AlignmentMethod::Direct
             },
             invalid_reason,
+            source_sequence: None,
+            source_capture_tick: None,
         }
     }
 
@@ -167,6 +209,8 @@ impl TelemetrySample {
                 AlignmentMethod::Direct
             },
             invalid_reason,
+            source_sequence: None,
+            source_capture_tick: None,
         }
     }
 }
@@ -302,6 +346,8 @@ impl TelemetryAligner {
                 method
             },
             invalid_reason,
+            source_sequence: None,
+            source_capture_tick: None,
         };
 
         if carrier_advanced {

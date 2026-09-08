@@ -7,6 +7,9 @@ This file records user-visible changes. The crate version remains `0.2.0`; chang
 
 ### Added
 
+- Additive `pattern_rendering` JSON diagnostic records the number of continuous pattern branches,
+  the zero-based primary branch selected for normal display, why it was selected and how many
+  older branches were attenuated (`src/draw.rs`, `src/tasks/record_recovery.rs`).
 - Additive graduated-assessment contract across JSON, SQLite, Discord and the board:
   `assessment_scope`, `observed_from_distance_m`, `missing_coverage`, `points_eligible` and
   `fallback_source`. A measured partial approach remains visible without points, independently of
@@ -15,6 +18,13 @@ This file records user-visible changes. The crate version remains `0.2.0`; chang
 
 ### Fixed
 
+- `InvalidTelemetry` is now proportional to proven loss of scored-segment coverage. One isolated
+  invalid buffered-source sequence is diagnostic when immediately bounded by real valid
+  sequence/tick/time anchors within 300 ms and outside every valid gate bracket; consecutive,
+  longer, gate-touching or unbounded errors remain blocking. Missing source time may be bounded
+  without inventing a timestamp, and receipt time is never substituted. JSON retains every
+  observation with its attribution basis, real bounds, coverage gap and explicit verdict effect
+  (`src/telemetry.rs`, `src/tasks/position_collector.rs`, `src/track.rs`).
 - Buffered delivery latency no longer invalidates otherwise continuous source capture; it remains
   visible in health metrics and warnings. Buffered RPC/empty-batch recovery now uses the source
   ring's advertised retention (one-second safety margin, 30-second cap), while unary keeps its
@@ -88,8 +98,9 @@ This file records user-visible changes. The crate version remains `0.2.0`; chang
   touch-and-go.
 - Hook-position calibration (touch-and-go vs bolter) extended from the F/A-18C to the VNAO T-45
   (draw argument index 25, shared with the F/A-18C) and the F-14A/B/B(U) (index 1305), via new
-  `AirplaneInfo::hook_draw_argument`. Only the F/A-18C's `<=0.2`=up/`>=0.8`=down polarity is
-  empirically confirmed; T-45/F-14 reuse it as an unverified assumption pending live confirmation.
+  `AirplaneInfo::hook_draw_argument`. The `<=0.2`=up/`>=0.8`=down polarity is empirically
+  confirmed for the F/A-18C and was subsequently confirmed live in both directions for the T-45
+  and F-14B(U); F-14A/F-14B still reuse it as an assumption pending type-specific live validation.
 - A dedicated sink-rate/bank-angle Cut (`dangerous_sink_rate_or_bank`, `src/grading.rs`): a
   sustained (>=3 consecutive samples) sink rate >=8.0 m/s or bank >=30 degrees inside the
   quarter-NM grades the pass `C`. `PROJECT-DERIVED`; NATOPS documents sink rate and bank as
@@ -313,6 +324,11 @@ This file records user-visible changes. The crate version remains `0.2.0`; chang
 
 ### Changed
 
+- Multi-circuit pattern PNGs no longer draw every circuit as one equally prominent polyline. The
+  renderer splits confirmed approach/departure reversals and telemetry discontinuities into
+  independent branches, keeps AoA colours on the branch containing groove entry (touchdown/latest
+  fallback), and draws older branches as thin grey context without artificial joins. Track
+  lifecycle, telemetry and grading are unchanged (`src/draw.rs`).
 - Telemetry health now reports source capture spacing and delivery age as separate maxima, scored
   maxima, warning ratios and p50/p95/p99 distributions while retaining legacy worst-of gap fields.
   Reader-observed sequence loss/continuity is separate from source ring capacity/retention churn;

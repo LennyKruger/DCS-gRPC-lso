@@ -1009,16 +1009,19 @@ mod tests {
                 status: GateStatus::Valid,
                 reason: None,
                 bracket_gap_ms: Some(100.0),
+                ..GateQuality::default()
             },
             half_quality: GateQuality {
                 status: GateStatus::Valid,
                 reason: None,
                 bracket_gap_ms: Some(100.0),
+                ..GateQuality::default()
             },
             quarter_quality: GateQuality {
                 status: GateStatus::Valid,
                 reason: None,
                 bracket_gap_ms: Some(100.0),
+                ..GateQuality::default()
             },
         }
     }

@@ -1211,8 +1211,9 @@ impl ValueFormatter<f64> for CustomRange {
 #[cfg(test)]
 mod layout_tests {
     use super::{
-        chart_layout, select_catobar_display_runs, select_catobar_final_datums,
-        select_vstol_final_datums, Datum, PANEL_GAP,
+        chart_layout, pattern_branch_diagnostic, select_catobar_display_runs,
+        select_catobar_final_datums, select_pattern_branches, select_vstol_final_datums, Datum,
+        PatternDatum, PANEL_GAP,
     };
 
     fn two_complete_final_approach_runs() -> Vec<Datum> {
@@ -1310,6 +1311,92 @@ mod layout_tests {
         assert!(selected.iter().all(|datum| datum.y == 180.0));
         assert_eq!(selected.last().map(|datum| datum.x), Some(0.0));
     }
+
+    fn pattern_datum(time: f64, astern_m: f64) -> PatternDatum {
+        PatternDatum {
+            time,
+            astern_m,
+            port_m: 0.0,
+            alt_ft: 600.0,
+            aoa: 7.0,
+        }
+    }
+
+    #[test]
+    fn simple_pattern_stays_in_one_primary_branch() {
+        let datums = [
+            pattern_datum(0.0, 2_000.0),
+            pattern_datum(1.0, 1_600.0),
+            pattern_datum(2.0, 1_200.0),
+            pattern_datum(3.0, 800.0),
+            pattern_datum(4.0, 400.0),
+            pattern_datum(5.0, 200.0),
+        ];
+
+        let selection = select_pattern_branches(&datums, Some(4.5), Some(5.0));
+        assert_eq!(selection.ranges, vec![0..6]);
+        assert_eq!(selection.primary_index, Some(0));
+        assert_eq!(selection.reason, "groove_entry");
+    }
+
+    #[test]
+    fn repeated_high_passes_are_separate_and_the_groove_branch_is_primary() {
+        let datums = [
+            // First high pass, followed by a departure of more than 150 m.
+            pattern_datum(0.0, 2_500.0),
+            pattern_datum(1.0, 2_100.0),
+            pattern_datum(2.0, 1_700.0),
+            pattern_datum(3.0, 1_300.0),
+            pattern_datum(4.0, 900.0),
+            pattern_datum(5.0, 1_000.0),
+            pattern_datum(6.0, 1_100.0),
+            // Circuit and second high pass.
+            pattern_datum(7.0, 1_500.0),
+            pattern_datum(8.0, 1_900.0),
+            pattern_datum(9.0, 2_300.0),
+            pattern_datum(10.0, 1_900.0),
+            pattern_datum(11.0, 1_500.0),
+            pattern_datum(12.0, 1_100.0),
+            pattern_datum(13.0, 800.0),
+            pattern_datum(14.0, 900.0),
+            pattern_datum(15.0, 1_000.0),
+            // Circuit and actual final.
+            pattern_datum(16.0, 1_400.0),
+            pattern_datum(17.0, 1_800.0),
+            pattern_datum(18.0, 2_200.0),
+            pattern_datum(19.0, 1_800.0),
+            pattern_datum(20.0, 1_400.0),
+            pattern_datum(21.0, 1_000.0),
+            pattern_datum(22.0, 850.0),
+            pattern_datum(23.0, 450.0),
+            pattern_datum(24.0, 100.0),
+        ];
+
+        let selection = select_pattern_branches(&datums, Some(22.0), Some(24.0));
+        assert_eq!(selection.ranges, vec![0..7, 7..16, 16..25]);
+        assert_eq!(selection.primary_index, Some(2));
+
+        let diagnostic = pattern_branch_diagnostic(&datums, Some(22.0), Some(24.0));
+        assert_eq!(diagnostic.pattern_branch_count, 3);
+        assert_eq!(diagnostic.primary_pattern_branch, Some(2));
+        assert_eq!(diagnostic.attenuated_branch_count, 2);
+        assert_eq!(diagnostic.selection_reason, "groove_entry");
+    }
+
+    #[test]
+    fn a_time_discontinuity_never_creates_a_rendering_connection() {
+        let datums = [
+            pattern_datum(0.0, 2_000.0),
+            pattern_datum(1.0, 1_500.0),
+            pattern_datum(10.0, 1_000.0),
+            pattern_datum(11.0, 500.0),
+        ];
+
+        let selection = select_pattern_branches(&datums, None, Some(11.0));
+        assert_eq!(selection.ranges, vec![0..2, 2..4]);
+        assert_eq!(selection.primary_index, Some(1));
+        assert_eq!(selection.reason, "touchdown");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1324,6 +1411,155 @@ const PAT_AHEAD_NM: f64 = 3.0; // ahead  (top of chart)
 /// Physical size of the pattern PNG.
 const PAT_IMG_W: u32 = 900;
 const PAT_IMG_H: u32 = 900;
+
+const PATTERN_BRANCH_REVERSAL_M: f64 = 150.0;
+const PATTERN_BRANCH_MAX_GAP_S: f64 = 2.0;
+const PATTERN_BRANCH_MAX_STEP_M: f64 = 500.0;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct PatternRenderingDiagnostic {
+    pub pattern_branch_count: usize,
+    /// Zero-based index in chronological branch order.
+    pub primary_pattern_branch: Option<usize>,
+    pub selection_reason: &'static str,
+    pub attenuated_branch_count: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PatternBranchSelection {
+    ranges: Vec<std::ops::Range<usize>>,
+    primary_index: Option<usize>,
+    reason: &'static str,
+}
+
+/// Split overview history at a confirmed approach-to-departure reversal or a
+/// telemetry discontinuity. A branch starts just after one pass and contains
+/// the following circuit plus its next inbound leg, so drawing branches as
+/// separate series cannot join two circuits with an artificial chord.
+fn select_pattern_branches(
+    datums: &[PatternDatum],
+    groove_entry_time: Option<f64>,
+    touchdown_time: Option<f64>,
+) -> PatternBranchSelection {
+    #[derive(Clone, Copy)]
+    enum Motion {
+        Approaching { minimum_distance_m: f64 },
+        Departing { maximum_distance_m: f64 },
+    }
+
+    if datums.is_empty() {
+        return PatternBranchSelection {
+            ranges: Vec::new(),
+            primary_index: None,
+            reason: "no_pattern_data",
+        };
+    }
+
+    let distance = |datum: &PatternDatum| datum.astern_m.hypot(datum.port_m);
+    let mut ranges = Vec::new();
+    let mut branch_start = 0;
+    let mut motion = Motion::Approaching {
+        minimum_distance_m: distance(&datums[0]),
+    };
+
+    for index in 1..datums.len() {
+        let previous = &datums[index - 1];
+        let datum = &datums[index];
+        let previous_distance_m = distance(previous);
+        let current_distance_m = distance(datum);
+        let dt = datum.time - previous.time;
+        let step_m = (datum.astern_m - previous.astern_m).hypot(datum.port_m - previous.port_m);
+        let continuous = datum.time.is_finite()
+            && previous.time.is_finite()
+            && previous_distance_m.is_finite()
+            && current_distance_m.is_finite()
+            && dt > 0.0
+            && dt <= PATTERN_BRANCH_MAX_GAP_S
+            && step_m.is_finite()
+            && step_m <= PATTERN_BRANCH_MAX_STEP_M;
+
+        if !continuous {
+            ranges.push(branch_start..index);
+            branch_start = index;
+            motion = Motion::Approaching {
+                minimum_distance_m: distance(datum),
+            };
+            continue;
+        }
+
+        motion = match motion {
+            Motion::Approaching { minimum_distance_m }
+                if current_distance_m - minimum_distance_m > PATTERN_BRANCH_REVERSAL_M =>
+            {
+                ranges.push(branch_start..index + 1);
+                branch_start = index + 1;
+                Motion::Departing {
+                    maximum_distance_m: current_distance_m,
+                }
+            }
+            Motion::Approaching { minimum_distance_m } => Motion::Approaching {
+                minimum_distance_m: minimum_distance_m.min(current_distance_m),
+            },
+            Motion::Departing { maximum_distance_m }
+                if maximum_distance_m - current_distance_m > PATTERN_BRANCH_REVERSAL_M =>
+            {
+                Motion::Approaching {
+                    minimum_distance_m: current_distance_m,
+                }
+            }
+            Motion::Departing { maximum_distance_m } => Motion::Departing {
+                maximum_distance_m: maximum_distance_m.max(current_distance_m),
+            },
+        };
+    }
+    if branch_start < datums.len() {
+        ranges.push(branch_start..datums.len());
+    }
+    ranges.retain(|range| !range.is_empty());
+
+    let anchor = groove_entry_time
+        .filter(|time| time.is_finite())
+        .map(|time| (time, "groove_entry"))
+        .or_else(|| {
+            touchdown_time
+                .filter(|time| time.is_finite())
+                .map(|time| (time, "touchdown"))
+        });
+    let anchored_index = anchor.and_then(|(anchor_time, _)| {
+        ranges.iter().position(|range| {
+            datums[range.start].time <= anchor_time && anchor_time <= datums[range.end - 1].time
+        })
+    });
+    let primary_index = anchored_index.or_else(|| ranges.len().checked_sub(1));
+    let reason = if anchored_index.is_some() {
+        anchor.map(|(_, reason)| reason).unwrap_or("latest_branch")
+    } else {
+        "latest_branch"
+    };
+
+    PatternBranchSelection {
+        ranges,
+        primary_index,
+        reason,
+    }
+}
+
+pub(crate) fn pattern_branch_diagnostic(
+    datums: &[PatternDatum],
+    groove_entry_time: Option<f64>,
+    touchdown_time: Option<f64>,
+) -> PatternRenderingDiagnostic {
+    let selection = select_pattern_branches(datums, groove_entry_time, touchdown_time);
+    PatternRenderingDiagnostic {
+        pattern_branch_count: selection.ranges.len(),
+        primary_pattern_branch: selection.primary_index,
+        selection_reason: selection.reason,
+        attenuated_branch_count: selection
+            .ranges
+            .len()
+            .saturating_sub(usize::from(selection.primary_index.is_some())),
+    }
+}
 
 /// Draw a top-down bird's-eye chart of the full recovery circuit and save it
 /// next to the approach chart as `<filename>-pattern.png`.
@@ -1367,6 +1603,29 @@ pub fn draw_pattern_chart(
         &title_style,
         (16, 12),
     )?;
+
+    let groove_entry_time = track.groove_entry.as_ref().map(|entry| entry.timestamp_dcs);
+    let branch_selection = select_pattern_branches(
+        &track.pattern_datums,
+        groove_entry_time,
+        track.touchdown_time_dcs,
+    );
+    if branch_selection.ranges.len() > 1 {
+        let previous_count = branch_selection.ranges.len() - 1;
+        let branch_text_color = THEME_GUIDE_GRAY.mix(0.75);
+        let branch_style =
+            TextStyle::from(("sans-serif", 15).into_font()).color(&branch_text_color);
+        root.draw_text(
+            &format!(
+                "{previous_count} circuit{} antérieur{} atténué{}",
+                if previous_count > 1 { "s" } else { "" },
+                if previous_count > 1 { "s" } else { "" },
+                if previous_count > 1 { "s" } else { "" },
+            ),
+            &branch_style,
+            (16, 38),
+        )?;
+    }
 
     let x_range = (-PAT_WIDTH_NM / 2.0)..(PAT_WIDTH_NM / 2.0);
     // chart_y = -astern_m: carrier at 0, ahead = positive, astern = negative
@@ -1457,54 +1716,66 @@ pub fn draw_pattern_chart(
         let _ = label; // label kept for reference
     }
 
-    // Pattern track coloured by AoA
-    let datums_nm: Vec<_> = track
-        .pattern_datums
-        .iter()
-        .map(|d| PatternDatum {
-            time: d.time,
-            // chart coords: port on left (negate port_m), ahead at top (negate astern_m)
-            astern_m: -m_to_nm(d.astern_m), // chart_y = -astern_m
-            port_m: -m_to_nm(d.port_m),     // chart_x = -port_m
-            alt_ft: d.alt_ft,
-            aoa: d.aoa,
-        })
-        .filter(|d| {
-            d.port_m >= -PAT_WIDTH_NM / 2.0
-                && d.port_m <= PAT_WIDTH_NM / 2.0
-                && d.astern_m >= -PAT_ASTERN_NM
-                && d.astern_m <= PAT_AHEAD_NM
-        })
-        .collect();
+    // Draw each circuit as an independent series. Only the branch containing
+    // groove entry (or touchdown fallback) keeps the normal AoA colours.
+    let mut primary_datums_nm = Vec::new();
+    for (branch_index, range) in branch_selection.ranges.iter().enumerate() {
+        let datums_nm: Vec<_> = track.pattern_datums[range.clone()]
+            .iter()
+            .map(|d| PatternDatum {
+                time: d.time,
+                // chart coords: port on left (negate port_m), ahead at top (negate astern_m)
+                astern_m: -m_to_nm(d.astern_m),
+                port_m: -m_to_nm(d.port_m),
+                alt_ft: d.alt_ft,
+                aoa: d.aoa,
+            })
+            .filter(|d| {
+                d.port_m >= -PAT_WIDTH_NM / 2.0
+                    && d.port_m <= PAT_WIDTH_NM / 2.0
+                    && d.astern_m >= -PAT_ASTERN_NM
+                    && d.astern_m <= PAT_AHEAD_NM
+            })
+            .collect();
 
-    let mut iter = datums_nm.iter().peekable();
-    let mut seg_pts: Vec<(f64, f64)> = Vec::new();
-    let mut seg_color = THEME_AOA_ON_SPEED;
-
-    while let Some(d) = iter.next() {
-        let pt = (d.port_m, d.astern_m); // (chart_x, chart_y)
-        let color = aoa_color(d.aoa, track.plane_info);
-        if seg_pts.is_empty() {
-            seg_color = color;
-        }
-        if color != seg_color || iter.peek().is_none() {
-            if color != seg_color {
-                seg_pts.push(pt);
-            }
+        if Some(branch_index) != branch_selection.primary_index {
             chart.draw_series(LineSeries::new(
-                std::mem::take(&mut seg_pts),
-                seg_color.stroke_width(2),
+                datums_nm.iter().map(|d| (d.port_m, d.astern_m)),
+                THEME_GUIDE_GRAY.mix(0.35).stroke_width(1),
             ))?;
-            seg_color = color;
+            continue;
         }
-        seg_pts.push(pt);
-    }
-    if !seg_pts.is_empty() {
-        chart.draw_series(LineSeries::new(seg_pts, seg_color.stroke_width(2)))?;
+
+        let mut iter = datums_nm.iter().peekable();
+        let mut seg_pts: Vec<(f64, f64)> = Vec::new();
+        let mut seg_color = THEME_AOA_ON_SPEED;
+        while let Some(d) = iter.next() {
+            let pt = (d.port_m, d.astern_m);
+            let color = aoa_color(d.aoa, track.plane_info);
+            if seg_pts.is_empty() {
+                seg_color = color;
+            }
+            if color != seg_color || iter.peek().is_none() {
+                if color != seg_color {
+                    seg_pts.push(pt);
+                }
+                chart.draw_series(LineSeries::new(
+                    std::mem::take(&mut seg_pts),
+                    seg_color.stroke_width(2),
+                ))?;
+                seg_color = color;
+            }
+            seg_pts.push(pt);
+        }
+        if !seg_pts.is_empty() {
+            chart.draw_series(LineSeries::new(seg_pts, seg_color.stroke_width(2)))?;
+        }
+        primary_datums_nm = datums_nm;
     }
 
-    // Touchdown marker (last datum)
-    if let Some(last) = datums_nm.last() {
+    // Touchdown/end marker belongs to the selected final branch, not to an
+    // unrelated later fragment.
+    if let Some(last) = primary_datums_nm.last() {
         chart.draw_series(std::iter::once(Circle::new(
             (last.port_m, last.astern_m),
             5,

@@ -17,8 +17,8 @@ use stubs::recovery::v0::{
 use crate::client::{request_with_deadline, GrpcChannel, GrpcResult, UnitClient};
 use crate::metrics::RpcKind;
 use crate::telemetry::{
-    InvalidSourceObservation, ScoringSegmentAttribution, SourceObservationEntity, TelemetryAligner,
-    TelemetrySample,
+    InvalidSourceObservation, InvalidSourceVerdictEffect, ScoringSegmentAttribution,
+    SourceObservationEntity, SourceTimeAttributionBasis, TelemetryAligner, TelemetrySample,
 };
 use crate::track::{OnlineMetricStats, PositionCollectionMetrics};
 use crate::transform::Transform;
@@ -490,6 +490,13 @@ fn invalid_observations_in_snapshot(
                 source_read_time_dcs,
                 received_unix_ms,
                 attribution: ScoringSegmentAttribution::IndeterminateMissingSourceTime,
+                attribution_basis: SourceTimeAttributionBasis::Unresolved,
+                source_time_lower_bound_dcs: None,
+                source_time_upper_bound_dcs: None,
+                coverage_gap_ms: None,
+                previous_valid_sequence: None,
+                next_valid_sequence: None,
+                verdict_effect: InvalidSourceVerdictEffect::BlockingIndeterminateMissingSourceTime,
                 affects_scoring: false,
             });
         }
@@ -556,16 +563,21 @@ fn snapshot_to_sample(
             "non-finite recovery telemetry timestamp",
         )));
     }
+    let sequence = snapshot.sequence;
+    let capture_tick = snapshot.capture_tick;
     let aircraft = valid_transform(snapshot.aircraft, "aircraft")?;
     let carrier = valid_transform(snapshot.carrier, "carrier")?;
     let capture_time = snapshot.capture_time;
     let source_age_ms = ((read_time - capture_time).max(0.0)) * 1_000.0;
-    Ok(TelemetrySample::from_source_pair(
+    let mut sample = TelemetrySample::from_source_pair(
         transform_at(carrier, capture_time)?,
         transform_at(aircraft, capture_time)?,
         previous_capture_time,
         source_age_ms,
-    ))
+    );
+    sample.source_sequence = Some(sequence);
+    sample.source_capture_tick = Some(capture_tick);
+    Ok(sample)
 }
 
 fn valid_transform(
@@ -671,6 +683,7 @@ mod tests {
         let sample = snapshot_to_sample(
             RecoveryTelemetrySnapshot {
                 sequence: 1,
+                capture_tick: 77,
                 capture_time: 42.5,
                 aircraft: Some(observation()),
                 carrier: Some(observation()),
@@ -682,6 +695,8 @@ mod tests {
         .unwrap();
         assert_eq!(sample.carrier.time, 42.5);
         assert_eq!(sample.plane.time, 42.5);
+        assert_eq!(sample.source_sequence, Some(1));
+        assert_eq!(sample.source_capture_tick, Some(77));
         assert!((sample.source_age_ms - 300.0).abs() < 1.0e-6);
     }
 

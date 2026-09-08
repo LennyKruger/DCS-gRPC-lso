@@ -87,6 +87,9 @@ struct RecoveryReport<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     wind_reference_probes: Option<crate::track::WindReferenceProbes>,
     datums: &'a [Datum],
+    /// Rendering-only segmentation of the full pattern history. This never
+    /// changes track closure, telemetry completeness or grading.
+    pattern_rendering: crate::draw::PatternRenderingDiagnostic,
     /// In-mission date/time from the DCS scenario clock (ISO-8601).
     #[serde(skip_serializing_if = "str::is_empty")]
     mission_datetime: &'a str,
@@ -1343,6 +1346,11 @@ pub async fn record_recovery(params: TaskParams<'_>) -> Result<(), crate::error:
     } else {
         FallbackSource::None
     };
+    let pattern_rendering = crate::draw::pattern_branch_diagnostic(
+        &track.pattern_datums,
+        track.groove_entry.as_ref().map(|entry| entry.timestamp_dcs),
+        track.touchdown_time_dcs,
+    );
     let report = RecoveryReport {
         schema_version: 3,
         recovery_id: &recovery_id,
@@ -1378,6 +1386,7 @@ pub async fn record_recovery(params: TaskParams<'_>) -> Result<(), crate::error:
         wind_reference_established: track.wind_reference_established,
         wind_reference_probes: track.wind_reference_probes,
         datums: &track.datums,
+        pattern_rendering,
         mission_datetime: &mission_datetime,
         recording_started_at: &recovery_timestamp,
         completed_at: &completed_at,
