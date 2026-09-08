@@ -2,9 +2,11 @@
 
 > Document de continuité, à tenir à jour à chaque changement significatif de code ou de contrat.
 > Dépôt `E:\DCS stuffs\Initiative ESG\DCS-gRPC-lso`, branche `feature/refonte-v3-lua-buffer`.
-> Dernier commit : HEAD `b0e112b` ("Commit post-dev tests 07/09/2026"). Working tree actuellement
-> **non propre** : la correction de segmentation des waveoffs issue du second corpus humain
-> F-14B(U) du 7 septembre 2026 est appliquée mais non committée. L'entrée en groove CATOBAR exige
+> Dernier commit : HEAD `e62506d` ("Corrections post tests phase 2 07/09/2026"). Working tree
+> actuellement **non propre** : la première tranche sûre du P0 de réduction des `Grading unavailable`
+> est implémentée, en plus de changements documentaires utilisateur préexistants. La correction de segmentation des waveoffs issue du
+> second corpus humain F-14B(U) du 7 septembre 2026 est incluse dans HEAD. L'entrée en groove
+> CATOBAR exige
 > un axe réellement
 > stabilisé (lineup, bank, route et tendance resserrés, maintenus 0,75 s) ; les observations unité
 > invalides conservent séquence, horodatage source, côté, statut et réception afin d'être attribuées
@@ -89,20 +91,14 @@ Baseline exécutée avant modification sur le HEAD propre `8e1228a` :
   de provenance de build) ;
 - `cargo fmt --check` et `cargo clippy --locked --all-targets -- -D warnings` propres.
 
-Sur le HEAD propre `b0e112b`, avant la correction de segmentation courante :
+Sur le HEAD `e62506d`, qui inclut la correction de segmentation des waveoffs :
 
-- `cargo test --locked --no-fail-fast` : **244 réussis, 0 échec** (242 tests du binaire + 2 tests
+- `cargo test --locked --no-fail-fast` : **246 réussis, 0 échec** (244 tests du binaire + 2 tests
   de provenance) ;
 - `cargo fmt --check` et `cargo clippy --locked --all-targets -- -D warnings` propres ;
 - `lso.exe groove-ab .ignore/tests-20260907-human` traite les 12 rapports sans les modifier et
   retrouve une entrée avec le nouveau détecteur sur les 12 ; deux durées restent `N/A` faute de
   touchdown DCS exploitable.
-
-Sur le working tree courant non committé :
-
-- `cargo test --locked --no-fail-fast` : **246 réussis, 0 échec** (244 tests du binaire + 2 tests
-  de provenance) ;
-- `cargo fmt --check` et `cargo clippy --locked --all-targets -- -D warnings` propres.
 
 La première session humaine du 7 septembre a été capturée avec un binaire issu d'un working tree dirty au
 commit `b6308bc`, sans `-vv`. Elle fournit le corpus de calibration, mais ne constitue une
@@ -111,8 +107,8 @@ seconde session (`.ignore/tests-20260907-2-human`, `-vv`) a exercé le code post
 binaire encore déclaré dirty au commit `8e1228a` : six approches réelles ont été reconstruites (deux
 T&G crosse haute, un bolter, deux `GRADE:WO`, puis un trap DCS `WIRE# 2`). Les deux waveoffs et le
 trap ont été fusionnés dans une seule track parce que le premier LQM n'établissait pas une issue ;
-le correctif courant traite désormais un `GRADE:WO` matching comme l'issue terminale de la tentative
-et attend le départ géométrique normal pour la fermer. Cette correction reste à revalider live avec
+le correctif inclus dans HEAD traite désormais un `GRADE:WO` matching comme l'issue terminale de
+la tentative et attend le départ géométrique normal pour la fermer. Cette correction reste à revalider live avec
 un binaire propre et identifié. Voir [tasking-roadmap.md](tasking-roadmap.md) pour les autres limites.
 
 ## Produit et périmètre métier
@@ -260,12 +256,14 @@ Contrat `telemetry-contract-v1`, PROJECT-DERIVED :
 - 100<skew<=300 ms : extrapolation de position seulement avec historique valide/frais ;
 - skew >300 ms : invalide ;
 - gap/source age >300 ms : warning et bracket gate invalide ;
-- gap/source age >1 000 ms **à l'intérieur d'une gate/du groove noté** : `TelemetryGap`, télémétrie
+- gap de capture >1 000 ms **à l'intérieur d'une gate/du groove noté** : `TelemetryGap`, télémétrie
   de notation incomplète, aucun point (`telemetry_gap_only_invalidates_the_scored_segment`,
   `src/track.rs`) ;
 - le même gap >1 000 ms **hors du segment noté** (pattern/break avant le groove) reste un
   diagnostic conservé, sans invalider la note à lui seul ;
-- watchdog sans progression source : 2 s ;
+- watchdog sans progression source : 2 s en unary ; en bufferisé, récupération jusqu'à une seconde
+  avant la rétention annoncée par le ring, bornée entre 2 et 30 s ; une reprise contiguë ne crée
+  aucune perte, tandis qu'une perte explicitement rapportée reste bloquante si elle touche le segment ;
 - reset de l'aligneur après erreur ;
 - timestamps DCS, réception Unix et horloge monotone distincts.
 
@@ -277,6 +275,16 @@ La santé distingue désormais explicitement :
   le curseur lecteur ;
 - `source_ring_capacity_evictions`/`source_ring_retention_evictions` : churn/évictions internes du
   ring, jamais assimilés seuls à des snapshots perdus.
+
+Pour la source bufferisée, `delivery_age_ms` reste toujours une métrique de santé et un avertissement,
+mais n'est jamais à lui seul une cause d'invalidité : seuls le temps de capture, le skew et les pertes
+lecteur prouvées décident de la couverture. La politique unary conserve son contrôle d'âge source.
+
+La restitution schema-v3 ajoute `assessment_scope` (`full`, `partial`, `outcome_only`, `none`),
+`observed_from_distance_m`, `missing_coverage`, `points_eligible` et `fallback_source` (`project`,
+`dcs_lqm`, `geometry`, `none`). Une évaluation partielle conserve le grade d'approche mesuré mais
+n'accorde aucun point ; l'issue et le `WIRE#` DCS restent indépendants. Les mêmes informations sont
+persistées par migrations SQLite additives et exposées par le board.
 
 Les anciens champs `sample_gap_ms`, `gap_*`, `overflow_count`, `capacity_overflow_count` et
 `lost_snapshots` restent sérialisés pour compatibilité. `sample_gap_ms`/`gap_*` gardent la valeur la

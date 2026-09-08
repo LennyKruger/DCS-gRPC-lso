@@ -475,7 +475,13 @@ notable du tout (étape 5) ? — mais une fois cette question réglée, le calcu
 | Très bas et dangereux à la toute dernière photo (¼ NM), ou taux de descente/gîte franchement dangereux et soutenu à ce même endroit | `C` (Cut) | 0.0 |
 | Bolter confirmé (voir étape 6) | `B` | 2.5 |
 | Remise de gaz | `WO?` | pas de points |
-| Preuve insuffisante pour juger | `NC` | pas de points |
+| Preuve insuffisante pour juger | évaluation partielle, issue seule, ou `NC` si rien d'utile ne subsiste | pas de points |
+
+Une limite technique n'efface plus ce qui est certain. Le rapport sépare désormais l'issue de la
+tentative, l'évaluation de la portion réellement observée et l'éligibilité aux points. Une approche
+partielle peut donc conserver son appréciation avec la mention « sans points » ; un câble annoncé
+par DCS, un bolter, un touch-and-go ou une remise de gaz restent visibles. Le grade DCS brut peut
+servir de recours clairement étiqueté, mais n'est jamais converti en note ou points du projet.
 
 **Exemple fictif :** pour Wolf 1-1, le pire écart relevé sur toute la trajectoire était 0.4° (à ¾
 NM), la tendance était stable et rien d'anormal ne s'est produit dans les 150 derniers mètres. Le

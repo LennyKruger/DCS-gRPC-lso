@@ -138,7 +138,10 @@ const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
               + '<td class="pts">' + ptsStr + '</td>'
               + '<td>' + esc(p.spot != null ? p.spot : p.wire) + '</td>'
               + '<td>' + esc(p.outcome) + '</td>'
-              + '<td>' + esc(p.completeness === 'complete' ? 'Available' : 'Unavailable — ' + p.completeness) + '</td>'
+              + '<td>' + esc(p.assessment_scope === 'full' ? 'Full / points eligible'
+                  : p.assessment_scope === 'partial' ? 'Partial / no points — ' + (p.missing_coverage || []).join(', ')
+                  : p.assessment_scope === 'outcome_only' ? 'Outcome only / no points'
+                  : 'Grading unavailable — ' + p.completeness) + '</td>'
               + '<td>' + esc(p.dcs_grading) + '</td>'
               + '<td class="lso-notes">' + esc(p.lso_notes) + '</td>'
               + '</tr>';

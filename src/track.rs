@@ -920,6 +920,7 @@ pub enum TelemetryHealth {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticCause {
+    PatternHistoryTruncated,
     HookHistoryTruncated,
     EventHistoryTruncated,
     EventStreamUnavailable,
@@ -1648,10 +1649,25 @@ impl Track {
                     aoa: self.effective_aoa(plane),
                 });
             } else {
-                self.telemetry_quality.dropped_samples += 1;
-                self.telemetry_quality.dropped_position_samples += 1;
-                self.telemetry_quality
-                    .add_unavailability_cause(Completeness::BufferLimit);
+                // Only the oldest, non-scoring overview history is compacted. This is a chart
+                // limitation, not loss of source telemetry or scoring evidence.
+                self.pattern_datums.drain(..MAX_TRACK_SAMPLES / 4);
+                self.pattern_datums.push(PatternDatum {
+                    time: plane.time,
+                    astern_m,
+                    port_m,
+                    alt_ft: m_to_ft(plane.alt),
+                    aoa: self.effective_aoa(plane),
+                });
+                if !self
+                    .telemetry_quality
+                    .diagnostics
+                    .contains(&DiagnosticCause::PatternHistoryTruncated)
+                {
+                    self.telemetry_quality
+                        .diagnostics
+                        .push(DiagnosticCause::PatternHistoryTruncated);
+                }
             }
         }
 
@@ -2475,7 +2491,16 @@ impl Track {
                 .add_unavailability_cause(Completeness::UnconfirmedArrest);
         }
         if self.telemetry_quality.completeness != Completeness::Complete {
-            pass_grade = PassGrade::Incomplete;
+            // Preserve a measured approach assessment even when its coverage is only partial.
+            // It is never point-eligible in this state; `Incomplete` remains the compatibility
+            // value only when no meaningful approach segment was observed.
+            let has_approach_evidence = !self.trajectory_deviations.is_empty()
+                || self.gate_deviations.at_three_quarter_nm.is_some()
+                || self.gate_deviations.at_half_nm.is_some()
+                || self.gate_deviations.at_quarter_nm.is_some();
+            if !has_approach_evidence {
+                pass_grade = PassGrade::Incomplete;
+            }
             grade_points = None;
         }
 
@@ -4571,7 +4596,8 @@ mod tests {
             result.telemetry_quality.completeness,
             Completeness::UnconfirmedArrest
         );
-        assert_eq!(result.pass_grade, PassGrade::Incomplete);
+        assert_eq!(result.pass_grade, result.approach_grade);
+        assert_eq!(result.grade_points, None);
         assert_eq!(result.grade_points, None);
     }
 
@@ -5251,7 +5277,8 @@ mod tests {
                 Completeness::UnconfirmedArrest,
                 "{invalid}"
             );
-            assert_eq!(result.pass_grade, PassGrade::Incomplete, "{invalid}");
+            assert_eq!(result.pass_grade, result.approach_grade, "{invalid}");
+            assert_eq!(result.grade_points, None, "{invalid}");
             assert_eq!(result.grade_points, None, "{invalid}");
         }
     }

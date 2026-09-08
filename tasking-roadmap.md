@@ -12,6 +12,132 @@
 
 ## À faire en priorité (P0)
 
+- **Réduire au maximum les `Grading unavailable` sans transformer une absence de preuve en note
+  inventée.** Le défaut de produit n'est pas seulement la fréquence des indisponibilités : des
+  informations certaines (issue, qualité de la portion observée, grade DCS) sont aujourd'hui
+  aplaties dans un unique `PassGrade::Incomplete`, puis présentées au pilote comme si rien
+  d'exploitable n'avait été mesuré. Les deux corpus humains du 7 septembre totalisent 3 rapports
+  indisponibles sur 16 : 2 avec `unconfirmed_arrest`, dont le faux cas WO/WO/trap que la correction
+  de segmentation courante doit éliminer, et 1 avec `invalid_telemetry + unconfirmed_arrest` ; ils
+  n'exercent toutefois pas tous les chemins théoriques. Le chantier doit séparer durablement
+  **issue**, **évaluation d'approche**, **périmètre observé** et **confiance technique**, puis traiter
+  chaque cause selon sa matérialité réelle :
+
+  **Tranche locale implémentée, revalidation live encore requise** : l'âge de livraison bufferisé
+  ne rend plus une capture continue invalide ; le watchdog bufferisé attend dans la limite de la
+  rétention annoncée ; l'ancien pattern graphique est compacté sans `BufferLimit` de notation ; et
+  JSON/SQLite/Discord/board distinguent désormais périmètre, couverture, points et source de
+  fallback. Une approche partielle conserve son appréciation sans points et l'issue reste séparée.
+  Restent ouverts dans ce chantier : drain vers queue locale dédié, couverture matérielle des
+  observations invalides isolées et des gates manquantes, journal d'événements persistant avec
+  grâce tardive, suppression prouvée des faux départs, et éventuelle promotion cinématique après
+  vérité terrain gel/rebond. Les huit points ci-dessous restent donc la spécification active.
+
+  1. `TelemetryGap` : pour la source bufferisée, un `delivery_age` élevé avec capture continue et
+     séquences lecteur contiguës doit dégrader la santé, jamais suffire seul à retirer la note. Une
+     vraie rupture de capture ou perte de séquence dans le segment noté reste bloquante. Le
+     watchdog bufferisé doit tenter de récupérer les snapshots pendant une fenêtre compatible avec
+     la rétention du ring au lieu de terminer automatiquement après 2 s ; si le curseur reprend
+     sans perte, la passe reste exploitable. Isoler idéalement la lecture bufferisée dans une tâche
+     qui draine continuellement la source vers une queue locale, afin que vent, ACMI, rendu ou
+     autres RPC ne retardent pas l'acquisition. Ne pas modifier la politique unary sans preuve.
+  2. `InvalidTelemetry` : remplacer « une frame invalide dans le groove annule toute la passe » par
+     une décision de couverture en fin de track. Un trou court entièrement encadré par de vrais
+     samples valides dans <=300 ms reste diagnostique ; aucune position ne doit être fabriquée. Une
+     gate ne peut être utilisée que depuis un bracket réel conforme. Pour une observation source
+     sans temps, utiliser si possible `capture_tick`/séquence et les voisins horodatés afin de
+     borner son segment, sans substituer le temps de réception. Les séries longues ou impossibles à
+     borner dans le segment noté restent indisponibles. Un verdict déjà irréversible (`Cut`, par
+     exemple) ne doit pas être remplacé par NC si les données manquantes ne peuvent plus changer ce
+     verdict.
+  3. `InsufficientGates` : détecter plus tôt les tentatives et accepter comme preuve de couverture
+     la trajectoire continue valide autour des distances requises, plutôt que dépendre uniquement
+     de trois objets gate ponctuels. Le seuil de bracket 300 ms reste inchangé. Si l'enregistrement
+     commence réellement trop tard ou qu'une zone nécessaire n'est pas observée, exposer une
+     évaluation partielle (`observed_from_distance_m`, couverture manquante), sans points, plutôt
+     qu'un NC opaque. Corriger aussi le message « fewer than three gates », faux lorsque 3/4 NM est
+     légitimement exclue après roll-out.
+  4. `UnconfirmedArrest` : rendre le flux d'événements persistant/reconnectable au niveau session,
+     conserver un court journal par IDs/temps DCS et laisser une grâce de corrélation avant
+     finalisation, afin qu'un LQM tardif ne soit pas perdu entre deux tracks. La preuve cinématique
+     structurée peut lever l'indisponibilité avec confiance `medium`, sans brin certain ni bonus de
+     câble, seulement après des tests discriminant trap, bolter, T&G, remise de gaz, rebond,
+     disparition et unité gelée ; le second corpus valide un trap et trois non-traps mais ne couvre
+     pas encore tous ces risques. Un grade DCS sans `WIRE#` peut être montré comme fallback DCS,
+     jamais converti seul en grade/points projet.
+  5. `BufferLimit` : réserver la capacité aux gates/groove/touchdown, compacter ou faire tourner
+     uniquement l'ancien pattern non noté, et ne jamais retirer une note pour la seule troncature
+     d'un graphique. Attribuer les pertes réelles du ring source au segment par leurs séquences et
+     bornes temporelles ; seules celles pouvant toucher le segment noté sont bloquantes.
+  6. `EventStreamUnavailable` et `Grading::Unknown` : une panne événementielle ne doit pas effacer
+     une approche positionnelle complète. Publier une `approach_grade` indépendante avec issue
+     inconnue et points retenus ; supprimer des surfaces pilote les faux départs n'ayant ni groove,
+     ni gate significative, ni événement d'issue. Une vraie finale sans issue doit devenir
+     `approach_only`, pas être confondue avec « aucune approche reconnaissable ».
+  7. UX/contrat : conserver `grading_availability`, mais ajouter de façon additive un périmètre
+     (`full`/`partial`/`outcome_only`/`none`), la couverture observée/manquante, l'éligibilité aux
+     points et la source de fallback (`project`/`dcs_lqm`/`geometry`/`none`). Discord, PNG, SQLite et
+     board doivent afficher en priorité : note projet complète ; sinon note projet partielle sans
+     points ; sinon grade DCS explicitement étiqueté ; sinon issue seule. Les issues certaines WO,
+     B, T&G et trap/brin restent visibles même si l'approche est techniquement partielle. Réserver
+     la formule nue `Grading unavailable` au seul cas où aucune information utile ne subsiste.
+
+  Implémenter par étapes revues et testées : d'abord la sémantique source bufferisée et la
+  préservation des issues certaines, puis la matérialité/couverture, les surfaces pilote, la
+  résilience événementielle et enfin l'éventuelle promotion cinématique. Chaque fallback doit être
+  sans points tant que les données requises ne sont pas complètes ; ne pas relever 300 ms,
+  interpoler une longue coupure, assimiler les évictions du ring à une perte lecteur, ou confondre
+  grade DCS et `project-derived-v4`. Revalidation live obligatoire avant de considérer ce P0 clos.
+
+- **Rendre le PNG de pattern lisible lorsqu'une même track contient plusieurs circuits sans issue
+  terminale observable.** Le corpus humain `.ignore/tests-20260907-3-human` confirme un cas précis,
+  `LSO-20260907-220813-Justice-s1788809129-g8-p1001014-c5160-t2891150-pattern.png` : la track est
+  armée à `2570,22` / 3,375 NM, dure ensuite 320,85 s (`2570,30` à `2891,15`) et dessine deux
+  circuits complets plus une longue branche avant la finale réellement évaluée. Les deux premiers
+  survols passent devant le point de toucher vers `2632,10` (`x = -3216,5 m`, altitude relative
+  134,8 m) et `2778,75` (`x = -2315,8 m`, altitude relative 118,1 m) : aucun n'entre en groove,
+  n'approche le pont, ne produit de contact ni de LQM `GRADE:WO`. Le code applique donc à juste
+  titre son reset de minimum « pattern: plane moving away » et conserve la même track. La vraie
+  finale n'entre en groove qu'à `2871,45`, à 859,7 m, puis se termine en T&G crosse haute. Les
+  trois gates de cette dernière finale sont valides et le verdict `NoGrade`/2,0 points est
+  exploitable ; le défaut démontré concerne la restitution graphique du contexte antérieur, pas
+  la télémétrie, la note, ni la correction de segmentation des `GRADE:WO` (celle-ci est par ailleurs
+  exercée favorablement dans le même corpus par deux WO distincts suivis d'un trap câble 2 distinct,
+  sans généraliser cette preuve F-14B(U) à tous les modules/scénarios).
+
+  **Solution recommandée, limitée au rendu :** conserver intégralement les données et la logique
+  métier de `Track`, mais segmenter `pattern_datums` en branches continues à partir des inversions
+  approche/départ déjà observables, puis choisir comme branche principale la plus récente qui
+  contient l'entrée en groove ou, à défaut, l'issue/contact retenu. Afficher cette branche en
+  couleurs normales ; afficher les branches antérieures en gris fin/atténué, sans jamais relier la
+  fin d'une branche au début de la suivante, avec une légende telle que « 2 circuits antérieurs ».
+  Si aucune branche ne contient groove, gate significative ou issue, ne pas publier de PNG pilote
+  et conserver seulement un diagnostic de faux départ. Ne pas fermer automatiquement la track sur
+  les deux survols hauts de ce corpus : sans groove, contact ou LQM, ils sont indiscernables d'un
+  pattern/overhead légitime et une fermeture métier risquerait de perdre la finale suivante. Ne pas
+  supprimer les points historiques du JSON/ACMI, ne pas modifier le grading, ne pas inventer une
+  séparation temporelle depuis le temps de réception, et ne pas utiliser une distance fixe seule
+  comme preuve de waveoff.
+
+  **Contexte d'implémentation :** le PNG est rendu depuis `TrackResult::pattern_datums` dans
+  `src/draw.rs`, tandis que le JSON schema-v3 ne sérialise actuellement que `datums` (sous-échantillonnés
+  hors segment noté), pas `pattern_datums`. Extraire une fonction pure de segmentation/sélection,
+  testable sans backend graphique, et produire un petit diagnostic additif (`pattern_branch_count`,
+  `primary_pattern_branch`, motif de sélection, branches masquées/atténuées). Réutiliser autant que
+  possible les notions existantes d'inbound, `groove_entry_time`, contact/issue et croissance de
+  distance >150 m, mais sans leur attribuer une nouvelle sémantique métier. Vérifier aussi que la
+  compaction récente de l'ancien pattern conserve les marqueurs nécessaires à cette segmentation.
+
+  **Critères d'acceptation déterministes :** (1) pattern simple nominal inchangé ; (2) deux circuits
+  hauts puis T&G reproduisant les temps/positions ci-dessus : dernière branche colorée, deux branches
+  grises, aucune ligne de raccord artificielle ; (3) `GRADE:WO` suivi d'un nouveau circuit : deux
+  rapports/tracks restent la source de vérité, aucune fusion par le renderer ; (4) bolter puis
+  nouveau circuit ; (5) trap avec rollout ; (6) faux départ sans groove/gate/issue non publié sur
+  les surfaces pilote ; (7) pattern tronqué/compacté sans panic ni promotion en `BufferLimit` ;
+  (8) rendu CATOBAR et V/STOL sans régression de cadrage. Rejouer visuellement le PNG signalé et les
+  autres PNG `g8`, puis revalider en mission live un overhead simple, un waveoff sans LQM et un
+  `GRADE:WO` explicite. Un replay local valide le rendu seulement, jamais le comportement DCS live.
+
 - **Dégradation sévère et systémique du cadencement position pendant le test humain du 6 septembre
   après-midi (`Justice-20260906`, 4 passes, code/commit actuel, `--position-source buffered`) —
   a coûté sa note à un trap réel confirmé par DCS.** Sur les 4 rapports (mêmes session/génération/
@@ -42,10 +168,10 @@
   ce canal**, ce qui élimine une piste et recentre l'hypothèse sur une charge serveur dédié plus
   lourde avec un vrai client humain connecté (plus de trafic réseau/état à répliquer côté DCS
   qu'avec des IA seules) qu'avec le test IA de la veille, faisant concourir `lso.exe` pour du CPU sur
-  la même machine. **À faire en priorité** : rejouer un test humain équivalent avec `-vv` actif
-  (RPC/tick-lag/queue_high_watermark loggés côté LSO) et, si possible, une mesure de charge CPU/
-  réseau du serveur dédié pendant la session, pour confirmer que la contention vient bien du serveur
-  DCS lui-même sous charge client humaine plutôt que de `lso.exe`.
+  la même machine. Le test humain `-vv` réalisé ensuite confirme une capture source intacte mais
+  une livraison tardive (voir la dernière mise à jour ci-dessous). La mesure CPU/réseau du serveur
+  dédié et un A/B avec/sans traces restent nécessaires pour attribuer cette latence à la contention
+  DCS plutôt qu'au niveau de journalisation de `lso.exe`.
 
   **Mise à jour 7 septembre 2026** : un second corpus déposé par l'utilisateur (même pilote
   `Justice`, même soirée du 6 septembre, `.ignore/tests-20260906-human/`, hors dépôt Git) — mais une
@@ -59,7 +185,7 @@
   corpus. Renforce la conclusion déjà écrite : la dégradation est un trait systémique de cette
   configuration (client humain + serveur dédié), pas un incident isolé, mais son passage au-dessus du
   seuil dur de 1 000 ms qui coûte réellement une note semble marginal/intermittent plutôt que garanti
-  à chaque passe. Le test avec `-vv` recommandé ci-dessus reste à faire.
+  à chaque passe. Le corpus `-vv` décrit juste après a depuis séparé capture et livraison.
 
   **Mise à jour après instrumentation, second corpus humain du 7 septembre 2026**
   (`.ignore/tests-20260907-2-human`, `-vv`) : les quatre tracks publiées capturent toutes à
@@ -73,23 +199,6 @@
 
 ## P1 — bugs confirmés à corriger, décisions à prendre
 
-- **Phase B de la confirmation cinématique d'arrestation : ne pas l'activer sans nouveau corpus
-  discriminant.** La Phase A expose désormais dans `arrest_confirmation` une signature structurée
-  (contact DCS, onset de décélération, vitesse avion-navire basse maintenue 2 s, continuité, hauteur
-  de crosse, rebond/départ/verdict contradictoire), avec seuils et motifs ; même acceptée, elle reste
-  `medium` et `diagnostic_only_no_grading_change`. Les fixtures déterministes distinguent arrêt
-  soutenu, bolter/T&G, remise en avant, rebond et télémétrie trop courte, mais le corpus du 7
-  septembre ne persiste pas les vitesses nécessaires pour rejouer exactement la signature après
-  coup. Avant de lever `unconfirmed_arrest` sans `WIRE#`, obtenir plusieurs captures live avec vérité
-  indépendante couvrant chaque cas, quantifier les faux positifs et confirmer que le maintien à
-  faible vitesse relative n'est pas un artefact de disparition/gel de l'unité. Ne jamais promouvoir
-  cette Phase B sur la seule passe 09:34 ni sur les tests synthétiques.
-  Le second corpus humain du 7 septembre apporte un premier discriminant live favorable : la
-  signature accepte le trap final (`WIRE# 2` visible dans le log) avec onset 350 ms avant contact,
-  vitesse relative minimale nulle maintenue 6,95 s/140 samples et aucun conflit, tout en rejetant
-  correctement deux T&G et un bolter (aucun onset soutenu, vitesse minimale >56 m/s). Elle reste
-  néanmoins diagnostique : rebond, gel/disparition et fausse décélération ne sont toujours pas tous
-  couverts en vérité terrain indépendante.
 - **Attribution temporelle des observations unité invalides : revalidation live requise.** Le
   correctif conserve maintenant temps source/séquence/entité/statut
   et n'invalide que `[entrée groove, touchdown]`; après-touch et avant-groove restent diagnostics,
@@ -421,6 +530,51 @@
   -6,65° / -4,20° / -2,90°) — cohérent avec le constat déjà écrit ("7 passes sur 8" sur le corpus du 5
   septembre soir) que cette porte tombe structurellement dans le virage base-à-finale pour ce
   pilote/ce porte-avions, une reconfirmation de plus plutôt qu'un signal nouveau.
+
+  **Mise à jour 7 septembre 2026, soir — nouveau test 100 % IA (8 unités, 4×F-14B(U) + 4×F/A-18C,
+  CVN-72, `--ki`, `--position-source buffered`, `-vv`), signal le plus net obtenu à ce jour et
+  probablement décisif contre l'hypothèse de coïncidence de pilotage.** 7 des 8 unités ont produit un
+  rapport (6 posers + 1 remise de gaz `WaveoffUnknown`/`go_around_initiator_unknown` sans lineup
+  exploitable) ; **les 6 posers plafonnent tous à `NoGrade`/`--` (2,0 pts)** malgré des portes 3/4,
+  1/2 et 1/4 NM toutes propres (`abs(GS) < 0,5°`, `abs(LU) < 1,0°` partout, qualité `valid` sans
+  exception) — la dégradation vient donc entièrement de la trajectoire continue, pas des gates. Sur
+  les 6 posers **et** la remise de gaz (7/7), `groove_entry.lineup_deg` est négatif et resserré entre
+  **-0,49° et -0,70°**, avec un `lineup_rate_deg_per_s` déjà négatif à l'entrée (-0,05 à -0,14°/s) —
+  un avion en régime a priori stabilisé montre donc déjà la même dérive avant même le début du
+  segment noté. Le lineup continue de croître ensuite de façon lisse et quasi identique sur les 6
+  posers, franchissant `LATE_WINDOW_LU_DEG = 1,5°` vers 150-200 m et atteignant **-2,2° à -2,45° au
+  dernier échantillon avant contact sur les 6/6**, ce qui plafonne chacune à `--` via la pondération
+  temporelle de fin d'approche — reproduction quasi identique en forme et en signe du test IA du 6
+  septembre après-midi, mais cette fois avec un F/A-18C **et** un F-14B(U) montrant la même valeur de
+  convergence à quelques centièmes de degré près. **Point nouveau, potentiellement le plus important** :
+  reconstitué en mètres (`distance_m * tan(lineup_deg)`), l'écart latéral réel décroît de façon
+  monotone et cohérente sur les 6 passes — environ 12 m à 3/4 NM, ~6 m à 300 m, ~3,5 m à 100 m, moins
+  de 0,5 m au dernier échantillon avant contact — ce qui ressemble à une **vraie convergence physique
+  vers l'axe** (pas un offset fixe constant comme d'abord suspecté début septembre) ; c'est la
+  conversion en degrés via une distance qui tend vers zéro qui manufacture l'essentiel de l'excursion
+  visible dans `LATE_WINDOW_LU_DEG`, bien avant le plancher `NEAR_TOUCHDOWN_ANGLE_REFERENCE_M = 75 m`
+  déjà corrigé début septembre — confirmant très concrètement, sur ce corpus, la piste déjà notée
+  ("l'effet existe aussi dans la fenêtre 80-160 m visée par `LATE_WINDOW_LU_DEG`, non couverte par le
+  plancher de 75 m"). Combiné au signe unanime et à la valeur resserrée dès l'entrée en groove sur 7
+  appareils/2 types différents dans la même session, ceci pointe fortement vers soit (a) un axe de
+  référence géométrique partagé (BRC/angle de pont) légèrement dévié de l'axe réellement utilisé côté
+  DCS pour ce porte-avions/cette mission, soit (b) un comportement IA DCS réellement partagé entre
+  modules sur cette mission précise (vent quasi identique au test du 6 septembre après-midi : `0°
+  vrai / ~4,2-4,3 m/s`, donc ce test ne permet toujours pas de trancher via un vent différent comme
+  proposé précédemment). **Reste à faire avant toute conclusion définitive** : (1) rejouer avec un
+  vent nettement différent (sens et/ou force) pour voir si le signe/la magnitude de la dérive suit le
+  vent ; (2) si possible un test humain sur cette même mission/porte-avions pour vérifier si un pilote
+  humain montre la même convergence en mètres près du pont ou un profil différent ; (3) tracer
+  explicitement l'écart en mètres (pas seulement en degrés) dans `trajectory_deviations` ou un outil
+  de diagnostic dédié, pour ne plus avoir à le reconstituer a posteriori à chaque analyse.
+
+  **Anomalie de vent près du niveau mer/pont reconfirmée sur ce même test** (voir aussi le point P1
+  dédié plus haut) : sur les 7 rapports, la probe `wind_reference_probes.low` lit `180°/0,0 m/s`
+  (au lieu de `0°/~4,2-4,3 m/s` cohérent avec la probe haute) sur 4 rapports sur 7, et la requête
+  séparée de fin de rapport lit la même valeur aberrante sur 5 rapports sur 7 — nouvelle confirmation,
+  sur un cinquième corpus indépendant, que l'anomalie touche spécifiquement les requêtes `GetWind`
+  proches du niveau de la mer/du pont, sans jamais faire échouer le RPC lui-même
+  (`wind_reference_established` reste `true` dans tous les cas).
 - **Déclin de l'AoA corrigée dans le groove** (~1,5-3° entre ¾ NM et ¼ NM, systématique sur 3-4 F-14
   dans un test avec vent nul, matin du 5 septembre). Le vent nul dans cette mission exclut un
   artefact de la correction vent introduite pour l'AoA ; reste à savoir si c'est un comportement de
@@ -447,6 +601,40 @@
   démarrage du serveur.
 
 ## Optimisations et robustesse à considérer (P2)
+
+- **Externaliser les seuils de tuning dans un fichier `lso.toml` placé à côté de l'exécutable.**
+  Un brouillon documenté existe à la racine du dépôt, mais le binaire ne le charge pas encore et
+  toutes les valeurs métier restent compilées dans Rust. Implémenter un chargement au démarrage
+  avec `--config <chemin>` prioritaire, puis recherche par défaut à côté de `lso.exe` ; ne pas faire
+  de hot reload dans une première version afin qu'aucune passe ne puisse changer de règles en
+  cours de collecte. Réserver l'externalisation aux seuils `PROJECT-DERIVED` de détection d'entrée
+  en groove, grading CATOBAR/V/STOL, Cut, correction/tendance et, dans des sections avancées
+  clairement séparées, outcome/estimation de brin. Garder compilés les invariants de télémétrie
+  (100/300/1 000 ms), distances des gates, géométries avion/navire, capacités mémoire, isolation et
+  règles de sécurité. Le chargeur doit accepter les clés absentes via les défauts compilés, refuser
+  clés inconnues, nombres non finis et ordres incohérents (`perfect <= OK <= no-grade`, fenêtre min
+  <= max, Cut plus sévère que No Grade), et échouer explicitement au démarrage sur une configuration
+  invalide plutôt que revenir silencieusement aux défauts.
+
+  La configuration ne nécessite ni variable `schema_version` ni `profile` dans le TOML final ; ne
+  pas confondre ce choix avec le `schema_version` du rapport JSON, qui reste obligatoire. À la
+  création de chaque `Track`, figer un snapshot immuable de la configuration **effective après
+  application des défauts**. Sérialiser ce snapshot complet dans le JSON avec un SHA-256 sémantique
+  calculé sur une représentation canonique des valeurs effectives, et conserver séparément
+  `grading_version`, version/commit/dirty du binaire et données brutes nécessaires au rejeu. Ne pas
+  utiliser comme identité principale le hash des octets TOML : commentaires, espaces ou ordre des
+  clés ne doivent pas créer artificiellement une nouvelle configuration métier. Journaliser au
+  démarrage le chemin résolu et le hash, sans secret ni contenu ambigu.
+
+  Étendre les diagnostics hors-ligne, en priorité `groove-ab`, pour accepter une ou plusieurs
+  configurations et comparer leurs effets sur un même corpus sans modifier les fichiers d'entrée.
+  Couvrir par tests : fichier absent et défauts historiques inchangés ; configuration partielle ;
+  rejet de chaque incohérence ; résolution `--config`/dossier exécutable ; canonicalisation stable ;
+  hash différent dès qu'une valeur effective change ; snapshot identique pendant toute une track ;
+  séparation CATOBAR/V/STOL ; reproduction bit-à-bit des grades actuels avec les valeurs du
+  brouillon. Mettre ensuite à jour AGENTS.md, CHANGES.md, primer.md et README.md lorsque le fichier
+  deviendra effectivement consommé ; toute modification des seuils restera à revalider sur corpus
+  puis en mission live selon sa portée.
 
 - **Boucle de redémarrage pendant une pause/un rechargement de mission** — reconfirmé le 5 septembre
   soir : deux générations consommées sans log exploitable, puis deux générations de repli
@@ -512,7 +700,16 @@
   fichier soit déployé avec le script (le rendre optionnel si absent, ou documenter qu'il doit être
   livré à côté) ; variable `$lsoRoot` calculée et jamais utilisée ; webhook Discord en clair dans le
   script **et** dans `start.bat` (à externaliser en variable d'environnement, comme pour le token
-  gRPC). Par ailleurs, le dossier `Records` de cette machine mélange des rapports `schema_version: 3`
+  gRPC). **Mise à jour 7 septembre 2026, soir** : le correctif d'encodage forcé du 7 septembre
+  matin (`Tee-Object -Encoding utf8`) fait échouer le script au démarrage sur ce poste de
+  développement lui-même — `Tee-Object` de Windows PowerShell 5.1 (celui réellement installé ici)
+  n'a pas de paramètre `-Encoding` (ajouté seulement en PowerShell 7). Remplacé par
+  `ForEach-Object { $_; Add-Content -LiteralPath $logFile -Value $_ -Encoding UTF8 }`, qui reste
+  compatible 5.1 et force malgré tout un encodage UTF-8 cohérent (avec BOM, contrairement à
+  `Tee-Object` par défaut qui écrit en UTF-16LE — cause d'origine du log mixte du 6-7 septembre).
+  Non testé sur la machine de déploiement distincte mentionnée ci-dessous ; à vérifier si jamais
+  cette machine utilise PowerShell 7 plutôt que 5.1 (le correctif fonctionne dans les deux cas, donc
+  aucun risque de régression connu). Par ailleurs, le dossier `Records` de cette machine mélange des rapports `schema_version: 3`
   / `project-derived-v4` (0.2.0, cette lignée) et des rapports `schema_version: 8` / `lso_version
   0.4.0` / `project-derived-v1` d'une **autre lignée** du programme, tous deux écrits dans le même
   `lso.db` — aucune erreur SQLite observée ce soir (WAL passé de 123 à 194 Ko sur 8 rapports, donc les

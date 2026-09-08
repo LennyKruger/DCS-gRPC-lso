@@ -146,9 +146,7 @@ impl TelemetrySample {
                 Some(TelemetryInvalidReason::TimeWentBackwards)
             } else if skew_ms > MAX_EXTRAPOLATION_MS {
                 Some(TelemetryInvalidReason::ExcessiveSkew)
-            } else if sample_gap_ms > SAMPLE_GAP_INCOMPLETE_MS
-                || source_age_ms > SAMPLE_GAP_INCOMPLETE_MS
-            {
+            } else if sample_gap_ms > SAMPLE_GAP_INCOMPLETE_MS {
                 Some(TelemetryInvalidReason::TelemetryGap)
             } else {
                 None
@@ -491,6 +489,20 @@ mod tests {
         let sample = TelemetrySample::from_source_pair(carrier, plane, Some(10.0), 750.0);
         assert!((sample.sample_gap_ms - 200.0).abs() < 1.0e-6);
         assert_eq!(sample.source_age_ms, 750.0);
+        assert!(sample.is_valid());
+        assert!(sample.has_warning());
+    }
+
+    #[test]
+    fn buffered_delivery_age_above_one_second_does_not_invalidate_contiguous_capture() {
+        let carrier = Transform {
+            time: 10.05,
+            ..Transform::default()
+        };
+        let plane = carrier.clone();
+        let sample = TelemetrySample::from_source_pair(carrier, plane, Some(10.0), 1_200.0);
+        assert!((sample.sample_gap_ms - 50.0).abs() < 1.0e-6);
+        assert_eq!(sample.source_age_ms, 1_200.0);
         assert!(sample.is_valid());
         assert!(sample.has_warning());
     }

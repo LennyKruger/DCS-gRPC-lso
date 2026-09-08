@@ -419,10 +419,19 @@ pub fn draw_chart(
         Some(points) => format!("{points:.1}"),
         None => "no".to_string(),
     };
+    let assessment_suffix =
+        if track.telemetry_quality.completeness == crate::track::Completeness::Complete {
+            ""
+        } else if track.pass_grade != crate::grading::PassGrade::Incomplete {
+            " — partial assessment"
+        } else {
+            " — outcome only"
+        };
     root_drawing_area.draw_text(
         &format!(
-            "Grade: {}  ({} pts)",
+            "Grade: {}{}  ({} pts)",
             track.pass_grade.label(),
+            assessment_suffix,
             grade_points_text
         ),
         &text_style,
@@ -1342,8 +1351,13 @@ pub fn draw_pattern_chart(
     let title_style = TextStyle::from(("sans-serif", 22).into_font()).color(&THEME_FG);
     root.draw_text(
         &format!(
-            "Pattern — {}  {} pts",
+            "Pattern — {}{}  {} pts",
             track.pass_grade.label(),
+            if track.telemetry_quality.completeness == crate::track::Completeness::Complete {
+                ""
+            } else {
+                " — partial/no points"
+            },
             match track.grade_points {
                 Some(points) if track.carrier_info.is_vstol() => format!("{points:.2}"),
                 Some(points) => format!("{points:.1}"),

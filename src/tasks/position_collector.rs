@@ -4,6 +4,7 @@
 //! The unary implementation is retained as an explicit diagnostic rollback.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use stubs::recovery::v0::recovery_service_client::RecoveryServiceClient;
@@ -266,6 +267,22 @@ impl PositionCollector {
 
     pub fn is_buffered(&self) -> bool {
         matches!(self.kind, PositionCollectorKind::Buffered { .. })
+    }
+
+    /// A buffered reader may safely wait for the source ring to become readable again: snapshots
+    /// continue to be captured while the RPC path is unavailable. Keep a one-second margin before
+    /// the advertised retention boundary and cap recovery at 30 seconds. Unary polling has no
+    /// retained samples and therefore keeps the historical two-second watchdog.
+    pub fn recovery_watchdog(&self) -> Duration {
+        match &self.kind {
+            PositionCollectorKind::Unary { .. } => {
+                Duration::from_millis(crate::telemetry::ACTIVE_WATCHDOG_MS)
+            }
+            PositionCollectorKind::Buffered { diagnostics, .. } => {
+                let retained_ms = ((diagnostics.retention_seconds - 1.0).max(2.0) * 1_000.0) as u64;
+                Duration::from_millis(retained_ms.min(30_000))
+            }
+        }
     }
 
     pub fn buffered_diagnostics(&self) -> Option<&BufferedCollectionDiagnostics> {

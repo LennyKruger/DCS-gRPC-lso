@@ -23,7 +23,7 @@ use tokio::sync::mpsc;
 
 use crate::client::{HookClient, MissionClient, UnitClient};
 use crate::grading::{PassGrade, SpotGrade};
-use crate::telemetry::{TelemetryInvalidReason, ACTIVE_WATCHDOG_MS};
+use crate::telemetry::TelemetryInvalidReason;
 use crate::track::{Datum, GateDeviations, Grading, HookSampleStatus, Track, TrajectoryDeviation};
 use crate::transform::Transform;
 
@@ -132,12 +132,55 @@ struct RecoveryReport<'a> {
     wire_estimation: &'a crate::track::WireEstimateEvidence,
     arrest_confirmation: &'a crate::track::ArrestConfirmationEvidence,
     grading_availability: &'static str,
+    assessment_scope: AssessmentScope,
+    observed_from_distance_m: Option<f64>,
+    missing_coverage: &'a [String],
+    points_eligible: bool,
+    fallback_source: FallbackSource,
     telemetry_quality: &'a crate::track::TelemetryQuality,
     events: &'a [crate::track::EventEvidence],
     spot_zone: &'a crate::track::SpotZoneObservation,
     touchdown_horizontal_speed_mps: Option<f64>,
     hook_observation: &'a crate::track::HookObservation,
     event_correlation: &'a super::event_correlator::EventCorrelationSummary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AssessmentScope {
+    Full,
+    Partial,
+    OutcomeOnly,
+    None,
+}
+impl AssessmentScope {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Partial => "partial",
+            Self::OutcomeOnly => "outcome_only",
+            Self::None => "none",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum FallbackSource {
+    Project,
+    DcsLqm,
+    Geometry,
+    None,
+}
+impl FallbackSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::DcsLqm => "dcs_lqm",
+            Self::Geometry => "geometry",
+            Self::None => "none",
+        }
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -569,7 +612,7 @@ pub async fn record_recovery(params: TaskParams<'_>) -> Result<(), crate::error:
                         position_collector.reset();
                         let silent_for = last_telemetry_success.elapsed();
                         tracing::warn!(?status, ?silent_for, "transform polling failed");
-                        if silent_for >= Duration::from_millis(ACTIVE_WATCHDOG_MS) {
+                        if silent_for >= position_collector.recovery_watchdog() {
                             datums.mark_telemetry_gap(TelemetryInvalidReason::TelemetryGap);
                             break 'recording;
                         }
@@ -610,8 +653,7 @@ pub async fn record_recovery(params: TaskParams<'_>) -> Result<(), crate::error:
                     {
                         last_telemetry_success = Instant::now();
                     }
-                    if last_telemetry_success.elapsed() >= Duration::from_millis(ACTIVE_WATCHDOG_MS)
-                    {
+                    if last_telemetry_success.elapsed() >= position_collector.recovery_watchdog() {
                         tracing::warn!(
                             silent_for = ?last_telemetry_success.elapsed(),
                             source_age_ms = sample.source_age_ms,
@@ -799,7 +841,7 @@ pub async fn record_recovery(params: TaskParams<'_>) -> Result<(), crate::error:
                     }
                 }
                 if sample_count == 0
-                    && last_telemetry_success.elapsed() >= Duration::from_millis(ACTIVE_WATCHDOG_MS)
+                    && last_telemetry_success.elapsed() >= position_collector.recovery_watchdog()
                 {
                     tracing::warn!(
                         silent_for = ?last_telemetry_success.elapsed(),
@@ -1198,6 +1240,9 @@ pub async fn record_recovery(params: TaskParams<'_>) -> Result<(), crate::error:
             .diagnostics
             .iter()
             .map(|cause| match cause {
+                crate::track::DiagnosticCause::PatternHistoryTruncated => {
+                    "pattern_history_truncated"
+                }
                 crate::track::DiagnosticCause::HookHistoryTruncated => "hook_history_truncated",
                 crate::track::DiagnosticCause::EventHistoryTruncated => "event_history_truncated",
                 crate::track::DiagnosticCause::EventStreamUnavailable => "event_stream_unavailable",
@@ -1259,6 +1304,45 @@ pub async fn record_recovery(params: TaskParams<'_>) -> Result<(), crate::error:
     // `spot` is retained as the legacy phase-1 alias. New consumers must use the
     // independent intended/nearest fields below.
     let spot_label = track.intended_spot;
+    let observed_from_distance_m = track
+        .trajectory_deviations
+        .iter()
+        .map(|sample| sample.distance_m)
+        .chain(track.datums.iter().map(|sample| sample.x))
+        .filter(|distance| distance.is_finite() && *distance >= 0.0)
+        .reduce(f64::max);
+    let has_approach_evidence = !track.trajectory_deviations.is_empty()
+        || track.gate_deviations.at_three_quarter_nm.is_some()
+        || track.gate_deviations.at_half_nm.is_some()
+        || track.gate_deviations.at_quarter_nm.is_some();
+    let has_outcome = !matches!(track.grading, Grading::Unknown);
+    let assessment_scope = if track.telemetry_quality.completeness
+        == crate::track::Completeness::Complete
+        && has_approach_evidence
+    {
+        AssessmentScope::Full
+    } else if has_approach_evidence {
+        AssessmentScope::Partial
+    } else if has_outcome {
+        AssessmentScope::OutcomeOnly
+    } else {
+        AssessmentScope::None
+    };
+    let missing_coverage = track
+        .telemetry_quality
+        .unavailability_causes
+        .iter()
+        .map(|cause| completeness_cause(*cause).to_string())
+        .collect::<Vec<_>>();
+    let fallback_source = if has_approach_evidence {
+        FallbackSource::Project
+    } else if track.dcs_grading.is_some() {
+        FallbackSource::DcsLqm
+    } else if has_outcome {
+        FallbackSource::Geometry
+    } else {
+        FallbackSource::None
+    };
     let report = RecoveryReport {
         schema_version: 3,
         recovery_id: &recovery_id,
@@ -1342,6 +1426,11 @@ pub async fn record_recovery(params: TaskParams<'_>) -> Result<(), crate::error:
         wire_estimation: &track.wire_estimation,
         arrest_confirmation: &track.arrest_confirmation,
         grading_availability,
+        assessment_scope,
+        observed_from_distance_m,
+        missing_coverage: &missing_coverage,
+        points_eligible: track.grade_points.is_some(),
+        fallback_source,
         telemetry_quality: &track.telemetry_quality,
         events: &track.events,
         spot_zone: &track.spot_zone,
@@ -1479,6 +1568,12 @@ pub async fn record_recovery(params: TaskParams<'_>) -> Result<(), crate::error:
             grading_version: GRADING_VERSION.to_string(),
             wire_estimation_confidence: track.wire_estimation.confidence.to_string(),
             grading_availability: grading_availability.to_string(),
+            assessment_scope: assessment_scope.as_str().to_string(),
+            observed_from_distance_m,
+            missing_coverage_json: serde_json::to_string(&missing_coverage)
+                .unwrap_or_else(|_| "[]".to_string()),
+            points_eligible: track.grade_points.is_some(),
+            fallback_source: fallback_source.as_str().to_string(),
         };
         match tokio::task::spawn_blocking(move || db.insert(&entry)).await {
             Ok(Ok(inserted)) => Some(inserted),
@@ -1591,15 +1686,24 @@ pub async fn record_recovery(params: TaskParams<'_>) -> Result<(), crate::error:
             // unavailable, why (that takes priority: `grade_reason` still describes whatever
             // amplitude/etc. rule the code path reached internally, but `pass_grade` was
             // overridden to `Incomplete` regardless, so showing it here would be misleading).
-            let why_this_grade =
-                if track.telemetry_quality.completeness != crate::track::Completeness::Complete {
-                    format!(
-                        "Grading unavailable: {:?}. This is a measurement limitation, not a pilot failure.",
-                        track.telemetry_quality.completeness
-                    )
-                } else {
-                    track.grade_reason.clone()
-                };
+            let why_this_grade = match assessment_scope {
+                AssessmentScope::Full => track.grade_reason.clone(),
+                AssessmentScope::Partial => format!(
+                    "Partial project assessment (no points): {} Missing coverage: {}.",
+                    track.grade_reason,
+                    missing_coverage.join(", ")
+                ),
+                AssessmentScope::OutcomeOnly if track.dcs_grading.is_some() => format!(
+                    "Outcome only; raw DCS LQM fallback: {}. No project points.",
+                    track.dcs_grading.as_deref().unwrap_or_default()
+                ),
+                AssessmentScope::OutcomeOnly =>
+                    "Outcome only; approach coverage is insufficient. No project points.".to_string(),
+                AssessmentScope::None => format!(
+                    "Grading unavailable: {:?}. This is a measurement limitation, not a pilot failure.",
+                    track.telemetry_quality.completeness
+                ),
+            };
             embed = embed.field("Why This Grade", why_this_grade, false);
 
             if track.carrier_info.is_vstol() {

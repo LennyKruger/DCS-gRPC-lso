@@ -7,6 +7,22 @@ This file records user-visible changes. The crate version remains `0.2.0`; chang
 
 ### Added
 
+- Additive graduated-assessment contract across JSON, SQLite, Discord and the board:
+  `assessment_scope`, `observed_from_distance_m`, `missing_coverage`, `points_eligible` and
+  `fallback_source`. A measured partial approach remains visible without points, independently of
+  a certain bolter/T&G/waveoff/trap outcome or DCS wire (`src/track.rs`,
+  `src/tasks/record_recovery.rs`, `src/db.rs`, `src/web.rs`).
+
+### Fixed
+
+- Buffered delivery latency no longer invalidates otherwise continuous source capture; it remains
+  visible in health metrics and warnings. Buffered RPC/empty-batch recovery now uses the source
+  ring's advertised retention (one-second safety margin, 30-second cap), while unary keeps its
+  two-second watchdog (`src/telemetry.rs`, `src/tasks/position_collector.rs`,
+  `src/tasks/record_recovery.rs`).
+- Exhaustion of the old pattern-chart history now compacts only that non-scoring history and emits
+  `pattern_history_truncated`; it no longer creates a scoring `BufferLimit` (`src/track.rs`).
+
 - `groove_entry` in schema-v3 JSON records the exact DCS timestamp, receipt-clock evidence,
   distance, lineup, bank, fitted track angle, lineup trend, persistence duration/sample count,
   trigger and all active thresholds that latched CATOBAR groove entry. Because the current RPC
