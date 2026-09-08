@@ -22,8 +22,8 @@ or through Discord.
 - Separate outcome, grade, points, cause, confidence, completeness, rule version and wire provenance.
 - Event correlation and positional completeness are independent: an event-stream outage is reported
   as `event_stream_unavailable` and cannot manufacture a positional gap or a favourable outcome.
-- Per-recovery cadence/gap/source-age and paired-transform latency percentiles, plus sliding-window
-  telemetry health that identifies sustained gate-capture risk.
+- Per-recovery source-capture gap, delivery-age, reader-sequence-loss and source-ring-churn
+  diagnostics, plus sliding-window telemetry health that identifies sustained gate-capture risk.
 - JSON reports, optional compressed Tacview ACMI recordings, and persistent SQLite history.
 - Optional Discord reports, terminal session summary, and HTTP greenie board.
 - Offline regeneration of the approach chart from ACMI files created by LSO.
@@ -91,6 +91,9 @@ Common examples:
 # Offline diagnostic: test an artificially reduced pre-groove sampling cadence against
 # already-recorded JSON reports (a file or a directory searched recursively)
 .\lso.exe cadence-ab C:\LSO\recordings --stride 2 --stride 4
+
+# Offline read-only comparison of recorded vs current CATOBAR groove entry/duration/geometry
+.\lso.exe groove-ab C:\LSO\recordings
 ```
 
 Use `lso.exe --help` and `lso.exe run --help` for the complete generated CLI reference.
@@ -104,7 +107,10 @@ be discovered and recorded concurrently.
 The default `--position-source buffered` lifecycle is idempotent `StartRecoveryTelemetry`, ordered
 `ReadRecoveryTelemetry` batches with an exclusive sequence cursor, then best-effort
 `StopRecoveryTelemetry`. Epoch changes, sequence-contract violations, invalid unit observations and
-source retention/capacity loss remain explicit technical evidence in the schema-v3 report.
+source retention/capacity loss remain explicit technical evidence in the schema-v3 report. Invalid
+source observations retain their source timestamp/entity/status and are attributed at finalization;
+receipt time is never substituted for missing source time. `groove-ab` reuses persisted geometry
+exactly, but cannot reconstruct unpersisted RPC timing, events, UTC anchors or velocities.
 Copy [`docs/BASELINE_MANIFEST.example.json`](docs/BASELINE_MANIFEST.example.json) and fill in the DCS
 build, mission/module versions and deployed DLL/Lua hashes to make those comparisons attributable.
 Supplied manifests reject unknown keys, empty content and malformed SHA-256 values.

@@ -141,6 +141,23 @@ un problème, ou pour comparer les deux méthodes lors de tests (jamais sur le m
   temps pour qu'elles redeviennent comparables — un peu comme reconstituer une photo de groupe à
   partir de deux photos prises à quelques centièmes de seconde d'écart.
 
+Le rapport distingue maintenant quatre problèmes qui se ressemblaient auparavant : la boîte aux
+lettres qui évince d'anciens éléments, une séquence réellement manquée par le lecteur, une capture
+DCS qui s'interrompt, et un paquet complet simplement livré en retard. Un grand compteur interne ne
+signifie donc plus à lui seul « positions perdues ». Les seuils de sécurité restent inchangés : le
+programme n'interpole jamais une longue coupure et ne fabrique aucune trajectoire.
+
+Si DCS signale qu'une lecture d'avion ou de porte-avions était invalide, le JSON garde l'instant de
+capture, le côté concerné, le motif exact et l'instant séparé où l'erreur a été reçue. Une erreur
+prouvée avant le groove ou après le toucher reste un diagnostic. Dans le groove, une erreur isolée
+ne retire plus automatiquement la note lorsque les deux vraies captures qui l'encadrent prouvent
+qu'au plus 300 ms se sont écoulées et qu'aucune porte de mesure ne tombe dans ce trou. Le programme
+ne recrée aucune position manquante : il constate seulement que la couverture réelle reste assez
+serrée. Plusieurs erreurs de suite, un intervalle plus long ou une porte touchée restent bloquants.
+Si l'heure de capture manque, la séquence, le tick DCS et les captures voisines peuvent seulement
+servir de bornes prudentes ; l'heure de réception n'est jamais utilisée à sa place. Sans bornes
+fiables, la note reste indisponible et le rapport l'indique explicitement.
+
 ### Une fréquence identique du début à la fin — est-ce pertinent ?
 
 Aujourd'hui, cette fréquence de 10-20 fois par seconde est **la même partout** : dès le repérage
@@ -285,13 +302,14 @@ distances précises et traditionnellement utilisées en doctrine LSO :
 > centrée" — un **geste du pilote**, pas une distance ou une altitude précise. Le programme ne peut
 > pas voir ce geste directement (DCS ne l'expose pas), donc il doit s'en approcher autrement. Une
 > première version se contentait d'une boîte géométrique large (avion à moins de ¾ NM, moins de
-> 300 ft, à peu près dans l'axe) — simple, mais capable de se déclencher un instant trop tôt, par
-> exemple si l'avion traverse cette boîte en coupant son virage final avant de vraiment se
-> stabiliser. Le programme vérifie désormais, en plus de cette boîte, que l'avion vole déjà à
-> peu près à plat (pas en plein virage) et que sa trajectoire réelle des dernières secondes pointe
-> déjà vers le pont — sur deux mesures consécutives, pour ignorer un signal isolé. Ce
-> raffinement ne s'applique qu'aux porte-avions CATOBAR (Nimitz/Forrestal) : l'AV-8B sur le
-> Tarawa n'a pas ce virage final à distinguer, donc garde l'ancienne boîte seule.
+> 300 ft, à peu près dans l'axe) — simple, mais capable de se déclencher trop tôt pendant la fin du
+> virage. Le programme exige désormais une vraie stabilisation : avion à moins de 2° de l'axe,
+> inclinaison et route resserrées, déplacement latéral devenu lent, et toutes ces conditions tenues
+> pendant trois quarts de seconde. Un trou de télémétrie remet cette confirmation à zéro. La durée
+> de groove qui en résulte n'est jamais forcée vers 15–18 secondes : elle dépend du vol réellement
+> mesuré, et un défaut qui réapparaît près du toucher reste pleinement sanctionnable. Ce
+> raffinement ne s'applique qu'aux porte-avions CATOBAR (Nimitz/Forrestal) ; l'AV-8B/Tarawa garde
+> la boîte seule.
 
 | Repère | Distance | Équivalent |
 |---|---:|---|
@@ -317,13 +335,12 @@ approche et pas trop désaxé). Si les conditions ne sont pas réunies, la photo
 "invalide" plutôt que d'inventer un chiffre approximatif.
 
 **Pourquoi ces trois photos précises comptent encore, alors que la trajectoire est déjà
-enregistrée en continu ?** Parce que ce sont elles, avec cette exigence de fiabilité renforcée
-(et elles seules), qui décident si l'appontage est *notable* du tout : il faut les **trois**
-valides et dans l'ordre pour qu'une note favorable soit possible. Sans ça, l'appontage est classé
-"non noté" (`NC`), quelle que soit la qualité du reste de la trajectoire continue. Une fois cette
-condition remplie, en revanche, ce ne sont plus les trois photos seules qui fixent l'amplitude
-retenue pour la note — voir l'étape 7 : le programme combine les trois photos avec le fil complet
-de la trajectoire continue entre elles.
+enregistrée en continu ?** Parce qu'elles apportent une vérification de fiabilité renforcée. En
+CATOBAR, si la photo ¾ NM a été prise avant la vraie entrée en groove — donc encore dans le virage
+final — elle reste visible mais ne décide ni de l'éligibilité ni de la note ; les photos ½ et ¼ NM
+doivent alors être valides et ordonnées. Si ¾ NM tombe après l'entrée en groove, les trois restent
+obligatoires. L'AV-8B/Tarawa exige toujours les trois. Une fois cette condition remplie, le
+programme combine les photos utiles avec toute la trajectoire continue — voir l'étape 7.
 
 ---
 
@@ -333,8 +350,10 @@ En observant en continu la distance entre l'avion et le point d'atterrissage (es
 diminue toujours, ou est-ce que ça recommence à augmenter ?), combiné aux événements DCS de
 l'étape 3, le programme détermine l'issue :
 
-- **Posé/arrêté ("Recovered")** : contact confirmé par DCS, l'avion s'est bien arrêté sur un
-  brin. Le programme calcule aussi, de façon indépendante, **quel brin** en regardant
+- **Posé/arrêté ("Recovered")** : un contact `Land`/`RunwayTouch` prouve le toucher, mais seul un
+  message DCS `WIRE#` confirme aujourd'hui l'arrestation pour rendre la passe notable. Sans ce
+  message, le verdict reste techniquement indisponible plutôt que de transformer un simple
+  ralentissement en trap certain. Le programme calcule aussi, de façon indépendante, **quel brin** en regardant
   géométriquement où passe la crosse par rapport aux quatre câbles — un peu comme s'il
   chronométrait lui-même à quel endroit exact la crosse a "accroché". Cette estimation est
   ensuite comparée au texte que DCS a envoyé (`WIRE# 3` dans notre exemple), mais **c'est
@@ -345,6 +364,12 @@ l'étape 3, le programme détermine l'issue :
   des deux valeurs côte à côte, pour du diagnostic — jamais affiché au premier coup d'œil comme
   s'il fallait choisir entre deux versions. L'estimation Rust ne devient "affichable seule" que
   dans le cas contraire, quand DCS n'a lui-même rien annoncé.
+
+  Le JSON mène en parallèle une enquête cinématique : contact corrélé, début de décélération,
+  vitesse de l'avion par rapport au bateau qui tombe près de zéro et y reste, absence de rebond ou
+  de nouveau départ. Cette preuve affiche ses mesures et ses raisons, mais reste volontairement
+  diagnostique pour l'instant. Même convaincante, elle vaut confiance « moyenne », n'invente pas de
+  numéro de brin et ne rend pas encore une passe notable sans confirmation DCS.
 - **Bolter** : le train a touché le pont mais l'avion a continué et a redécollé sans s'arrêter
   (aucun brin accroché).
 - **Touch-and-go** : comme un bolter en apparence, mais la crosse était en position "up" par
@@ -361,14 +386,16 @@ l'étape 3, le programme détermine l'issue :
 > jusqu'ici fiable que pour le F/A-18C — le T-45 et le F-14 obtenaient toujours `Bolter`, même
 > pour un vrai touch-and-go volontaire, faute de connaître le bon canal DCS à interroger pour ces
 > deux types. Les deux canaux ont été fournis et ajoutés (le T-45 partage celui du F/A-18C ; le
-> F-14, dans ses trois variantes, en utilise un différent). Un avertissement subsiste : seule la
-> lecture du F/A-18C a été vérifiée comme fiable sur des données réelles ; celle du T-45/F-14
-> suppose la même convention sans l'avoir encore confirmée séparément — voir
-> `tasking-roadmap.md`.
+> F-14, dans ses trois variantes, en utilise un différent). La polarité a depuis été confirmée en
+> vol pour le T-45 et le F-14B(U), dans les deux sens ; les F-14A et F-14B restent à vérifier
+> séparément — voir `tasking-roadmap.md`.
 - **Remise de gaz ("Wave off")** : l'avion s'est écarté sans jamais toucher le pont. Le
   programme ne sait pas dire, à partir des données brutes, si c'est le pilote qui a décidé de
   remettre les gaz ou un ordre du LSO/de sécurité — donc il l'affiche comme "remise de gaz",
-  sans jamais inventer une cause qu'il ne peut pas prouver.
+  sans jamais inventer une cause qu'il ne peut pas prouver. Quand DCS émet explicitement une note
+  `GRADE:WO`, cette note termine la tentative dès que l'avion repart : le circuit suivant commence
+  dans un rapport neuf, afin qu'un second waveoff ou un trap ultérieur ne soit jamais absorbé comme
+  un simple doublon du premier.
 
 **Exemple fictif :** Wolf 1-1 → `Recovered`, brin estimé par géométrie = 3, brin annoncé par DCS
 = 3 → les deux concordent, confiance "haute".
@@ -453,7 +480,13 @@ notable du tout (étape 5) ? — mais une fois cette question réglée, le calcu
 | Très bas et dangereux à la toute dernière photo (¼ NM), ou taux de descente/gîte franchement dangereux et soutenu à ce même endroit | `C` (Cut) | 0.0 |
 | Bolter confirmé (voir étape 6) | `B` | 2.5 |
 | Remise de gaz | `WO?` | pas de points |
-| Preuve insuffisante pour juger | `NC` | pas de points |
+| Preuve insuffisante pour juger | évaluation partielle, issue seule, ou `NC` si rien d'utile ne subsiste | pas de points |
+
+Une limite technique n'efface plus ce qui est certain. Le rapport sépare désormais l'issue de la
+tentative, l'évaluation de la portion réellement observée et l'éligibilité aux points. Une approche
+partielle peut donc conserver son appréciation avec la mention « sans points » ; un câble annoncé
+par DCS, un bolter, un touch-and-go ou une remise de gaz restent visibles. Le grade DCS brut peut
+servir de recours clairement étiqueté, mais n'est jamais converti en note ou points du projet.
 
 **Exemple fictif :** pour Wolf 1-1, le pire écart relevé sur toute la trajectoire était 0.4° (à ¾
 NM), la tendance était stable et rien d'anormal ne s'est produit dans les 150 derniers mètres. Le
@@ -536,11 +569,18 @@ le même ordre, et seulement s'il est sûr d'être le seul à écrire ce dossier
 deux rapports en double si jamais deux processus tournaient en même temps) :
 
 1. **Un fichier JSON** — le rapport complet, lisible par une machine : note, écarts aux trois
-   portes et sur toute la trajectoire, brin, vent, niveau de confiance des données, etc.
+   portes et sur toute la trajectoire, décision détaillée d'entrée en groove, erreurs de source
+   horodatées, preuve d'arrestation, brin, vent et niveau de confiance. L'historique de crosse garde
+   les observations les plus récentes dans une capacité couvrant largement un circuit de trois
+   minutes ; s'il devait quand même être tronqué, le rapport indique pourquoi, combien d'éléments
+   ont été évincés et quelle période reste conservée.
 2. **Un fichier ACMI** — un rejeu du passage, ouvrable dans Tacview, pour revoir l'approche en
    3D.
 3. **Une image PNG** — un petit graphique visuel de l'écart glideslope/lineup pendant
-   l'approche, et un schéma du circuit d'approche (le "pattern").
+   l'approche, et un schéma du circuit d'approche (le "pattern"). Si un même suivi contient
+   plusieurs circuits avant la finale, la branche réellement évaluée garde ses couleurs ; les
+   circuits antérieurs sont tracés séparément en gris fin pour rester visibles sans masquer la
+   finale ni créer de faux raccord entre deux tours.
 4. **Une ligne dans une base de données locale** — pour garder un historique de tous vos
    passages et calculer des moyennes dans le temps (le "greenie board").
 5. **Un message Discord** (si configuré) — avec la note, le graphique et le fichier de rejeu en

@@ -35,6 +35,7 @@ pub struct EventCorrelator {
     stream_status: EventStreamStatus,
     stream_detail: Option<String>,
     outcome_evidence_seen: bool,
+    dcs_waveoff_evidence_seen: bool,
 }
 
 impl EventCorrelator {
@@ -45,6 +46,7 @@ impl EventCorrelator {
             stream_status: EventStreamStatus::Available,
             stream_detail: None,
             outcome_evidence_seen: false,
+            dcs_waveoff_evidence_seen: false,
         }
     }
 
@@ -55,6 +57,7 @@ impl EventCorrelator {
             stream_status: EventStreamStatus::Disabled,
             stream_detail: Some("positions_only".to_string()),
             outcome_evidence_seen: false,
+            dcs_waveoff_evidence_seen: false,
         }
     }
 
@@ -79,6 +82,7 @@ impl EventCorrelator {
             },
         );
         self.outcome_evidence_seen |= accepted;
+        self.dcs_waveoff_evidence_seen |= accepted && track.has_dcs_waveoff_evidence();
         accepted
     }
 
@@ -133,9 +137,8 @@ impl EventCorrelator {
         let outcome_confirmed = match grading {
             Grading::Recovered { cable: Some(_), .. } => self.outcome_evidence_seen,
             Grading::Bolter | Grading::TouchAndGo { .. } => true,
-            Grading::WaveoffUnknown | Grading::Unknown | Grading::Recovered { cable: None, .. } => {
-                false
-            }
+            Grading::WaveoffUnknown => self.dcs_waveoff_evidence_seen,
+            Grading::Unknown | Grading::Recovered { cable: None, .. } => false,
         };
         EventCorrelationSummary {
             stream_status: self.stream_status.clone(),
@@ -159,11 +162,15 @@ pub(crate) fn transform_from_event_unit(time: f64, unit: Unit) -> Option<Transfo
 mod tests {
     use super::*;
 
-    #[test]
-    fn stream_failure_is_scoped_to_event_diagnostics() {
+    fn catobar_track() -> Track {
         let carrier = crate::data::CarrierInfo::by_type("CVN_71").unwrap();
         let plane = crate::data::AirplaneInfo::by_type("FA-18C_hornet").unwrap();
-        let mut track = Track::new("pilot", carrier, plane);
+        Track::new("pilot", carrier, plane)
+    }
+
+    #[test]
+    fn stream_failure_is_scoped_to_event_diagnostics() {
+        let mut track = catobar_track();
         let mut correlator = EventCorrelator::new(10, 20);
 
         correlator.stream_unavailable(&mut track, "grpc unavailable");
@@ -172,5 +179,49 @@ mod tests {
             track.finish().telemetry_quality.completeness,
             crate::track::Completeness::InsufficientGates
         );
+    }
+
+    #[test]
+    fn separate_waveoff_tracks_do_not_consume_a_later_wire_lqm() {
+        // Regression for the 7 September 2026 human F-14B(U) session: one recorder retained two
+        // GRADE:WO comments and then a WIRE# 2 trap.  Because the first LQM won forever, both the
+        // second waveoff and the authoritative wire were marked as duplicates in one report.
+        for (time, comment) in [
+            (
+                100.0,
+                "LSO: GRADE:WO _LOIC_ _LOAR_ _LULIM_ (EGTL) (DLIM) WO(AFU)IC [BC]",
+            ),
+            (200.0, "LSO: GRADE:WO _LULIM_ _LULIC_ WO(AFU)IC [BC]"),
+        ] {
+            let mut track = catobar_track();
+            let mut correlator = EventCorrelator::new(10, 20);
+            assert!(correlator.landing_quality_mark(&mut track, time, comment.to_string()));
+
+            let result = track.finish();
+            assert_eq!(result.grading, Grading::WaveoffUnknown);
+            assert!(correlator.summary(&result.grading).outcome_confirmed);
+            assert_eq!(result.events.len(), 1);
+            assert!(result.events[0].accepted);
+        }
+
+        let mut trap = catobar_track();
+        let mut trap_correlator = EventCorrelator::new(10, 20);
+        assert!(trap_correlator.landing_quality_mark(
+            &mut trap,
+            300.0,
+            "LSO: GRADE:C : WX WIRE# 2 _EGIW_ [BC]".to_string(),
+        ));
+
+        let result = trap.finish();
+        assert_eq!(
+            result.grading,
+            Grading::Recovered {
+                cable: Some(2),
+                cable_estimated: None,
+            }
+        );
+        assert!(trap_correlator.summary(&result.grading).outcome_confirmed);
+        assert_eq!(result.events.len(), 1);
+        assert!(result.events[0].accepted);
     }
 }

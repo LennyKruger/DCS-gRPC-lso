@@ -279,22 +279,101 @@ pub fn compute_vstol_final_grade_from_points(
 /// `groove_time_secs` is `None` when either timestamp was not recorded
 /// (e.g. the aircraft never entered the 3/4-nm gate before landing).
 ///
+/// PROJECT-DERIVED plain-language summary of this module's own measured GS/lineup deviations, for
+/// display when no DCS LSO comment exists to show instead (`Track::dcs_grading`) -- DCS never
+/// emits a `LandingQualityMark` comment for a touch-and-go (confirmed live 6 September 2026: 3/3
+/// T&G passes in one session had no `dcs_grading` at all, only the single arrested pass in the
+/// same session did), so this is the only way to show *why* a T&G graded the way it did. This is
+/// explicitly a summary of our own measurements, not a DCS/NATOPS LSO comment and never phrased to
+/// resemble one (no NATOPS shorthand codes, no invented callouts) -- see AGENTS.md, "Règles de
+/// vérité", on never fabricating an authoritative-sounding result without evidence behind it.
+/// Reuses the same amplitude/late-window thresholds as `grade_from_gates` so a phrase only appears
+/// for a deviation that could actually have affected the grade. Returns an empty string when every
+/// gate and the late-window trajectory check are all clean.
+pub fn describe_measured_deviations(
+    gates: &GateDeviations,
+    trajectory: &[TrajectoryDeviation],
+) -> String {
+    let mut phrases = Vec::new();
+    for (label, gate) in [
+        ("3/4 NM", &gates.at_three_quarter_nm),
+        ("1/2 NM", &gates.at_half_nm),
+        ("1/4 NM", &gates.at_quarter_nm),
+    ] {
+        let Some(g) = gate else { continue };
+        if g.gs_deviation_deg >= GS_SLIGHT_HIGH {
+            phrases.push(format!(
+                "high on glideslope at {label} ({:+.1}°)",
+                g.gs_deviation_deg
+            ));
+        } else if g.gs_deviation_deg <= -GS_SLIGHT_LOW {
+            phrases.push(format!(
+                "low on glideslope at {label} ({:+.1}°)",
+                g.gs_deviation_deg
+            ));
+        }
+        if g.lineup_deg.abs() >= LU_SLIGHT {
+            let side = if g.lineup_deg > 0.0 { "right" } else { "left" };
+            phrases.push(format!(
+                "{side} of centerline at {label} ({:+.1}°)",
+                g.lineup_deg
+            ));
+        }
+    }
+
+    // The single closest late-window excursion (see `LATE_WINDOW_*` above) -- the most
+    // operationally relevant one, since it is what a real LSO would have called out loudest.
+    if let Some(d) = trajectory.iter().rev().find(|d| {
+        d.distance_m <= LATE_WINDOW_DISTANCE_M
+            && (d.gs_deviation_deg.abs() >= LATE_WINDOW_GS_DEG
+                || d.lineup_deg.abs() >= LATE_WINDOW_LU_DEG)
+    }) {
+        phrases.push(format!(
+            "still off in close ({:.0} m out: GS {:+.1}°, lineup {:+.1}°)",
+            d.distance_m, d.gs_deviation_deg, d.lineup_deg
+        ));
+    }
+
+    if phrases.is_empty() {
+        return String::new();
+    }
+    let mut result = phrases.join(", ");
+    if let Some(c) = result.get_mut(0..1) {
+        c.make_ascii_uppercase();
+    }
+    result
+}
+
 /// `groove_entry_time` (DCS simulation time of roll-out-confirmed groove entry, CATOBAR only) is
 /// forwarded to `GateDeviations::all_valid` so the 3/4 NM gate is not required when it was
-/// captured before that instant -- see that method's doc comment.
-pub fn compute_pass_grade(
+/// captured before that instant -- see that method's doc comment. Returns the grade plus a short,
+/// plain-language explanation of the specific rule that produced it -- see
+/// `grade_from_gates_with_reason`'s doc comment for why this is the single source of truth
+/// rather than a second, independent reconstruction. Used for the Discord "Why This Grade"
+/// field.
+pub fn compute_pass_grade_with_reason(
     grading: &Grading,
     gates: &GateDeviations,
     trajectory: &[TrajectoryDeviation],
     groove_time_secs: Option<f64>,
     groove_entry_time: Option<f64>,
-) -> PassGrade {
+) -> (PassGrade, String) {
     match grading {
-        Grading::Unknown => PassGrade::Incomplete,
-        Grading::WaveoffUnknown => PassGrade::WaveoffUnknown,
-        Grading::Bolter if gates.all_valid(groove_entry_time) => PassGrade::Bolter,
+        Grading::Unknown => (
+            PassGrade::Incomplete,
+            "Grading unavailable: no recognisable approach was recorded.".to_string(),
+        ),
+        Grading::WaveoffUnknown => (
+            PassGrade::WaveoffUnknown,
+            "WO?: went around; can't tell from the data who or what caused it.".to_string(),
+        ),
+        Grading::Bolter if gates.all_valid(groove_entry_time) => (
+            PassGrade::Bolter,
+            "B: hook touched down but didn't catch a wire; the approach itself was on track."
+                .to_string(),
+        ),
         Grading::Recovered { .. } if gates.all_valid(groove_entry_time) => {
-            grade_from_gates(gates, trajectory, groove_time_secs, groove_entry_time)
+            grade_from_gates_with_reason(gates, trajectory, groove_time_secs, groove_entry_time)
         }
         // A qualification touch-and-go keeps the independently measured
         // approach grade, but can never receive a trap/wire-specific upgrade.
@@ -302,14 +381,19 @@ pub fn compute_pass_grade(
         // hook-up practice pass, never a full stop, so it is capped one tier down instead (see
         // docs/GRADING_REFERENCE.md: "A touch-and-go cannot receive `_OK_` or points").
         Grading::TouchAndGo { .. } if gates.all_valid(groove_entry_time) => {
-            match grade_from_gates(gates, trajectory, groove_time_secs, groove_entry_time) {
-                PassGrade::Perfect => PassGrade::Ok,
+            match grade_from_gates_with_reason(gates, trajectory, groove_time_secs, groove_entry_time)
+            {
+                (PassGrade::Perfect, _) => (
+                    PassGrade::Ok,
+                    "OK: textbook approach, but capped one tier down — a touch-and-go can't receive a perfect pass.".to_string(),
+                ),
                 other => other,
             }
         }
-        Grading::TouchAndGo { .. } | Grading::Bolter | Grading::Recovered { .. } => {
-            PassGrade::Incomplete
-        }
+        Grading::TouchAndGo { .. } | Grading::Bolter | Grading::Recovered { .. } => (
+            PassGrade::Incomplete,
+            "Grading unavailable: fewer than three valid, ordered gates were captured. A positioning/detection limitation, not a pilot failure.".to_string(),
+        ),
     }
 }
 
@@ -420,6 +504,23 @@ pub(crate) fn grade_from_gates(
     groove_time_secs: Option<f64>,
     groove_entry_time: Option<f64>,
 ) -> PassGrade {
+    grade_from_gates_with_reason(gates, trajectory, groove_time_secs, groove_entry_time).0
+}
+
+/// Same result as `grade_from_gates`, plus a short, plain-language explanation of the specific
+/// rule that produced it -- for the Discord "Why This Grade" field. Built inline, as the single
+/// source of truth for both the grade and its reason, rather than reconstructed afterward from
+/// the final grade alone: this project has already been bitten once by two code paths computing
+/// the same answer independently and drifting apart (`wire_estimated`/`wire_estimation`, fixed 6
+/// September 2026), so `grade_from_gates` above is now a thin wrapper over this function instead
+/// of a parallel implementation. Deliberately worded for a pilot, not a developer: measured
+/// values are given, but internal constant names never are.
+pub(crate) fn grade_from_gates_with_reason(
+    gates: &GateDeviations,
+    trajectory: &[TrajectoryDeviation],
+    groove_time_secs: Option<f64>,
+    groove_entry_time: Option<f64>,
+) -> (PassGrade, String) {
     // Dangerously low at the 1/4-nm gate → Cut pass. GS_CUT_LOW_DEG is negative, so this
     // triggers when the hook is well below the ideal glide path at close range. Also checked
     // at every continuous sample inside the 1/4-nm gate distance, not only at the exact gate
@@ -427,16 +528,32 @@ pub(crate) fn grade_from_gates(
     // dangerous as one measured exactly at the gate. A sustained excessive sink rate or bank
     // angle in that same zone (`dangerous_sink_rate_or_bank`) is graded the same way — see its
     // doc comment for why those thresholds carry no NATOPS-numeric backing, unlike GS_CUT_LOW_DEG.
-    let quarter_nm_cut = gates
+    if let Some(g) = gates
         .at_quarter_nm
         .as_ref()
-        .is_some_and(|g| g.gs_deviation_deg < GS_CUT_LOW_DEG)
-        || trajectory.iter().any(|d| {
-            d.distance_m <= crate::track::GATE_QUARTER_NM && d.gs_deviation_deg < GS_CUT_LOW_DEG
-        })
-        || dangerous_sink_rate_or_bank(trajectory);
-    if quarter_nm_cut {
-        return PassGrade::Cut;
+        .filter(|g| g.gs_deviation_deg < GS_CUT_LOW_DEG)
+    {
+        return (
+            PassGrade::Cut,
+            format!(
+                "C: glideslope {:.1}° low at the 1/4 NM gate — dangerously low this close to the ship.",
+                g.gs_deviation_deg.abs()
+            ),
+        );
+    }
+    if let Some(d) = trajectory.iter().find(|d| {
+        d.distance_m <= crate::track::GATE_QUARTER_NM && d.gs_deviation_deg < GS_CUT_LOW_DEG
+    }) {
+        return (
+            PassGrade::Cut,
+            format!(
+                "C: glideslope {:.1}° low inside 1/4 NM — dangerously low this close to the ship.",
+                d.gs_deviation_deg.abs()
+            ),
+        );
+    }
+    if let Some(reason) = dangerous_sink_rate_or_bank_reason(trajectory) {
+        return (PassGrade::Cut, reason);
     }
 
     // Worst positive (high) and negative (low) GS deviation, and worst lineup, across the
@@ -489,17 +606,41 @@ pub(crate) fn grade_from_gates(
     // Apply the PROJECT-DERIVED grade tiers.
     // GS uses the CATOBAR-derived tiers retained for both paths: slight at 0.5°, significant at 1.0°.
     // Lineup has three tiers: slight (1.0°) → (OK), medium (2.0°) → --, large (3.0°) → --
-    let tier = if worst_gs_high >= GS_SIGNIFICANT
-        || worst_gs_low >= GS_SIGNIFICANT
-        || worst_lu >= LU_MEDIUM
-    {
-        PassGrade::NoGrade
-    } else if worst_gs_high >= GS_SLIGHT_HIGH
-        || worst_gs_low >= GS_SLIGHT_LOW
-        || worst_lu >= LU_SLIGHT
-    {
-        PassGrade::OkParentheses
-    } else if trend_worsening(trajectory) {
+    let (mut tier, mut reason) = if worst_gs_high >= GS_SIGNIFICANT {
+        (
+            PassGrade::NoGrade,
+            format!("--: glideslope {worst_gs_high:.1}° high — well outside tolerance."),
+        )
+    } else if worst_gs_low >= GS_SIGNIFICANT {
+        (
+            PassGrade::NoGrade,
+            format!("--: glideslope {worst_gs_low:.1}° low — well outside tolerance."),
+        )
+    } else if worst_lu >= LU_MEDIUM {
+        (
+            PassGrade::NoGrade,
+            format!("--: lineup off by {worst_lu:.1}° — more than double what OK allows."),
+        )
+    } else if worst_gs_high >= GS_SLIGHT_HIGH {
+        (
+            PassGrade::OkParentheses,
+            format!(
+                "(OK): drifted {worst_gs_high:.1}° high on glideslope — OK needs better than {GS_SLIGHT_HIGH:.1}°."
+            ),
+        )
+    } else if worst_gs_low >= GS_SLIGHT_LOW {
+        (
+            PassGrade::OkParentheses,
+            format!(
+                "(OK): drifted {worst_gs_low:.1}° low on glideslope — OK needs better than {GS_SLIGHT_LOW:.1}°."
+            ),
+        )
+    } else if worst_lu >= LU_SLIGHT {
+        (
+            PassGrade::OkParentheses,
+            format!("(OK): lineup off by {worst_lu:.1}° — OK needs better than {LU_SLIGHT:.1}°."),
+        )
+    } else if let Some((axis, _slope)) = trend_worsening_detail(trajectory) {
         // NATOPS distinguishes OK ("reasonable deviations with good corrections") from (OK)
         // ("fair — reasonable deviations") precisely on whether corrections were good, not on
         // amplitude alone (see docs/GRADING_REFERENCE.md, "Continuous trajectory"). Deviations
@@ -507,17 +648,30 @@ pub(crate) fn grade_from_gates(
         // worsening this close to touchdown cannot claim "good corrections", so it is capped at
         // (OK) instead. Trend is deliberately never used to raise a grade the amplitude rules
         // already placed below Ok — only to hold Ok back when it would otherwise be granted.
-        PassGrade::OkParentheses
-    } else if oscillating(trajectory) {
+        (
+            PassGrade::OkParentheses,
+            format!(
+                "(OK): within tolerance, but {axis} kept getting worse over the last few seconds instead of being corrected."
+            ),
+        )
+    } else if let Some((axis, reversals)) = oscillation_detail(trajectory) {
         // A.4 (NATOPS `OC` — overcontrolled): `trend_worsening` only sees the *net* slope
         // between the start and end of the window, so a pilot correcting back and forth
         // (+0.5°/-0.5°/+0.5°...) can show a near-zero net slope while still exhibiting exactly
         // the alternating, over-controlled piloting NATOPS penalizes. Counting direction
         // reversals instead catches that shape. Same downgrade-only contract as the trend
         // check: never raises a grade, only holds Ok back.
-        PassGrade::OkParentheses
+        (
+            PassGrade::OkParentheses,
+            format!(
+                "(OK): within tolerance, but {axis} swung back and forth {reversals} times instead of settling down."
+            ),
+        )
     } else {
-        PassGrade::Ok
+        (
+            PassGrade::Ok,
+            "OK: within tolerance on every gate and the continuous approach.".to_string(),
+        )
     };
 
     // A.3: weight the last moments before the ramp more heavily. Rather than reweighting
@@ -527,13 +681,15 @@ pub(crate) fn grade_from_gates(
     // approach is treated as NoGrade if it happens inside LATE_WINDOW_DISTANCE_M, where there
     // is no distance left to correct it. It never raises a grade, and never touches Cut or an
     // already-NoGrade result. See docs/GRADING_REFERENCE.md, "Late-approach weighting".
-    let tier = if matches!(tier, PassGrade::Ok | PassGrade::OkParentheses)
-        && late_window_severe(trajectory)
-    {
-        PassGrade::NoGrade
-    } else {
-        tier
-    };
+    if matches!(tier, PassGrade::Ok | PassGrade::OkParentheses) {
+        if let Some((axis, value, distance_m)) = late_window_detail(trajectory) {
+            tier = PassGrade::NoGrade;
+            reason = format!(
+                "--: {axis} off by {:.1}° in the final {LATE_WINDOW_DISTANCE_M:.0} m before the ramp ({distance_m:.0} m out) — too close in to still correct.",
+                value.abs()
+            );
+        }
+    }
 
     // `_OK_` (NAVAIR 00-80T-104 §11.4.1, "Perfect pass"): only reachable from a pass that has
     // already cleared every check above and landed on plain `Ok` — this is a strict tightening
@@ -546,9 +702,15 @@ pub(crate) fn grade_from_gates(
             (OK_PERFECT_GROOVE_TIME_MIN_S..=OK_PERFECT_GROOVE_TIME_MAX_S).contains(&t)
         })
     {
-        PassGrade::Perfect
+        (
+            PassGrade::Perfect,
+            format!(
+                "_OK_: textbook pass on every gate and the continuous approach, groove time {:.1} s.",
+                groove_time_secs.unwrap_or_default()
+            ),
+        )
     } else {
-        tier
+        (tier, reason)
     }
 }
 
@@ -589,39 +751,55 @@ fn is_amplitude_perfect(gates: &GateDeviations, trajectory: &[TrajectoryDeviatio
 }
 
 /// Whether any continuous trajectory sample inside `LATE_WINDOW_DISTANCE_M` of touchdown
-/// crossed the (stricter) late-window GS/lineup thresholds. See `LATE_WINDOW_GS_DEG`/
-/// `LATE_WINDOW_LU_DEG` for why this is intentionally tighter than the general amplitude tiers.
-fn late_window_severe(trajectory: &[TrajectoryDeviation]) -> bool {
-    trajectory.iter().any(|d| {
-        d.distance_m <= LATE_WINDOW_DISTANCE_M
-            && (d.gs_deviation_deg.abs() >= LATE_WINDOW_GS_DEG
-                || d.lineup_deg.abs() >= LATE_WINDOW_LU_DEG)
-    })
+/// crossed the (stricter) late-window GS/lineup thresholds, and which axis/value/distance did so
+/// -- used to build a plain-language reason (see `grade_from_gates_with_reason`).
+/// Checks GS before lineup, matching the order the original boolean OR evaluated them in; when
+/// both axes trip on the same sample this only reports one, which is fine for a short summary.
+fn late_window_detail(trajectory: &[TrajectoryDeviation]) -> Option<(&'static str, f64, f64)> {
+    trajectory
+        .iter()
+        .filter(|d| d.distance_m <= LATE_WINDOW_DISTANCE_M)
+        .find_map(|d| {
+            if d.gs_deviation_deg.abs() >= LATE_WINDOW_GS_DEG {
+                Some(("glideslope", d.gs_deviation_deg, d.distance_m))
+            } else if d.lineup_deg.abs() >= LATE_WINDOW_LU_DEG {
+                Some(("lineup", d.lineup_deg, d.distance_m))
+            } else {
+                None
+            }
+        })
 }
 
 /// Whether GS or lineup deviation was clearly getting worse, not better, in the final
-/// `TREND_WINDOW_S` seconds of the recorded trajectory. A simple two-point slope of the
-/// deviation's absolute value over that window, as prescribed by A.2 of the notation work: "no
-/// sophisticated filtering at this stage". Returns `false` (no penalty) whenever there is not
-/// enough data to judge a trend, which errs toward not penalizing rather than inventing a signal.
-fn trend_worsening(trajectory: &[TrajectoryDeviation]) -> bool {
-    let Some(reference_time) = trajectory.last().map(|d| d.timestamp_dcs) else {
-        return false;
-    };
+/// `TREND_WINDOW_S` seconds of the recorded trajectory, and which axis/slope did so. A simple
+/// two-point slope of the deviation's absolute value over that window, as prescribed by A.2 of
+/// the notation work: "no sophisticated filtering at this stage". Returns `None` (no penalty)
+/// whenever there is not enough data to judge a trend, which errs toward not penalizing rather
+/// than inventing a signal.
+/// used to build a plain-language reason (see `grade_from_gates_with_reason`). Checks GS before
+/// lineup, matching the order the original boolean OR evaluated them in.
+fn trend_worsening_detail(trajectory: &[TrajectoryDeviation]) -> Option<(&'static str, f64)> {
+    let reference_time = trajectory.last()?.timestamp_dcs;
     let window: Vec<&TrajectoryDeviation> = trajectory
         .iter()
         .filter(|d| d.timestamp_dcs >= reference_time - TREND_WINDOW_S)
         .collect();
     let (Some(first), Some(last)) = (window.first(), window.last()) else {
-        return false;
+        return None;
     };
     let dt = last.timestamp_dcs - first.timestamp_dcs;
     if dt <= 0.0 {
-        return false;
+        return None;
     }
     let gs_slope = (last.gs_deviation_deg.abs() - first.gs_deviation_deg.abs()) / dt;
     let lu_slope = (last.lineup_deg.abs() - first.lineup_deg.abs()) / dt;
-    gs_slope >= TREND_WORSENING_DEG_PER_S || lu_slope >= TREND_WORSENING_DEG_PER_S
+    if gs_slope >= TREND_WORSENING_DEG_PER_S {
+        Some(("glideslope", gs_slope))
+    } else if lu_slope >= TREND_WORSENING_DEG_PER_S {
+        Some(("lineup", lu_slope))
+    } else {
+        None
+    }
 }
 
 /// A.1 robustness guard (see `PERSISTENCE_MIN_CONSECUTIVE_SAMPLES`): splits the continuous
@@ -686,8 +864,11 @@ fn persistent_mask(elevated: &[bool], min_run: usize) -> Vec<bool> {
 /// the same "no distance left to correct it" zone as `GS_CUT_LOW_DEG` — is graded as a Cut,
 /// exactly like a dangerously low glideslope. See `SINK_RATE_CUT_MPS`/`BANK_ANGLE_CUT_DEG` for why
 /// neither threshold is NATOPS-numeric. Guarded by `DANGER_CUT_MIN_CONSECUTIVE_SAMPLES` so a
-/// single spike or noisy frame never cuts a pass on its own.
-fn dangerous_sink_rate_or_bank(trajectory: &[TrajectoryDeviation]) -> bool {
+/// single spike or noisy frame never cuts a pass on its own. Returns a ready-made plain-language
+/// reason quoting the peak value within the persisting run when tripped -- used by
+/// `grade_from_gates_with_reason`. Checks sink rate before bank, matching the order the original
+/// boolean OR evaluated them in.
+fn dangerous_sink_rate_or_bank_reason(trajectory: &[TrajectoryDeviation]) -> Option<String> {
     let near_ramp: Vec<&TrajectoryDeviation> = trajectory
         .iter()
         .filter(|d| d.distance_m <= crate::track::GATE_QUARTER_NM)
@@ -696,16 +877,41 @@ fn dangerous_sink_rate_or_bank(trajectory: &[TrajectoryDeviation]) -> bool {
         .iter()
         .map(|d| d.sink_rate_mps >= SINK_RATE_CUT_MPS)
         .collect();
+    let sink_keep = persistent_mask(&sink_elevated, DANGER_CUT_MIN_CONSECUTIVE_SAMPLES);
+    if let Some(peak) = near_ramp
+        .iter()
+        .zip(&sink_keep)
+        .filter(|(_, &keep)| keep)
+        .map(|(d, _)| d.sink_rate_mps)
+        .fold(None, |acc: Option<f64>, v| {
+            Some(acc.map_or(v, |a| a.max(v)))
+        })
+    {
+        return Some(format!(
+            "C: sink rate {peak:.1} m/s sustained inside 1/4 NM — descending too fast this close to the ramp."
+        ));
+    }
+
     let bank_elevated: Vec<bool> = near_ramp
         .iter()
         .map(|d| d.bank_deg.abs() >= BANK_ANGLE_CUT_DEG)
         .collect();
-    persistent_mask(&sink_elevated, DANGER_CUT_MIN_CONSECUTIVE_SAMPLES)
+    let bank_keep = persistent_mask(&bank_elevated, DANGER_CUT_MIN_CONSECUTIVE_SAMPLES);
+    if let Some(peak) = near_ramp
         .iter()
-        .any(|&keep| keep)
-        || persistent_mask(&bank_elevated, DANGER_CUT_MIN_CONSECUTIVE_SAMPLES)
-            .iter()
-            .any(|&keep| keep)
+        .zip(&bank_keep)
+        .filter(|(_, &keep)| keep)
+        .map(|(d, _)| d.bank_deg.abs())
+        .fold(None, |acc: Option<f64>, v| {
+            Some(acc.map_or(v, |a| a.max(v)))
+        })
+    {
+        return Some(format!(
+            "C: bank angle {peak:.0}° sustained inside 1/4 NM — too steep a bank this close to the ramp."
+        ));
+    }
+
+    None
 }
 
 /// A.4 (NATOPS `OC` — overcontrolled): whether GS or (signed) lineup deviation reversed
@@ -714,16 +920,24 @@ fn dangerous_sink_rate_or_bank(trajectory: &[TrajectoryDeviation]) -> bool {
 /// `trend_worsening` (a net two-point slope), this looks at every consecutive pair in the
 /// window, so a pilot correcting back and forth around the aim point is caught even when the
 /// net slope over the window is near zero.
-fn oscillating(trajectory: &[TrajectoryDeviation]) -> bool {
-    let Some(reference_time) = trajectory.last().map(|d| d.timestamp_dcs) else {
-        return false;
-    };
+/// Returns which axis oscillated and how many reversals it made, if any -- used to build a
+/// plain-language reason (see `grade_from_gates_with_reason`). Checks GS before lineup, matching
+/// the order the original boolean OR evaluated them in.
+fn oscillation_detail(trajectory: &[TrajectoryDeviation]) -> Option<(&'static str, usize)> {
+    let reference_time = trajectory.last()?.timestamp_dcs;
     let window: Vec<&TrajectoryDeviation> = trajectory
         .iter()
         .filter(|d| d.timestamp_dcs >= reference_time - OSCILLATION_WINDOW_S)
         .collect();
-    count_reversals(window.iter().map(|d| d.gs_deviation_deg)) >= OSCILLATION_MIN_REVERSALS
-        || count_reversals(window.iter().map(|d| d.lineup_deg)) >= OSCILLATION_MIN_REVERSALS
+    let gs_reversals = count_reversals(window.iter().map(|d| d.gs_deviation_deg));
+    if gs_reversals >= OSCILLATION_MIN_REVERSALS {
+        return Some(("glideslope", gs_reversals));
+    }
+    let lu_reversals = count_reversals(window.iter().map(|d| d.lineup_deg));
+    if lu_reversals >= OSCILLATION_MIN_REVERSALS {
+        return Some(("lineup", lu_reversals));
+    }
+    None
 }
 
 /// Counts direction reversals in a signed series, ignoring any step smaller than
@@ -795,16 +1009,19 @@ mod tests {
                 status: GateStatus::Valid,
                 reason: None,
                 bracket_gap_ms: Some(100.0),
+                ..GateQuality::default()
             },
             half_quality: GateQuality {
                 status: GateStatus::Valid,
                 reason: None,
                 bracket_gap_ms: Some(100.0),
+                ..GateQuality::default()
             },
             quarter_quality: GateQuality {
                 status: GateStatus::Valid,
                 reason: None,
                 bracket_gap_ms: Some(100.0),
+                ..GateQuality::default()
             },
         }
     }
@@ -1338,7 +1555,7 @@ mod tests {
     fn test_bolter_outcome() {
         let g = gates_deg(0.2, 0.3, 0.1, 0.2, 0.1, 0.1);
         assert_eq!(
-            compute_pass_grade(&Grading::Bolter, &g, &[], None, None),
+            compute_pass_grade_with_reason(&Grading::Bolter, &g, &[], None, None).0,
             PassGrade::Bolter
         );
     }
@@ -1347,7 +1564,7 @@ mod tests {
     fn test_waveoff_outcome() {
         let g = GateDeviations::default();
         assert_eq!(
-            compute_pass_grade(&Grading::WaveoffUnknown, &g, &[], None, None),
+            compute_pass_grade_with_reason(&Grading::WaveoffUnknown, &g, &[], None, None).0,
             PassGrade::WaveoffUnknown
         );
     }
@@ -1366,7 +1583,7 @@ mod tests {
             cable_estimated: Some(3),
         };
         assert_eq!(
-            compute_pass_grade(&grading, &g, &[], Some(16.5), None),
+            compute_pass_grade_with_reason(&grading, &g, &[], Some(16.5), None).0,
             PassGrade::Perfect
         );
     }
@@ -1384,7 +1601,7 @@ mod tests {
             cable_estimated: Some(4),
         };
         assert_eq!(
-            compute_pass_grade(&grading, &g, &[], Some(16.5), None),
+            compute_pass_grade_with_reason(&grading, &g, &[], Some(16.5), None).0,
             PassGrade::Perfect
         );
     }
@@ -1399,11 +1616,11 @@ mod tests {
             cable_estimated: Some(3),
         };
         assert_eq!(
-            compute_pass_grade(&grading, &g, &[], Some(15.0), None),
+            compute_pass_grade_with_reason(&grading, &g, &[], Some(15.0), None).0,
             PassGrade::Perfect
         );
         assert_eq!(
-            compute_pass_grade(&grading, &g, &[], Some(18.0), None),
+            compute_pass_grade_with_reason(&grading, &g, &[], Some(18.0), None).0,
             PassGrade::Perfect
         );
     }
@@ -1416,11 +1633,11 @@ mod tests {
             cable_estimated: Some(3),
         };
         assert_eq!(
-            compute_pass_grade(&grading, &g, &[], Some(14.99), None),
+            compute_pass_grade_with_reason(&grading, &g, &[], Some(14.99), None).0,
             PassGrade::Ok
         );
         assert_eq!(
-            compute_pass_grade(&grading, &g, &[], Some(18.01), None),
+            compute_pass_grade_with_reason(&grading, &g, &[], Some(18.01), None).0,
             PassGrade::Ok
         );
     }
@@ -1436,7 +1653,7 @@ mod tests {
             cable_estimated: Some(3),
         };
         assert_eq!(
-            compute_pass_grade(&grading, &g, &[], Some(16.5), None),
+            compute_pass_grade_with_reason(&grading, &g, &[], Some(16.5), None).0,
             PassGrade::Ok
         );
     }
@@ -1453,7 +1670,7 @@ mod tests {
             cable_estimated: Some(3),
         };
         assert_eq!(
-            compute_pass_grade(&grading, &g, &[], Some(16.5), None),
+            compute_pass_grade_with_reason(&grading, &g, &[], Some(16.5), None).0,
             PassGrade::Ok
         );
     }
@@ -1474,7 +1691,7 @@ mod tests {
             trajectory_point(600.0, 0.1, 0.1),
         ];
         assert_eq!(
-            compute_pass_grade(&grading, &g, &trajectory, Some(16.5), None),
+            compute_pass_grade_with_reason(&grading, &g, &trajectory, Some(16.5), None).0,
             PassGrade::Perfect
         );
     }
@@ -1497,7 +1714,7 @@ mod tests {
             trajectory_point(550.0, 0.1, 0.1),
         ];
         assert_eq!(
-            compute_pass_grade(&grading, &g, &trajectory, Some(16.5), None),
+            compute_pass_grade_with_reason(&grading, &g, &trajectory, Some(16.5), None).0,
             PassGrade::Ok
         );
     }
@@ -1511,7 +1728,7 @@ mod tests {
             cable_estimated: Some(3),
         };
         assert_eq!(
-            compute_pass_grade(&grading, &g, &[], Some(12.0), None),
+            compute_pass_grade_with_reason(&grading, &g, &[], Some(12.0), None).0,
             PassGrade::Ok
         );
     }
@@ -1525,7 +1742,7 @@ mod tests {
             cable_estimated: Some(3),
         };
         assert_eq!(
-            compute_pass_grade(&grading, &g, &[], Some(22.0), None),
+            compute_pass_grade_with_reason(&grading, &g, &[], Some(22.0), None).0,
             PassGrade::Ok
         );
     }
@@ -1539,7 +1756,7 @@ mod tests {
             cable_estimated: Some(3),
         };
         assert_eq!(
-            compute_pass_grade(&grading, &g, &[], Some(16.5), None),
+            compute_pass_grade_with_reason(&grading, &g, &[], Some(16.5), None).0,
             PassGrade::OkParentheses
         );
     }
@@ -1553,7 +1770,7 @@ mod tests {
             cable_estimated: Some(3),
         };
         assert_eq!(
-            compute_pass_grade(&grading, &g, &[], None, None),
+            compute_pass_grade_with_reason(&grading, &g, &[], None, None).0,
             PassGrade::Ok
         );
     }
@@ -1566,7 +1783,7 @@ mod tests {
         };
 
         assert_eq!(
-            compute_pass_grade(&grading, &g, &[], Some(16.5), None),
+            compute_pass_grade_with_reason(&grading, &g, &[], Some(16.5), None).0,
             PassGrade::OkParentheses
         );
     }
@@ -1579,7 +1796,7 @@ mod tests {
         };
 
         assert_eq!(
-            compute_pass_grade(&grading, &g, &[], Some(16.5), None),
+            compute_pass_grade_with_reason(&grading, &g, &[], Some(16.5), None).0,
             PassGrade::Ok
         );
     }
@@ -1733,5 +1950,262 @@ mod tests {
                 (expected_grade, expected_points)
             );
         }
+    }
+
+    #[test]
+    fn describe_measured_deviations_is_empty_when_every_gate_and_trajectory_sample_is_clean() {
+        let gates = gates_deg(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let trajectory = [trajectory_point(200.0, 0.1, 0.1)];
+        assert_eq!(describe_measured_deviations(&gates, &trajectory), "");
+    }
+
+    #[test]
+    fn describe_measured_deviations_reports_high_and_left_by_side() {
+        // GS_SLIGHT_HIGH/LOW = 0.5, LU_SLIGHT = 1.0.
+        let gates = gates_deg(0.7, -1.5, 0.0, 0.0, -0.6, 0.0);
+        let description = describe_measured_deviations(&gates, &[]);
+        assert!(
+            description.starts_with("High on glideslope at 3/4 NM (+0.7°)"),
+            "{description}"
+        );
+        assert!(
+            description.contains("left of centerline at 3/4 NM (-1.5°)"),
+            "{description}"
+        );
+        assert!(
+            description.contains("low on glideslope at 1/4 NM (-0.6°)"),
+            "{description}"
+        );
+    }
+
+    #[test]
+    fn describe_measured_deviations_reports_right_of_centerline() {
+        let gates = gates_deg(0.0, 1.4, 0.0, 0.0, 0.0, 0.0);
+        let description = describe_measured_deviations(&gates, &[]);
+        assert_eq!(description, "Right of centerline at 3/4 NM (+1.4°)");
+    }
+
+    #[test]
+    fn describe_measured_deviations_reports_a_late_window_excursion() {
+        let gates = gates_deg(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        // LATE_WINDOW_LU_DEG = 1.5, LATE_WINDOW_DISTANCE_M = 150.
+        let trajectory = [
+            trajectory_point(200.0, 0.0, 0.0),
+            trajectory_point(100.0, 0.0, 1.8),
+        ];
+        let description = describe_measured_deviations(&gates, &trajectory);
+        assert_eq!(
+            description,
+            "Still off in close (100 m out: GS +0.0°, lineup +1.8°)"
+        );
+    }
+
+    // ── `_with_reason` variants: Discord "Why This Grade" field ────────────────────────────
+
+    #[test]
+    fn reason_cut_from_quarter_nm_gate_glideslope() {
+        // GS_CUT_LOW_DEG = -2.5.
+        let g = gates_deg(0.0, 0.0, 0.0, 0.0, -2.8, 0.0);
+        let (grade, reason) = grade_from_gates_with_reason(&g, &[], None, None);
+        assert_eq!(grade, PassGrade::Cut);
+        assert_eq!(
+            reason,
+            "C: glideslope 2.8° low at the 1/4 NM gate — dangerously low this close to the ship."
+        );
+    }
+
+    #[test]
+    fn reason_cut_from_sustained_sink_rate() {
+        // SINK_RATE_CUT_MPS = 8.0, DANGER_CUT_MIN_CONSECUTIVE_SAMPLES = 3.
+        let g = gates_deg(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let mut trajectory = vec![
+            trajectory_point(400.0, 8.4, 0.0),
+            trajectory_point(400.0, 8.4, 0.0),
+            trajectory_point(400.0, 8.4, 0.0),
+        ];
+        for d in &mut trajectory {
+            d.distance_m = 300.0;
+            d.sink_rate_mps = 8.4;
+        }
+        let (grade, reason) = grade_from_gates_with_reason(&g, &trajectory, None, None);
+        assert_eq!(grade, PassGrade::Cut);
+        assert_eq!(
+            reason,
+            "C: sink rate 8.4 m/s sustained inside 1/4 NM — descending too fast this close to the ramp."
+        );
+    }
+
+    #[test]
+    fn reason_cut_from_sustained_bank_angle() {
+        // BANK_ANGLE_CUT_DEG = 30.0, DANGER_CUT_MIN_CONSECUTIVE_SAMPLES = 3.
+        let g = gates_deg(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let mut trajectory = vec![
+            trajectory_point(300.0, 0.0, 0.0),
+            trajectory_point(300.0, 0.0, 0.0),
+            trajectory_point(300.0, 0.0, 0.0),
+        ];
+        for d in &mut trajectory {
+            d.bank_deg = -33.0;
+        }
+        let (grade, reason) = grade_from_gates_with_reason(&g, &trajectory, None, None);
+        assert_eq!(grade, PassGrade::Cut);
+        assert_eq!(
+            reason,
+            "C: bank angle 33° sustained inside 1/4 NM — too steep a bank this close to the ramp."
+        );
+    }
+
+    #[test]
+    fn reason_nograde_from_significant_glideslope() {
+        // GS_SIGNIFICANT = 1.0.
+        let g = gates_deg(0.0, 0.0, 0.0, 0.0, 1.4, 0.0);
+        let (grade, reason) = grade_from_gates_with_reason(&g, &[], None, None);
+        assert_eq!(grade, PassGrade::NoGrade);
+        assert_eq!(reason, "--: glideslope 1.4° high — well outside tolerance.");
+    }
+
+    #[test]
+    fn reason_nograde_from_medium_lineup() {
+        // LU_MEDIUM = 2.0.
+        let g = gates_deg(0.0, 0.0, 0.0, 2.3, 0.0, 0.0);
+        let (grade, reason) = grade_from_gates_with_reason(&g, &[], None, None);
+        assert_eq!(grade, PassGrade::NoGrade);
+        assert_eq!(
+            reason,
+            "--: lineup off by 2.3° — more than double what OK allows."
+        );
+    }
+
+    #[test]
+    fn reason_nograde_from_late_window() {
+        // LATE_WINDOW_LU_DEG = 1.5, LATE_WINDOW_DISTANCE_M = 150.
+        let g = gates_deg(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let trajectory = [trajectory_point(100.0, 0.0, 1.6)];
+        let (grade, reason) = grade_from_gates_with_reason(&g, &trajectory, None, None);
+        assert_eq!(grade, PassGrade::NoGrade);
+        assert_eq!(
+            reason,
+            "--: lineup off by 1.6° in the final 150 m before the ramp (100 m out) — too close in to still correct."
+        );
+    }
+
+    #[test]
+    fn reason_okparentheses_from_slight_glideslope() {
+        // GS_SLIGHT_HIGH = 0.5.
+        let g = gates_deg(0.0, 0.0, 0.0, 0.0, 0.6, 0.0);
+        let (grade, reason) = grade_from_gates_with_reason(&g, &[], None, None);
+        assert_eq!(grade, PassGrade::OkParentheses);
+        assert_eq!(
+            reason,
+            "(OK): drifted 0.6° high on glideslope — OK needs better than 0.5°."
+        );
+    }
+
+    #[test]
+    fn reason_okparentheses_from_trend_worsening() {
+        let g = gates_deg(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        // TREND_WORSENING_DEG_PER_S = 0.075, over TREND_WINDOW_S = 4s: 0.0 -> 0.4 deg lineup.
+        let trajectory = [
+            trajectory_point_at(0.0, 300.0, 0.0, 0.0),
+            trajectory_point_at(4.0, 250.0, 0.0, 0.4),
+        ];
+        let (grade, reason) = grade_from_gates_with_reason(&g, &trajectory, None, None);
+        assert_eq!(grade, PassGrade::OkParentheses);
+        assert_eq!(
+            reason,
+            "(OK): within tolerance, but lineup kept getting worse over the last few seconds instead of being corrected."
+        );
+    }
+
+    #[test]
+    fn reason_okparentheses_from_oscillation() {
+        let g = gates_deg(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        // OSCILLATION_MIN_REVERSALS = 2, OSCILLATION_MIN_SWING_DEG = 0.3.
+        let trajectory = [
+            trajectory_point_at(0.0, 300.0, 0.0, 0.4),
+            trajectory_point_at(1.0, 280.0, 0.0, -0.4),
+            trajectory_point_at(2.0, 260.0, 0.0, 0.4),
+            trajectory_point_at(3.0, 240.0, 0.0, -0.4),
+        ];
+        let (grade, reason) = grade_from_gates_with_reason(&g, &trajectory, None, None);
+        assert_eq!(grade, PassGrade::OkParentheses);
+        assert_eq!(
+            reason,
+            "(OK): within tolerance, but lineup swung back and forth 2 times instead of settling down."
+        );
+    }
+
+    #[test]
+    fn reason_ok_when_everything_is_clean() {
+        let g = gates_deg(0.1, 0.1, 0.1, 0.1, 0.1, 0.1);
+        let (grade, reason) = grade_from_gates_with_reason(&g, &[], None, None);
+        assert_eq!(grade, PassGrade::Ok);
+        assert_eq!(
+            reason,
+            "OK: within tolerance on every gate and the continuous approach."
+        );
+    }
+
+    #[test]
+    fn reason_perfect_when_amplitude_and_groove_time_both_qualify() {
+        let g = gates_deg(0.1, 0.1, 0.1, 0.1, 0.1, 0.1);
+        let (grade, reason) = grade_from_gates_with_reason(&g, &[], Some(16.5), None);
+        assert_eq!(grade, PassGrade::Perfect);
+        assert_eq!(
+            reason,
+            "_OK_: textbook pass on every gate and the continuous approach, groove time 16.5 s."
+        );
+    }
+
+    #[test]
+    fn reason_touch_and_go_caps_perfect_to_ok_with_its_own_message() {
+        let g = gates_deg(0.1, 0.1, 0.1, 0.1, 0.1, 0.1);
+        let grading = Grading::TouchAndGo {
+            cable_estimated: None,
+        };
+        let (grade, reason) = compute_pass_grade_with_reason(&grading, &g, &[], Some(16.5), None);
+        assert_eq!(grade, PassGrade::Ok);
+        assert_eq!(
+            reason,
+            "OK: textbook approach, but capped one tier down — a touch-and-go can't receive a perfect pass."
+        );
+    }
+
+    #[test]
+    fn reason_bolter_message() {
+        let g = gates_deg(0.2, 0.3, 0.1, 0.2, 0.1, 0.1);
+        let (grade, reason) = compute_pass_grade_with_reason(&Grading::Bolter, &g, &[], None, None);
+        assert_eq!(grade, PassGrade::Bolter);
+        assert_eq!(
+            reason,
+            "B: hook touched down but didn't catch a wire; the approach itself was on track."
+        );
+    }
+
+    #[test]
+    fn reason_waveoff_message() {
+        let g = GateDeviations::default();
+        let (grade, reason) =
+            compute_pass_grade_with_reason(&Grading::WaveoffUnknown, &g, &[], None, None);
+        assert_eq!(grade, PassGrade::WaveoffUnknown);
+        assert_eq!(
+            reason,
+            "WO?: went around; can't tell from the data who or what caused it."
+        );
+    }
+
+    #[test]
+    fn reason_incomplete_from_insufficient_gates() {
+        let g = GateDeviations::default();
+        let grading = Grading::Recovered {
+            cable: Some(3),
+            cable_estimated: Some(3),
+        };
+        let (grade, reason) = compute_pass_grade_with_reason(&grading, &g, &[], None, None);
+        assert_eq!(grade, PassGrade::Incomplete);
+        assert_eq!(
+            reason,
+            "Grading unavailable: fewer than three valid, ordered gates were captured. A positioning/detection limitation, not a pilot failure."
+        );
     }
 }

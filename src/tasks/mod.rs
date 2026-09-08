@@ -136,6 +136,15 @@ impl ActivePriorityPlanes {
             .lock()
             .is_ok_and(|active| active.contains_key(&plane_id))
     }
+
+    /// Number of distinct aircraft currently being recorded (across every carrier in this
+    /// session), regardless of `suspend_detectors_during_recovery`: `record_recovery` always
+    /// activates itself here for the duration of the attempt. Diagnostic only -- used to log
+    /// genuine recovery overlap, a scenario never yet exercised live (see tasking-roadmap.md,
+    /// "Robustesse multi-recoveries simultanées").
+    pub fn active_count(&self) -> usize {
+        self.0.lock().map(|active| active.len()).unwrap_or(0)
+    }
 }
 
 /// Record of a single completed recovery attempt, accumulated for the greenie board.

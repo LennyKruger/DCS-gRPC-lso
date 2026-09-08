@@ -33,6 +33,78 @@ pub enum TelemetryInvalidReason {
     TelemetryGap,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceObservationEntity {
+    Aircraft,
+    Carrier,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScoringSegmentAttribution {
+    BeforeGroove,
+    InScoredSegment,
+    AfterTouchdown,
+    IndeterminateMissingSourceTime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceTimeAttributionBasis {
+    CaptureTime,
+    SequenceAndCaptureTickBounds,
+    Unresolved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InvalidSourceVerdictEffect {
+    DiagnosticOutsideScoredSegment,
+    DiagnosticCoveredShortGap,
+    BlockingCoverageGap,
+    BlockingIndeterminateMissingSourceTime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SourceCaptureAnchor {
+    pub sequence: u64,
+    pub capture_tick: u64,
+    pub capture_time_dcs: f64,
+}
+
+/// One source-side unit observation that could not produce a paired position sample. The source
+/// capture clock and client receipt clock stay separate; attribution is filled only after the
+/// final groove/touchdown bounds are known.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct InvalidSourceObservation {
+    pub sequence: u64,
+    pub capture_tick: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_time_dcs: Option<f64>,
+    pub entity: SourceObservationEntity,
+    pub status_code: i32,
+    pub status: String,
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_read_time_dcs: Option<f64>,
+    pub received_unix_ms: u64,
+    pub attribution: ScoringSegmentAttribution,
+    pub attribution_basis: SourceTimeAttributionBasis,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_time_lower_bound_dcs: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_time_upper_bound_dcs: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coverage_gap_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_valid_sequence: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_valid_sequence: Option<u64>,
+    pub verdict_effect: InvalidSourceVerdictEffect,
+    pub affects_scoring: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct TelemetrySample {
     pub carrier_raw: Transform,
@@ -46,6 +118,10 @@ pub struct TelemetrySample {
     pub source_age_ms: f64,
     pub method: AlignmentMethod,
     pub invalid_reason: Option<TelemetryInvalidReason>,
+    /// Buffered-source identity used only to prove real capture coverage. Replay and unary
+    /// samples have no source sequence/tick and therefore never manufacture such an anchor.
+    pub source_sequence: Option<u64>,
+    pub source_capture_tick: Option<u64>,
 }
 
 impl TelemetrySample {
@@ -87,6 +163,8 @@ impl TelemetrySample {
                 AlignmentMethod::Direct
             },
             invalid_reason,
+            source_sequence: None,
+            source_capture_tick: None,
         }
     }
 
@@ -110,9 +188,7 @@ impl TelemetrySample {
                 Some(TelemetryInvalidReason::TimeWentBackwards)
             } else if skew_ms > MAX_EXTRAPOLATION_MS {
                 Some(TelemetryInvalidReason::ExcessiveSkew)
-            } else if sample_gap_ms > SAMPLE_GAP_INCOMPLETE_MS
-                || source_age_ms > SAMPLE_GAP_INCOMPLETE_MS
-            {
+            } else if sample_gap_ms > SAMPLE_GAP_INCOMPLETE_MS {
                 Some(TelemetryInvalidReason::TelemetryGap)
             } else {
                 None
@@ -133,6 +209,8 @@ impl TelemetrySample {
                 AlignmentMethod::Direct
             },
             invalid_reason,
+            source_sequence: None,
+            source_capture_tick: None,
         }
     }
 }
@@ -268,6 +346,8 @@ impl TelemetryAligner {
                 method
             },
             invalid_reason,
+            source_sequence: None,
+            source_capture_tick: None,
         };
 
         if carrier_advanced {
@@ -455,6 +535,20 @@ mod tests {
         let sample = TelemetrySample::from_source_pair(carrier, plane, Some(10.0), 750.0);
         assert!((sample.sample_gap_ms - 200.0).abs() < 1.0e-6);
         assert_eq!(sample.source_age_ms, 750.0);
+        assert!(sample.is_valid());
+        assert!(sample.has_warning());
+    }
+
+    #[test]
+    fn buffered_delivery_age_above_one_second_does_not_invalidate_contiguous_capture() {
+        let carrier = Transform {
+            time: 10.05,
+            ..Transform::default()
+        };
+        let plane = carrier.clone();
+        let sample = TelemetrySample::from_source_pair(carrier, plane, Some(10.0), 1_200.0);
+        assert!((sample.sample_gap_ms - 50.0).abs() < 1.0e-6);
+        assert_eq!(sample.source_age_ms, 1_200.0);
         assert!(sample.is_valid());
         assert!(sample.has_warning());
     }

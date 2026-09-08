@@ -65,6 +65,11 @@ pub struct DbPass {
     pub grading_version: String,
     pub wire_estimation_confidence: String,
     pub grading_availability: String,
+    pub assessment_scope: String,
+    pub observed_from_distance_m: Option<f64>,
+    pub missing_coverage_json: String,
+    pub points_eligible: bool,
+    pub fallback_source: String,
 }
 
 /// Pass record as returned from a database query (JSON-serialisable for the web API).
@@ -117,6 +122,11 @@ pub struct StoredPass {
     pub grading_version: Option<String>,
     pub wire_estimation_confidence: Option<String>,
     pub grading_availability: Option<String>,
+    pub assessment_scope: Option<String>,
+    pub observed_from_distance_m: Option<f64>,
+    pub missing_coverage: Vec<String>,
+    pub points_eligible: Option<bool>,
+    pub fallback_source: Option<String>,
 }
 
 impl RecoveryDb {
@@ -190,6 +200,11 @@ impl RecoveryDb {
             ("intended_spot", "TEXT"),
             ("actual_nearest_spot", "TEXT"),
             ("distance_to_intended_spot_m", "REAL"),
+            ("assessment_scope", "TEXT"),
+            ("observed_from_distance_m", "REAL"),
+            ("missing_coverage_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("points_eligible", "INTEGER NOT NULL DEFAULT 0"),
+            ("fallback_source", "TEXT"),
         ] {
             ensure_column(&conn, "passes", name, definition)?;
         }
@@ -221,9 +236,11 @@ impl RecoveryDb {
                  map_name, grade_date, grade_points, mission_datetime, outcome, recovery_id, pilot_kind, carrier_id, carrier_name, carrier_type,
                  recovery_mode, session_id, generation, completeness, max_sample_gap_ms, max_skew_ms, wire_estimated, wire_dcs, wire_divergent,
                  confidence, cause, grading_version, points_awarded, intended_spot, actual_nearest_spot, distance_to_intended_spot_m,
-                 max_scoring_sample_gap_ms, telemetry_health, wire_estimation_confidence, grading_availability, secondary_causes_json) \
+                 max_scoring_sample_gap_ms, telemetry_health, wire_estimation_confidence, grading_availability, secondary_causes_json,
+                 assessment_scope, observed_from_distance_m, missing_coverage_json, points_eligible, fallback_source) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
-                     ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42)",
+                     ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42,
+                     ?43, ?44, ?45, ?46, ?47)",
             params![
                 &pass.timestamp,
                 &pass.pilot_name,
@@ -267,6 +284,11 @@ impl RecoveryDb {
                 &pass.wire_estimation_confidence,
                 &pass.grading_availability,
                 &pass.secondary_causes_json,
+                &pass.assessment_scope,
+                pass.observed_from_distance_m,
+                &pass.missing_coverage_json,
+                pass.points_eligible,
+                &pass.fallback_source,
             ],
         )?;
         Ok(inserted == 1)
@@ -280,7 +302,8 @@ impl RecoveryDb {
                     map_name, grade_date, grade_points, mission_datetime, outcome, recovery_id, pilot_kind, carrier_id, carrier_name, carrier_type,
                     recovery_mode, session_id, generation, completeness, max_sample_gap_ms, max_skew_ms, wire_estimated, wire_dcs, wire_divergent,
                     confidence, cause, grading_version, points_awarded, intended_spot, actual_nearest_spot, distance_to_intended_spot_m,
-                    max_scoring_sample_gap_ms, telemetry_health, wire_estimation_confidence, grading_availability, secondary_causes_json \
+                    max_scoring_sample_gap_ms, telemetry_health, wire_estimation_confidence, grading_availability, secondary_causes_json,
+                    assessment_scope, observed_from_distance_m, missing_coverage_json, points_eligible, fallback_source \
              FROM passes ORDER BY id DESC",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -337,6 +360,14 @@ impl RecoveryDb {
                     .get::<_, Option<String>>(42)?
                     .and_then(|json| serde_json::from_str(&json).ok())
                     .unwrap_or_default(),
+                assessment_scope: row.get(43)?,
+                observed_from_distance_m: row.get(44)?,
+                missing_coverage: row
+                    .get::<_, Option<String>>(45)?
+                    .and_then(|json| serde_json::from_str(&json).ok())
+                    .unwrap_or_default(),
+                points_eligible: row.get(46)?,
+                fallback_source: row.get(47)?,
             })
         })?;
         rows.collect()
@@ -420,6 +451,11 @@ mod tests {
             grading_version: "project-derived-v1".to_string(),
             wire_estimation_confidence: "high".to_string(),
             grading_availability: "available".to_string(),
+            assessment_scope: "full".to_string(),
+            observed_from_distance_m: Some(1_389.0),
+            missing_coverage_json: "[]".to_string(),
+            points_eligible: true,
+            fallback_source: "project".to_string(),
         };
         assert!(db.insert(&entry).expect("insert pass"));
         assert!(!db.insert(&entry).expect("duplicate is idempotent"));
