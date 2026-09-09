@@ -15,8 +15,41 @@ This file records user-visible changes. The crate version remains `0.2.0`; chang
   `fallback_source`. A measured partial approach remains visible without points, independently of
   a certain bolter/T&G/waveoff/trap outcome or DCS wire (`src/track.rs`,
   `src/tasks/record_recovery.rs`, `src/db.rs`, `src/web.rs`).
+- `trajectory_deviations[].track_angle_deg` preserves the fitted post-roll-out ground route as an
+  additive diagnostic without changing grading (`src/track.rs`).
+
+### Changed
+
+- Case I CATOBAR groove entry now follows an explicit port-pattern/final-turn/roll-out state
+  machine: the last turn arms only inbound below 600 ft, and `|bank| <= 10°` must then persist for
+  0.75 source seconds. The 3/4 NM distance, lineup, ground route and lineup trend no longer delay a
+  physical roll-out; the `-0.75°` port corridor remains an optional interception diagnostic.
+  Capture gaps above 300 ms reset confirmation, while source-time reversal and a new outbound
+  branch reset branch state. V/STOL and implicit Case II/III activation remain unchanged/disabled
+  (`src/track.rs`, `lso.toml`).
+- Read-only replay of the 44 human JSON reports from 7-8 September 2026 finds 44 entries versus 41
+  with the preceding stable-axis detector. Of the 41 comparable entries, 23 move earlier and 18
+  remain identical; 38 comparable groove durations grow by 0-31.50 s (3.99 s mean). One geometric
+  grade changes from `(OK)` to `--` because newly included corrections are no longer hidden. This
+  is offline corpus evidence only, not live DCS validation (`src/commands/groove_ab.rs`).
 
 ### Fixed
+
+- Live CATOBAR validation on 8 September 2026 (28 clean-build F-14B(U) reports, two human pilots)
+  confirms the pattern renderer separates and attenuates earlier circuits without spurious joins:
+  8 reports contain two branches, 18 contain three and 2 contain five. The same corpus confirms
+  clean attempt separation for `GRADE:WO -> three T&G -> WIRE# 2`, with one accepted LQM in the
+  waveoff and trap tracks and no cross-track contamination (`src/draw.rs`, `src/track.rs`,
+  `src/tasks/record_recovery.rs`).
+- Live buffered-source validation on that corpus confirms late delivery alone no longer suppresses
+  grading: all 28 reports retain continuous 20 Hz capture (50 ms maximum gap), no invalid source
+  snapshots and no reader sequence loss; 23 are `available/full` despite delivery p95 650-880 ms
+  and a 1,030 ms maximum. The five partial reports are explained solely by unconfirmed arrest, not
+  telemetry delivery (`src/telemetry.rs`, `src/track.rs`).
+- Live concurrency validation on that corpus confirms two human F-14B(U) recoveries can be
+  collected and published concurrently without output collision or cross-track contamination.
+  Multiple overlapping pairs completed, including simultaneous T&G reports and an overlapping
+  bolter/T&G pair (`src/commands/run.rs`, `src/tasks/report_pipeline.rs`).
 
 - `InvalidTelemetry` is now proportional to proven loss of scored-segment coverage. One isolated
   invalid buffered-source sequence is diagnostic when immediately bounded by real valid
@@ -33,14 +66,19 @@ This file records user-visible changes. The crate version remains `0.2.0`; chang
 - Exhaustion of the old pattern-chart history now compacts only that non-scoring history and emits
   `pattern_history_truncated`; it no longer creates a scoring `BufferLimit` (`src/track.rs`).
 
-- `groove_entry` in schema-v3 JSON records the exact DCS timestamp, receipt-clock evidence,
-  distance, lineup, bank, fitted track angle, lineup trend, persistence duration/sample count,
-  trigger and all active thresholds that latched CATOBAR groove entry. Because the current RPC
+- `groove_entry` in schema-v3 JSON records the exact DCS confirmation and roll-out-start times,
+  receipt-clock evidence, distance, relative altitude, lineup, bank, fitted track angle, lineup
+  trend, inbound progress, approach side, optional port-corridor crossing, arm reason,
+  confirmation duration/sample count, trigger and all effective thresholds that latched CATOBAR
+  groove entry. Existing fields remain present; `stability_duration_s` and
+  `stability_sample_count` now mean roll-out confirmation, not stabilized lineup/route/trend.
+  Because the current RPC
   has no exact DCS-to-UTC anchor, the report says so explicitly instead of presenting receipt time
   as capture UTC (`src/track.rs`, `src/tasks/record_recovery.rs`).
-- `lso.exe groove-ab <json-or-directory>` replays the production gate/trajectory/stable-axis
-  geometry from persisted schema-v3 `datums` and prints a read-only TSV before/after comparison of
-  entry, duration, geometric grade and maximum post-entry lineup. It cannot reconstruct events,
+- `lso.exe groove-ab <json-or-directory>` replays the production gate/trajectory/Case-I-roll-out
+  geometry from persisted schema-v3 `datums` and prints a read-only TSV comparison of old/new
+  entry distance/time, duration delta, geometric grade, confirmation evidence and newly retained
+  lineup/bank/route amplitudes. It cannot reconstruct events,
   RPC timing, UTC mapping or velocities that the JSON did not persist (`src/commands/groove_ab.rs`).
 - Per-observation invalid-source evidence now retains source sequence/tick/time, aircraft versus
   carrier entity, exact status code/name, source read time, client receipt time, scored-segment

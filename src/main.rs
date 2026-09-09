@@ -49,7 +49,7 @@ enum Command {
     /// actually recorded. Never affects live recording or the fork.
     CadenceAb(commands::cadence_ab::Opts),
 
-    /// Offline diagnostic: compare recorded groove entry with the current stable-axis detector.
+    /// Offline diagnostic: compare recorded groove entry with the current Case I roll-out detector.
     /// Reads schema-v3 JSON reports without modifying them.
     GrooveAb(commands::groove_ab::Opts),
 }
