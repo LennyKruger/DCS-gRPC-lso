@@ -298,22 +298,22 @@ de cette lecture continue, il retient trois instants particuliers, quand l'avion
 distances précises et traditionnellement utilisées en doctrine LSO :
 
 > **Comment le programme sait-il que le groove commence ?** Dans la vraie doctrine (CASE I), le
-> groove commence quand le pilote "roule les ailes à plat, aligné sur l'axe du pont, avec la boule
-> centrée" — un **geste du pilote**, pas une distance ou une altitude précise. Le programme ne peut
-> pas voir ce geste directement (DCS ne l'expose pas), donc il doit s'en approcher autrement. Une
-> première version se contentait d'une boîte géométrique large (avion à moins de ¾ NM, moins de
-> 300 ft, à peu près dans l'axe) — simple, mais capable de se déclencher trop tôt pendant la fin du
-> virage. Le programme exige désormais une vraie stabilisation : avion à moins de 2° de l'axe,
-> inclinaison et route resserrées, déplacement latéral devenu lent, et toutes ces conditions tenues
-> pendant trois quarts de seconde. Un trou de télémétrie remet cette confirmation à zéro. La durée
-> de groove qui en résulte n'est jamais forcée vers 15–18 secondes : elle dépend du vol réellement
-> mesuré, et un défaut qui réapparaît près du toucher reste pleinement sanctionnable. Ce
-> raffinement ne s'applique qu'aux porte-avions CATOBAR (Nimitz/Forrestal) ; l'AV-8B/Tarawa garde
-> la boîte seule.
+> groove commence à la sortie du dernier virage, quand le pilote remet les ailes presque à plat.
+> C'est un **événement du circuit**, pas le franchissement d'une distance fixe et pas la preuve que
+> l'approche est déjà belle. Le programme reconnaît donc d'abord le circuit à gauche du navire,
+> observe le dernier virage sous 600 ft, puis attend que l'inclinaison revienne à 10° ou moins
+> pendant trois quarts de seconde tandis que l'avion continue vers la zone d'appontage. Un trou de
+> télémétrie supérieur à 300 ms recommence cette confirmation. Le passage près de `-0,75°` à gauche
+> de l'axe aide au diagnostic, mais n'est pas obligatoire : un undershoot qui reste à gauche ou un
+> overshoot qui traverse vite l'axe ont quand même un groove. Leur mauvais lineup, leur route
+> imparfaite et leurs corrections sont conservés dès le roll-out au lieu d'être cachés par une
+> entrée tardive. Le repère ¾ NM reste une photo de trajectoire, plus la définition du départ du
+> groove. Cette logique ne concerne que le Case I CATOBAR ; un straight-in Case II/III n'est pas
+> activé implicitement et l'AV-8B/Tarawa garde sa boîte historique.
 
 | Repère | Distance | Équivalent |
 |---|---:|---|
-| ¾ NM | 1 389 m | entrée dans le "groove" |
+| ¾ NM | 1 389 m | premier repère fixe ; il peut tomber avant ou après le roll-out réel |
 | ½ NM | 926 m | milieu de la finale |
 | ¼ NM | 463 m | juste avant le pont |
 

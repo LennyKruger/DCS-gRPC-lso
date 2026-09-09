@@ -126,7 +126,7 @@ Développement attendu :
 - faire accepter à `groove-ab` une ou plusieurs configurations pour comparer un corpus en lecture
   seule.
 
-Tests requis : absence de fichier = comportement historique bit-à-bit ; configuration partielle ;
+Tests requis : absence de fichier = comportement compilé courant bit-à-bit ; configuration partielle ;
 rejet de chaque incohérence ; priorité et résolution des chemins ; hash stable et sensible à toute
 valeur effective ; snapshot immuable pendant la track ; séparation CATOBAR/V/STOL. Mettre ensuite à
 jour README, primer, AGENTS et CHANGES. Toute modification réelle de seuil devra être revalidée sur
@@ -141,7 +141,7 @@ corpus puis en mission selon sa portée.
   `trajectory_deviations` ou à un diagnostic dédié. Arbitrer ensuite la métrique de sévérité tardive
   et la valeur de `NEAR_TOUCHDOWN_ANGLE_REFERENCE_M = 75 m`, sans masquer un vrai écart bref.
 - **Temps de groove et `_OK_`.** Les corpus disponibles donnent des durées tantôt sous 15 s, tantôt
-  au-dessus de 18 s, et aucun `_OK_` live. Déterminer si l’entrée stable-axis, la géométrie du
+  au-dessus de 18 s, et aucun `_OK_` live. Déterminer si l’entrée physique par roll-out, la géométrie du
   pattern, le type avion ou la fenêtre 15–18 s expliquent cet échec. La fenêtre est `OFFICIAL`, la
   bande d’amplitude est `PROJECT-DERIVED` ; ne pas les confondre. Vérifier séparément T-45 et
   F-14/F-18 avant promotion.
@@ -187,9 +187,15 @@ corpus puis en mission selon sa portée.
   refus d’un bolter contredit par `GRADE:WO`, notamment sur bolter léger, survol bas et rebond.
 - **Crosse F-14.** Vérifier l’offset vertical `+1,0 m` et le gel de lecture au premier contact sur
   F-14A/F-14B ; effectuer une nouvelle mesure ModelViewer2 pour remplacer l’offset empirique.
-- **Entrée stable-axis.** Étendre la validation au-delà du F-14B(U) : autres pilotes/types, vent de
-  travers, correction tardive légitime et absence de faux négatif. Ne pas desserrer les seuils pour
-  forcer une durée de 15–18 s.
+- **Entrée Case I par roll-out.** La machine à états et le rejeu hors ligne sont implémentés, mais
+  aucune mission live ne les a encore exercés. Revalider avec plusieurs pilotes et F/A-18C,
+  F-14A/B/B(U), T-45, avec sorties nominales, undershoots restant à bâbord, overshoots traversant
+  rapidement l'axe, route imparfaite, oscillation de gîte autour de 10°, corrections tardives,
+  vent de travers, waveoff puis nouveau circuit et tracks multi-circuits. Vérifier explicitement
+  absence de déclenchement sur initial, break, vent arrière, survol, départ catapulte, ailes à plat
+  outbound et straight-in Case II/III. Comparer l'instant observé par un LSO humain au
+  `rollout_started_at_dcs`/`timestamp_dcs`, sans desserrer 300 ms/0,75 s pour forcer une durée de
+  15–18 s. V/STOL doit rester inchangé.
 - **Tranche graduée du P0.** Revalider les nouveaux périmètres/fallbacks sur toutes les causes de
   complétude et sur les quatre surfaces pilote avant de considérer le contrat stabilisé.
 

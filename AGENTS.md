@@ -3,14 +3,14 @@
 > Document de continuité, à tenir à jour à chaque changement significatif de code ou de contrat.
 > Dépôt `E:\DCS stuffs\Initiative ESG\DCS-gRPC-lso`, branche `feature/refonte-v3-lua-buffer`.
 > Dernier commit : HEAD `42ebdecd` ("Ajout d'un exemple de fichier de configuration externe"). Working tree
-> actuellement **non propre** : mise à jour documentaire après analyse du corpus humain du 8 septembre
-> 2026. Les tranches sûres du P0 sur la restitution graduée et la couverture des observations source
-> invalides sont implémentées ; le rendu du pattern sépare les circuits antérieurs de la branche
+> actuellement **non propre** : refonte Rust du détecteur d'entrée en groove Case I CATOBAR et
+> mise à jour documentaire associée. Les tranches sûres du P0 sur la restitution graduée et la
+> couverture des observations source invalides sont implémentées ; le rendu du pattern sépare les circuits antérieurs de la branche
 > finale. La correction de segmentation des waveoffs issue du
-> second corpus humain F-14B(U) du 7 septembre 2026 est incluse dans HEAD. L'entrée en groove
-> CATOBAR exige
-> un axe réellement
-> stabilisé (lineup, bank, route et tendance resserrés, maintenus 0,75 s) ; les observations unité
+> second corpus humain F-14B(U) du 7 septembre 2026 est incluse dans HEAD. L'entrée en groove Case I
+> CATOBAR reconnaît le dernier virage depuis bâbord sous 600 ft puis confirme le roll-out sur une
+> gîte absolue au plus égale à 10° et une progression inbound maintenues 0,75 s ; lineup, route et
+> tendance restent des diagnostics non bloquants. Les observations unité
 > invalides conservent séquence, horodatage source, côté, statut et réception afin d'être attribuées
 > au vrai segment temporel ; la santé sépare cadence de capture, âge de livraison et pertes de
 > séquence ; une preuve cinématique d'arrestation structurée est exposée à titre diagnostique sans
@@ -105,9 +105,13 @@ Sur le HEAD `e62506d`, qui inclut la correction de segmentation des waveoffs :
 
 Sur le working tree courant :
 
-- `cargo test --locked --no-fail-fast` : **259 réussis, 0 échec** (257 tests du binaire + 2 tests
+- `cargo test --locked --no-fail-fast` : **269 réussis, 0 échec** (267 tests du binaire + 2 tests
   de provenance) ;
 - `cargo fmt --check` et `cargo clippy --locked --all-targets -- -D warnings` propres ;
+- les tests déterministes du détecteur Case I couvrent sortie nominale, undershoot, overshoot,
+  lineup/route/corrections imparfaits, durée de roll-out insuffisante ou suffisante, outbound, gap
+  `>300 ms`, retour du temps source, faux initial/break/vent arrière/straight-in, waveoff puis
+  nouvelle branche, V/STOL inchangé et parité du détecteur pur avec `groove-ab` ;
 - la segmentation pure du pattern couvre un circuit simple, deux survols suivis de la finale et une
   discontinuité temporelle ; la revue visuelle d’un PNG nominal est propre ; le corpus multi-circuits
   historique ne peut pas être rerendu depuis ses JSON, qui ne sérialisent pas `pattern_datums`.
@@ -125,6 +129,13 @@ séparation et l'atténuation des circuits antérieurs pour CATOBAR/F-14B(U). De
 V/STOL, pattern compacté à sa limite, overhead et waveoff sans LQM restent à couvrir. Plusieurs
 paires de tracks des deux pilotes se chevauchent jusqu'à publication, dont deux T&G simultanés et
 un bolter concurrent d'un T&G, sans collision d'artefact ni contamination inter-track observée.
+
+Le rejeu hors ligne `groove-ab` du détecteur Case I courant sur les 12 + 4 + 28 JSON humains des
+7 et 8 septembre retrouve une entrée sur les 44 rapports ; 20 de ces roll-outs restent à bâbord du
+corridor `-0,75°`, ce qui confirme que ce diagnostic n'est pas traité comme une obligation. Les
+`datums` JSON sont sous-échantillonnés avant la zone notée et ne permettent de reconstruire ni
+RPC/événement/UTC/vitesse absente ; ce résultat ne constitue aucune validation mission live du
+comportement courant.
 
 La première session humaine du 7 septembre a été capturée avec un binaire issu d'un working tree dirty au
 commit `b6308bc`, sans `-vv`. Elle fournit le corpus de calibration, mais ne constitue une
@@ -243,7 +254,7 @@ Frontières implémentées (fichiers vérifiés présents) :
   diagnostic hors-ligne rejouant des `datums` déjà enregistrés avec un sous-échantillonnage
   artificiel, sans jamais modifier la capture live ni les fichiers d'entrée.
 - [src/commands/groove_ab.rs](src/commands/groove_ab.rs) : commande `lso.exe groove-ab`, comparaison
-  hors-ligne en lecture seule entre l'entrée/durée enregistrée et le détecteur stable-axis courant
+  hors-ligne en lecture seule entre l'entrée/durée enregistrée et le détecteur Case I courant
   sur les `datums` JSON v3. Elle rejoue exactement la géométrie disponible, mais ne peut pas
   reconstruire un UTC de capture, les RPC/événements ni les vitesses absentes de `datums`.
 - [src/tasks/detect_recovery_attempt.rs](src/tasks/detect_recovery_attempt.rs) : détecteur par
@@ -391,28 +402,28 @@ l'état du code (voir "Règles de vérité" plus haut).
 - Formule au seuil `x` : `ideal_alt = base_alt + x * tan(pente_avion)` ;
   `gs_deg = atan2(observed_alt - ideal_alt, x)` ; `lineup = atan2(écart_latéral, x)` (voir
   "Near-touchdown geometry" plus bas pour le cas `x` proche de zéro).
-- Entrée en groove CATOBAR (`entered_groove`) : la boîte (`x <= 3/4 NM`, `alt <= 300 ft`, lineup
-  `<= ±10°`) est nécessaire mais non suffisante. NAVAIR 00-80T-105 §6.2.4.2/6.2.4.3 définit le
-  début du groove Case I comme l'événement « wings level on centerline », pas comme une distance.
-  Le détecteur stable-axis (`groove_stability_measurement`, `src/track.rs`) exige donc, sur des
-  samples valides/inbound : `|lineup| <= 2°`, `|bank| <= 10°`, `|track angle| <= 10°`, et une
-  régression du lineup sur la dernière seconde de pente absolue `<= 0,5°/s`. La route sol est une
-  régression linéaire sur la fenêtre `gate_samples` de 2 s, exploitable seulement avec au moins 1 s
-  d'historique. Tous les critères doivent rester vrais pendant `0,75 s` de temps source ; un gap de
-  capture `>300 ms` remet la persistance à zéro. Ces seuils `PROJECT-DERIVED` ont été calibrés sur
-  les 12 passes F-14B(U) du 7 septembre : ils retardent les deux entrées problématiques sans imposer
-  artificiellement un groove de 15–18 s, et conservent les écarts tardifs dans la trajectoire notée.
-  Le second corpus humain F-14B(U) du 7 septembre valide live les trois entrées isolées : 756, 368
-  et 346 m, lineup 0,25°, -0,53° et 0,12°, avec exactement 0,75 s/16 samples stables ; `groove-ab`
-  les reproduit à l'identique. La dernière approche, fusionnée avec deux waveoffs par le bug de
-  segmentation corrigé plus bas, n'entre pas en groove (`lineup` encore 3,51° à 1/2 NM et 2,64° à
-  1/4 NM), ce qui est cohérent avec le `GRADE:C` DCS. Les autres pilotes/types et les conditions
-  plus difficiles restent à revalider.
-  `groove_entry` sérialise l'instant DCS, distance, lineup, bank, angle de route, pente de lineup,
-  durée/nombre de samples, trigger et seuils exacts. Le contrat RPC ne fournit pas d'ancre exacte
-  DCS→UTC : `utc_mapping_status` l'indique et le temps Unix de réception reste distinct, jamais
-  présenté comme l'UTC de capture. **CATOBAR uniquement** : V/STOL conserve la boîte seule. Le Case
-  II/III n'est pas modélisé et ne doit pas hériter de ces critères sans validation dédiée.
+- Entrée en groove Case I CATOBAR (`entered_groove`) : une machine à états pure
+  (`CaseIGrooveDetector`, `src/track.rs`) observe d'abord le côté bâbord du pattern, arme le dernier
+  virage seulement sur l'approach side (`x > 0`), sous `600 ft` relatifs, pendant une progression
+  inbound et avec `|bank| > 10°`, puis confirme le roll-out lorsque `|bank| <= 10°` et l'inbound
+  persistent pendant `0,75 s` de temps source continu. Un gap de capture `>300 ms` remet la
+  confirmation à zéro ; un retour/non-progrès de temps ou une branche repartie de plus de 150 m
+  réinitialise l'état de branche. La distance de 3/4 NM n'est plus un prérequis CATOBAR et ne peut
+  pas retarder un roll-out réel détecté plus tôt. L'entrée ou le franchissement du corridor bâbord
+  `-0,75°` est conservé comme indice, jamais comme obligation : undershoot restant à bâbord et
+  overshoot traversant l'axe restent admissibles. Lineup `±2°`, route `±10°` et tendance lineup
+  `±0,5°/s` restent dans les diagnostics legacy mais leurs booléens `*_blocks_entry` valent faux.
+  La trajectoire continue commence au sample de confirmation et sérialise aussi la route sol ; ces
+  écarts ne changent aucune règle de grading mais deviennent visibles dès le roll-out physique.
+  `groove_entry` sérialise additivement instant de confirmation, début du roll-out, distance,
+  altitude relative, lineup, bank, route, progression inbound, côté d'approche, durée/nombre de
+  samples, franchissement éventuel du corridor, motif d'armement, trigger et seuils effectifs. Les
+  champs legacy `stability_duration_s`/`stability_sample_count` désignent désormais la durée et le
+  nombre de samples de confirmation du roll-out, pas une stabilité lineup/route/tendance. Le
+  contrat RPC ne fournit pas d'ancre exacte DCS→UTC : `utc_mapping_status` l'indique et le temps
+  Unix de réception reste distinct. **Case I CATOBAR uniquement** : le straight-in sans dernier
+  virage observé n'active pas implicitement Case II/III ; V/STOL conserve exactement sa boîte
+  historique `x <= 3/4 NM`, altitude `<=300 ft`, lineup `<=±10°`.
 - Franchissement du seuil de pont (`crossed_deck_threshold`, distingue `Bolter` de `WO?`) : ne se
   déclenche que si l'avion est proche du niveau du pont au moment du franchissement
   (`DECK_CROSSING_ALT_CAP_FT = 50 ft`, relatif au pont, crosse comprise) — sinon `WaveoffUnknown`.
@@ -915,7 +926,10 @@ aussi purement diagnostique. Les ajouts du 7 septembre sont `groove_entry`,
 `arrest_confirmation`, les champs `capture_gap_*`/`delivery_age_*`/continuité lecteur,
 `telemetry_quality.invalid_source_observations` (attribution, base de bornage, intervalle couvert et
 effet explicite sur le verdict), les bornes source des brackets de gate et la sémantique de troncature de
-`hook_observation`. `pattern_rendering` ajoute le nombre de branches de circuit, l’index primaire
+`hook_observation`. `groove_entry` conserve ses champs schema-v3 et ajoute le début du roll-out,
+l'altitude relative, la progression inbound, le côté d'approche, l'indice de corridor bâbord et le
+motif d'armement ; `trajectory_deviations[].track_angle_deg` conserve additivement la route sol
+post-roll-out sans entrer dans le grading. `pattern_rendering` ajoute le nombre de branches de circuit, l’index primaire
 compté à partir de zéro, son motif de sélection et le nombre de branches atténuées ; ce diagnostic décrit le
 rendu uniquement et n’affecte jamais le grading. Voir "Gates, outcomes et câble" et "Contrat de
 télémétrie" ci-dessus.
@@ -949,9 +963,11 @@ des dépendances, pas seulement à l'exécution.
   (fixtures de test réellement présentes dans `tests/recordings/`). Une invariance live/replay est
   couverte par un test, mais le replay ne peut pas reproduire le timing réseau, l'UCID, la livraison
   d'événements DCS ni la performance serveur.
-- Comparaison stable-axis sur un rapport ou dossier JSON v3 : `lso.exe groove-ab <chemin>`. Sortie
-  TSV sur stdout ; entrées jamais modifiées. La note `new_geometric_grade` est la note géométrique
-  avant application des causes techniques/événementielles du rapport original.
+- Comparaison Case I roll-out sur un rapport ou dossier JSON v3 : `lso.exe groove-ab <chemin>`.
+  Sortie TSV sur stdout avec anciennes/nouvelles entrée et durée, diagnostics au nouvel instant et
+  amplitudes ajoutées avant l'ancienne entrée ; entrées jamais modifiées. La note
+  `new_geometric_grade` est la note géométrique avant application des causes techniques/
+  événementielles du rapport original.
 
 ## Déploiement et rollback
 

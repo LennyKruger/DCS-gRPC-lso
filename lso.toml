@@ -14,16 +14,25 @@ profile = "default-project-derived-v4"
 # Sets the maximum absolute aircraft bank angle accepted while confirming wings-level rollout.
 max_bank_deg = 10.0
 
-# Sets the maximum absolute ground-track error from the carrier landing-course axis.
+# Arms the observed port-side final turn only at or below this deck-relative altitude.
+last_turn_arm_max_altitude_ft = 600.0
+
+# Port-side lineup corridor used as optional interception evidence, never as an entry prerequisite.
+port_lineup_corridor_deg = -0.75
+
+# Resets a completed/candidate branch once its along-axis distance grows by this amount outbound.
+branch_reset_outbound_growth_m = 150.0
+
+# Legacy diagnostic threshold; ground-track error no longer blocks Case I entry.
 max_track_error_deg = 10.0
 
-# Sets the maximum absolute lineup error accepted when latching CATOBAR groove entry.
+# Legacy diagnostic threshold; lineup error no longer blocks Case I entry.
 max_lineup_deg = 2.0
 
-# Sets the maximum absolute lineup change rate accepted while the aircraft is stabilizing.
+# Legacy diagnostic threshold; lineup rate no longer blocks Case I entry.
 max_lineup_rate_deg_per_s = 0.5
 
-# Sets how long every groove-entry stability criterion must remain continuously satisfied.
+# Sets how long bank <= max_bank_deg and inbound progress must remain continuously satisfied.
 stability_duration_s = 0.75
 
 # Sets the history window used to estimate the aircraft ground track relative to the landing axis.
@@ -35,10 +44,10 @@ minimum_track_window_s = 1.0
 # Sets the history window used to estimate whether lineup is stable, converging, or diverging.
 lineup_trend_window_s = 1.0
 
-# Sets the maximum altitude above deck accepted by the coarse groove-entry detection box.
+# V/STOL legacy box only; not a CATOBAR Case I entry prerequisite.
 detection_max_altitude_ft = 300.0
 
-# Sets the maximum lineup error accepted by the coarse box before stable-axis checks can begin.
+# V/STOL legacy box only; not a CATOBAR Case I entry prerequisite.
 detection_max_lineup_deg = 10.0
 
 [grading.catobar]

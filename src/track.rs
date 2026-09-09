@@ -143,7 +143,7 @@ const GATE_BUFFER_WINDOW_S: f64 = 2.0;
 const HEALTH_WINDOW_S: f64 = 10.0;
 
 // ---------------------------------------------------------------------------
-// CATOBAR (Case I, CVN) groove-entry roll-out refinement.
+// CATOBAR Case I groove-entry roll-out detection.
 //
 // SOURCE: NAVAIR 00-80T-105 (CV NATOPS) 6.2.4.2/6.2.4.3 defines Case I groove entry as an
 // event, not a geometric threshold: after the 180-to-90-to-start approach turn, "the aircraft
@@ -155,34 +155,23 @@ const HEALTH_WINDOW_S: f64 = 10.0;
 // different Case entirely, and cannot by itself distinguish a real roll-out from the aircraft
 // transiently sweeping through the box mid-turn (e.g., cutting inside the corner from the 90).
 //
-// PROJECT-DERIVED thresholds below add two directly-observable proxies for "wings level on
-// centerline": small bank, a ground track already pointed down the groove axis, lineup within
-// two degrees, and a low one-second lineup trend, all held continuously for 0.75 source seconds.
-// The track and trend fits reuse `gate_samples`; no new telemetry field is needed. None of these
-// numerical thresholds is NAVAIR-specified.
+// PROJECT-DERIVED thresholds below recognize the physical final turn from the port-side Case I
+// pattern, then confirm roll-out from bank alone while requiring continuous inbound progress.
+// Lineup, ground track and lineup trend remain auditable quality diagnostics, but never delay the
+// scored portion: an undershoot, overshoot or active correction is part of the groove rather than
+// evidence that the groove does not exist. None of these numerical thresholds is NAVAIR-specified.
 //
 // CATOBAR only. V/STOL (Tarawa AV-8B) keeps the box-only behaviour unchanged: its approach
 // profile (hover/cross/VL, see VSTOL.md) has no CATOBAR-style final turn to distinguish from,
 // and this refinement was designed and reasoned about against CATOBAR Case I geometry only.
 
-/// Maximum bank accepted while confirming a stable CATOBAR groove entry. PROJECT-DERIVED and
-/// calibrated against the twelve-pass 7 September 2026 F-14B(U) corpus. Together with the equal
-/// track-angle limit it excludes the two premature entries (whose track errors were about 13.3
-/// and 14 degrees) while retaining a later stable interval on every pass that reached the box.
-/// It remains looser than a literal zero-bank test so a small correction does not suppress entry
-/// indefinitely.
+/// Maximum bank accepted while confirming CATOBAR Case I roll-out. It remains looser than a
+/// literal zero-bank test so a small correction does not suppress entry indefinitely.
 const GROOVE_ROLLOUT_MAX_BANK_DEG: f64 = 10.0;
-/// Ground-track heading error (degrees) relative to the deck's landing-course axis, above
-/// which the aircraft is treated as still sweeping through the detection box rather than
-/// tracking down the groove. PROJECT-DERIVED, deliberately the same magnitude as
-/// `GROOVE_ROLLOUT_MAX_BANK_DEG`: loose enough to tolerate a stabilized crab into a stiff
-/// crosswind (wind-over-deck is standard procedure), tight enough to exclude a track that is
-/// still curving across the centerline mid-turn.
+/// Legacy stable-axis diagnostic threshold. Retained additively in `groove_entry.criteria`, but
+/// no longer gates Case I groove entry.
 const GROOVE_ROLLOUT_MAX_TRACK_ANGLE_DEG: f64 = 10.0;
-/// The aircraft must be close enough to the extended landing-area centerline that the first
-/// scored sample is not already a project-level significant lineup deviation (2 degrees).
-/// PROJECT-DERIVED, calibrated on the same twelve-pass corpus; this is an entry detector, not a
-/// grading threshold, and later deviations remain fully visible to grading.
+/// Legacy stable-axis diagnostic threshold. Retained for schema-v3 compatibility only.
 const GROOVE_ENTRY_MAX_LINEUP_DEG: f64 = 2.0;
 /// Minimum time span (seconds) the buffered `gate_samples` window must already cover before
 /// the ground-track angle above is trusted at all. PROJECT-DERIVED: half of
@@ -199,7 +188,14 @@ const GROOVE_LINEUP_TREND_WINDOW_S: f64 = 1.0;
 /// entered the CATOBAR box; it guards against rapid convergence independently of whether lineup
 /// happens to cross the two-degree boundary on one frame.
 const GROOVE_ENTRY_MAX_LINEUP_RATE_DEG_PER_S: f64 = 0.5;
-/// Minimum source-time duration for which every entry criterion must remain continuously true.
+/// Maximum relative altitude at which a port-side final turn may arm the Case I roll-out search.
+const CASE_I_LAST_TURN_ARM_MAX_ALTITUDE_FT: f64 = 600.0;
+/// Port-side lineup corridor used as an interception diagnostic. Reaching or crossing it is not
+/// mandatory: a genuine undershoot may roll wings level while remaining farther to port.
+const CASE_I_PORT_LINEUP_CORRIDOR_DEG: f64 = -0.75;
+/// Outbound growth proving that a later sample belongs to a new circuit branch.
+const CASE_I_BRANCH_RESET_OUTBOUND_GROWTH_M: f64 = 150.0;
+/// Minimum source-time duration for which bank and inbound progress must remain continuously true.
 /// Time, rather than a sample count, keeps the contract stable at both the 10 Hz unary rollback
 /// and the 20 Hz buffered source. A capture gap above the 300 ms contract resets this interval.
 const GROOVE_ENTRY_STABILITY_DURATION_S: f64 = 0.75;
@@ -456,6 +452,17 @@ pub struct GrooveEntryCriteria {
     pub max_lineup_rate_deg_per_s: f64,
     pub required_stability_duration_s: f64,
     pub max_contiguous_sample_gap_ms: f64,
+    pub last_turn_arm_max_altitude_ft: f64,
+    pub port_lineup_corridor_deg: f64,
+    pub requires_positive_approach_x: bool,
+    pub requires_inbound_progress: bool,
+    pub lineup_blocks_entry: bool,
+    pub track_angle_blocks_entry: bool,
+    pub lineup_rate_blocks_entry: bool,
+    pub detection_box_blocks_catobar_entry: bool,
+    pub last_turn_min_abs_bank_exclusive_deg: f64,
+    pub branch_reset_outbound_growth_m: f64,
+    pub source_time_must_increase: bool,
 }
 
 impl Default for GrooveEntryCriteria {
@@ -472,11 +479,22 @@ impl Default for GrooveEntryCriteria {
             max_lineup_rate_deg_per_s: GROOVE_ENTRY_MAX_LINEUP_RATE_DEG_PER_S,
             required_stability_duration_s: GROOVE_ENTRY_STABILITY_DURATION_S,
             max_contiguous_sample_gap_ms: SAMPLE_GAP_WARNING_MS,
+            last_turn_arm_max_altitude_ft: CASE_I_LAST_TURN_ARM_MAX_ALTITUDE_FT,
+            port_lineup_corridor_deg: CASE_I_PORT_LINEUP_CORRIDOR_DEG,
+            requires_positive_approach_x: true,
+            requires_inbound_progress: true,
+            lineup_blocks_entry: false,
+            track_angle_blocks_entry: false,
+            lineup_rate_blocks_entry: false,
+            detection_box_blocks_catobar_entry: false,
+            last_turn_min_abs_bank_exclusive_deg: GROOVE_ROLLOUT_MAX_BANK_DEG,
+            branch_reset_outbound_growth_m: CASE_I_BRANCH_RESET_OUTBOUND_GROWTH_M,
+            source_time_must_increase: true,
         }
     }
 }
 
-/// Auditable snapshot of the CATOBAR stable-axis decision that latched groove entry.
+/// Auditable snapshot of the CATOBAR Case I roll-out decision that latched groove entry.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct GrooveEntryEvidence {
     pub timestamp_dcs: f64,
@@ -490,18 +508,66 @@ pub struct GrooveEntryEvidence {
     pub bank_deg: f64,
     pub track_angle_deg: f64,
     pub lineup_rate_deg_per_s: f64,
+    /// Schema-v3 compatibility field: now the uninterrupted roll-out confirmation duration,
+    /// not a duration for which lineup/route/trend were stable.
     pub stability_duration_s: f64,
+    /// Schema-v3 compatibility field: now the number of roll-out confirmation samples.
     pub stability_sample_count: u32,
     pub trigger: &'static str,
     pub criteria: GrooveEntryCriteria,
+    pub rollout_started_at_dcs: f64,
+    pub altitude_relative_ft: f64,
+    pub inbound_progress_mps: f64,
+    pub approach_side: &'static str,
+    pub port_lineup_corridor_reached: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port_lineup_corridor_crossing_time_dcs: Option<f64>,
+    pub last_turn_arm_state: &'static str,
+    pub last_turn_arm_reason: &'static str,
+    pub decision_semantics: &'static str,
 }
 
 #[derive(Debug, Clone, Copy)]
-struct GrooveStabilityMeasurement {
-    lineup_deg: f64,
+struct GrooveQualityMeasurement {
     track_angle_deg: f64,
     lineup_rate_deg_per_s: f64,
-    meets_criteria: bool,
+    inbound_progress_mps: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaseIGrooveState {
+    SearchingPattern,
+    PatternObserved,
+    LastTurnArmed,
+    RolloutConfirming,
+    GrooveConfirmed,
+}
+
+#[derive(Debug, Clone)]
+struct CaseIGrooveDetector {
+    state: CaseIGrooveState,
+    last_time_dcs: Option<f64>,
+    branch_min_x: f64,
+    previous_lineup_deg: Option<f64>,
+    rollout_started_at_dcs: Option<f64>,
+    rollout_sample_count: u32,
+    corridor_reached: bool,
+    corridor_crossing_time_dcs: Option<f64>,
+}
+
+impl Default for CaseIGrooveDetector {
+    fn default() -> Self {
+        Self {
+            state: CaseIGrooveState::SearchingPattern,
+            last_time_dcs: None,
+            branch_min_x: f64::MAX,
+            previous_lineup_deg: None,
+            rollout_started_at_dcs: None,
+            rollout_sample_count: 0,
+            corridor_reached: false,
+            corridor_crossing_time_dcs: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -632,14 +698,11 @@ pub struct Track {
     /// Cleared on each fresh groove entry, alongside `wire_crossings`, so an earlier bolter's
     /// trajectory never leaks into the scored attempt.
     trajectory_deviations: Vec<TrajectoryDeviation>,
-    /// Set to `true` once the aircraft enters inside 3/4 nm, below 300 ft AGL, and lined up
-    /// within +/-10 deg of the extended deck centerline. CATOBAR additionally requires the
-    /// roll-out confirmation below (`groove_rollout_confirm_count`); V/STOL uses the box alone.
+    /// Set once a CATOBAR Case I final turn from port has rolled out, or once the unchanged
+    /// V/STOL detection box is entered.
     entered_groove: bool,
-    /// CATOBAR-only count and source-time start of the uninterrupted stable-axis interval.
-    /// Both reset on any failed criterion or capture gap above 300 ms. Unused for V/STOL.
-    groove_rollout_confirm_count: u32,
-    groove_stability_started_at: Option<f64>,
+    /// CATOBAR Case I pattern/last-turn/roll-out state. Unused for V/STOL.
+    case_i_groove_detector: CaseIGrooveDetector,
     /// DCS simulation time (seconds since scenario start) when groove entry was first detected.
     groove_entry_time: Option<f64>,
     groove_entry_evidence: Option<GrooveEntryEvidence>,
@@ -869,6 +932,10 @@ pub struct TrajectoryDeviation {
     pub distance_m: f64,
     pub gs_deviation_deg: f64,
     pub lineup_deg: f64,
+    /// Ground-track angle relative to the landing-area axis (0° = directly inbound). Additive
+    /// diagnostic; it preserves imperfect routing and corrections after physical roll-out but is
+    /// not a grading input.
+    pub track_angle_deg: f64,
     /// Deck-relative altitude (metres) at this sample. Additive; lets a consumer reconstruct
     /// `sink_rate_mps` or overlay a vertical profile without needing `gs_deviation_deg` and the
     /// ideal glidepath to back it out.
@@ -1172,17 +1239,15 @@ struct ApproachSample {
     skew_ms: f64,
 }
 
-/// Measure one CATOBAR stable-axis candidate. Persistence is applied by the caller because it
-/// spans successive windows; this function evaluates the instantaneous bank/lineup plus the
-/// smoothed track and lineup trend leading into the current sample.
-fn groove_stability_measurement(
+/// Measure the entry quality at the current sample. These values are diagnostics only: the Case I
+/// detector below never makes lineup, track angle or lineup trend prerequisites for roll-out.
+fn groove_quality_measurement(
     gate_samples: &VecDeque<ApproachSample>,
-    bank_deg: f64,
-) -> Option<GrooveStabilityMeasurement> {
+) -> Option<GrooveQualityMeasurement> {
     let (Some(oldest), Some(newest)) = (gate_samples.front(), gate_samples.back()) else {
         return None;
     };
-    if newest.time - oldest.time < GROOVE_ROLLOUT_MIN_TRACK_WINDOW_S {
+    if newest.time <= oldest.time {
         return None;
     }
     let (vx, vy) = track_velocity_regression(gate_samples)?;
@@ -1194,45 +1259,186 @@ fn groove_stability_measurement(
         .iter()
         .filter(|sample| sample.time >= trend_start && sample.valid)
         .collect::<Vec<_>>();
-    let trend_span = trend_window
-        .first()
-        .zip(trend_window.last())
-        .map(|(first, last)| last.time - first.time)?;
-    if trend_span < GROOVE_ENTRY_STABILITY_DURATION_S {
-        return None;
-    }
     let lineup_rate_deg_per_s = linear_regression_slope(&trend_window, |sample| {
         sample.y.atan2(sample.x).to_degrees()
-    })?;
+    })
+    .unwrap_or(0.0);
     let lineup_deg = newest.y.atan2(newest.x).to_degrees();
-    let meets_criteria =
-        groove_entry_thresholds_met(bank_deg, lineup_deg, track_angle_deg, lineup_rate_deg_per_s);
     tracing::trace!(
-        bank_deg,
         track_angle_deg,
         lineup_deg,
         lineup_rate_deg_per_s,
-        meets_criteria,
-        "CATOBAR groove stable-axis check"
+        inbound_progress_mps = -vx,
+        "CATOBAR groove entry quality diagnostics"
     );
-    Some(GrooveStabilityMeasurement {
-        lineup_deg,
+    Some(GrooveQualityMeasurement {
         track_angle_deg,
         lineup_rate_deg_per_s,
-        meets_criteria,
+        inbound_progress_mps: -vx,
     })
 }
 
-fn groove_entry_thresholds_met(
-    bank_deg: f64,
+#[derive(Debug, Clone, Copy)]
+struct CaseIGrooveObservation {
+    time_dcs: f64,
+    x: f64,
+    altitude_relative_ft: f64,
     lineup_deg: f64,
-    track_angle_deg: f64,
-    lineup_rate_deg_per_s: f64,
-) -> bool {
-    bank_deg.abs() <= GROOVE_ROLLOUT_MAX_BANK_DEG
-        && track_angle_deg.abs() <= GROOVE_ROLLOUT_MAX_TRACK_ANGLE_DEG
-        && lineup_deg.abs() <= GROOVE_ENTRY_MAX_LINEUP_DEG
-        && lineup_rate_deg_per_s.abs() <= GROOVE_ENTRY_MAX_LINEUP_RATE_DEG_PER_S
+    bank_deg: f64,
+    valid: bool,
+    inbound: bool,
+    capture_gap_ms: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaseIGrooveUpdate {
+    None,
+    BranchReset,
+    Confirmed,
+}
+
+impl CaseIGrooveDetector {
+    fn reset_confirmation(&mut self) {
+        self.rollout_started_at_dcs = None;
+        self.rollout_sample_count = 0;
+        if self.state == CaseIGrooveState::RolloutConfirming {
+            self.state = CaseIGrooveState::LastTurnArmed;
+        }
+    }
+
+    fn reset_branch(&mut self) {
+        *self = Self::default();
+    }
+
+    fn observe(&mut self, observation: CaseIGrooveObservation) -> CaseIGrooveUpdate {
+        if self
+            .last_time_dcs
+            .is_some_and(|previous| observation.time_dcs <= previous)
+        {
+            self.reset_branch();
+            self.last_time_dcs = Some(observation.time_dcs);
+            return CaseIGrooveUpdate::BranchReset;
+        }
+        self.last_time_dcs = Some(observation.time_dcs);
+
+        if !observation.valid || observation.x <= 0.0 {
+            self.reset_confirmation();
+            return CaseIGrooveUpdate::None;
+        }
+
+        self.branch_min_x = self.branch_min_x.min(observation.x);
+        if !observation.inbound
+            && observation.x - self.branch_min_x > CASE_I_BRANCH_RESET_OUTBOUND_GROWTH_M
+        {
+            self.reset_branch();
+            self.last_time_dcs = Some(observation.time_dcs);
+            if observation.lineup_deg <= CASE_I_PORT_LINEUP_CORRIDOR_DEG {
+                self.state = CaseIGrooveState::PatternObserved;
+                self.previous_lineup_deg = Some(observation.lineup_deg);
+            }
+            return CaseIGrooveUpdate::BranchReset;
+        }
+
+        if observation.lineup_deg <= CASE_I_PORT_LINEUP_CORRIDOR_DEG
+            && self.state == CaseIGrooveState::SearchingPattern
+        {
+            self.state = CaseIGrooveState::PatternObserved;
+        }
+
+        if matches!(
+            self.state,
+            CaseIGrooveState::LastTurnArmed | CaseIGrooveState::RolloutConfirming
+        ) {
+            let reached_now = observation.lineup_deg >= CASE_I_PORT_LINEUP_CORRIDOR_DEG;
+            let crossed_now = self.previous_lineup_deg.is_some_and(|previous| {
+                previous < CASE_I_PORT_LINEUP_CORRIDOR_DEG
+                    && observation.lineup_deg >= CASE_I_PORT_LINEUP_CORRIDOR_DEG
+            });
+            if !self.corridor_reached && (reached_now || crossed_now) {
+                self.corridor_reached = true;
+                self.corridor_crossing_time_dcs = Some(observation.time_dcs);
+            }
+        }
+        self.previous_lineup_deg = Some(observation.lineup_deg);
+
+        if self.state == CaseIGrooveState::PatternObserved
+            && observation.inbound
+            && observation.altitude_relative_ft <= CASE_I_LAST_TURN_ARM_MAX_ALTITUDE_FT
+            && observation.bank_deg.abs() > GROOVE_ROLLOUT_MAX_BANK_DEG
+        {
+            self.state = CaseIGrooveState::LastTurnArmed;
+        }
+
+        if !matches!(
+            self.state,
+            CaseIGrooveState::LastTurnArmed | CaseIGrooveState::RolloutConfirming
+        ) {
+            return CaseIGrooveUpdate::None;
+        }
+
+        if !observation.inbound
+            || observation.altitude_relative_ft > CASE_I_LAST_TURN_ARM_MAX_ALTITUDE_FT
+            || observation.capture_gap_ms > SAMPLE_GAP_WARNING_MS
+            || observation.bank_deg.abs() > GROOVE_ROLLOUT_MAX_BANK_DEG
+        {
+            self.reset_confirmation();
+            return CaseIGrooveUpdate::None;
+        }
+
+        if self.state == CaseIGrooveState::LastTurnArmed {
+            self.state = CaseIGrooveState::RolloutConfirming;
+            self.rollout_started_at_dcs = Some(observation.time_dcs);
+            self.rollout_sample_count = 1;
+            return CaseIGrooveUpdate::None;
+        }
+
+        self.rollout_sample_count += 1;
+        let rollout_started_at = self
+            .rollout_started_at_dcs
+            .expect("roll-out confirmation state always has a start time");
+        if observation.time_dcs - rollout_started_at >= GROOVE_ENTRY_STABILITY_DURATION_S {
+            self.state = CaseIGrooveState::GrooveConfirmed;
+            CaseIGrooveUpdate::Confirmed
+        } else {
+            CaseIGrooveUpdate::None
+        }
+    }
+
+    fn evidence(
+        &self,
+        observation: CaseIGrooveObservation,
+        quality: GrooveQualityMeasurement,
+        utc_mapping_status: &'static str,
+        confirmation_received_unix_ms: Option<u64>,
+    ) -> GrooveEntryEvidence {
+        let rollout_started_at_dcs = self
+            .rollout_started_at_dcs
+            .expect("confirmed roll-out always has a start time");
+        GrooveEntryEvidence {
+            timestamp_dcs: observation.time_dcs,
+            utc_mapping_status,
+            confirmation_received_unix_ms,
+            distance_m: observation.x,
+            lineup_deg: observation.lineup_deg,
+            bank_deg: observation.bank_deg,
+            track_angle_deg: quality.track_angle_deg,
+            lineup_rate_deg_per_s: quality.lineup_rate_deg_per_s,
+            stability_duration_s: observation.time_dcs - rollout_started_at_dcs,
+            stability_sample_count: self.rollout_sample_count,
+            trigger: "case_i_port_final_turn_rollout_sustained",
+            criteria: GrooveEntryCriteria::default(),
+            rollout_started_at_dcs,
+            altitude_relative_ft: observation.altitude_relative_ft,
+            inbound_progress_mps: quality.inbound_progress_mps,
+            approach_side: "port",
+            port_lineup_corridor_reached: self.corridor_reached,
+            port_lineup_corridor_crossing_time_dcs: self.corridor_crossing_time_dcs,
+            last_turn_arm_state: "last_turn_armed",
+            last_turn_arm_reason: "port_pattern_turn_observed_below_600_ft_while_inbound",
+            decision_semantics:
+                "physical_rollout_bank_and_inbound_only_quality_diagnostics_do_not_block",
+        }
+    }
 }
 
 /// Least-squares linear regression of `x` and `y` against `time` over every *valid* sample in
@@ -1249,7 +1455,7 @@ fn groove_entry_thresholds_met(
 fn track_velocity_regression(window: &VecDeque<ApproachSample>) -> Option<(f64, f64)> {
     let valid = window
         .iter()
-        .filter(|sample| sample.valid && sample.in_approach && sample.lined_up)
+        .filter(|sample| sample.valid)
         .collect::<Vec<_>>();
     Some((
         linear_regression_slope(&valid, |sample| sample.x)?,
@@ -1289,8 +1495,7 @@ pub enum Grading {
     TouchAndGo {
         cable_estimated: Option<u8>,
     },
-    /// Pilot broke off the approach after entering the groove (inside 3/4 nm, below 300 ft,
-    /// lined up within +/-10 deg).
+    /// Pilot broke off the approach after entering the detected groove.
     WaveoffUnknown,
     Recovered {
         cable: Option<u8>,
@@ -1367,7 +1572,7 @@ pub struct TrackResult {
     pub carrier_info: &'static CarrierInfo,
     /// Time from groove entry to touchdown in seconds, if both were recorded.
     pub groove_time_secs: Option<f64>,
-    /// Exact CATOBAR stable-axis criteria and measurements that latched groove entry.
+    /// Exact CATOBAR Case I roll-out criteria and measurements that latched groove entry.
     pub groove_entry: Option<GrooveEntryEvidence>,
     pub touchdown_time_dcs: Option<f64>,
     pub telemetry_quality: TelemetryQuality,
@@ -1409,8 +1614,7 @@ impl Track {
             gate_deviations: GateDeviations::default(),
             trajectory_deviations: Default::default(),
             entered_groove: false,
-            groove_rollout_confirm_count: 0,
-            groove_stability_started_at: None,
+            case_i_groove_detector: CaseIGrooveDetector::default(),
             groove_entry_time: None,
             groove_entry_evidence: None,
             landing_time: None,
@@ -1470,7 +1674,7 @@ impl Track {
         }
     }
 
-    /// Whether the aircraft has entered the groove (inside 3/4 nm, below 300 ft AGL, lined up).
+    /// Whether the aircraft has entered the groove.
     /// Used by the caller to know when to query and supply a wind reference (see
     /// `set_wind_reference`) for the AoA correction.
     pub fn entered_groove(&self) -> bool {
@@ -1962,11 +2166,6 @@ impl Track {
             if x > GATE_THREE_QUARTER_NM {
                 self.gate_deviations.at_three_quarter_nm = None;
                 self.gate_deviations.three_quarter_quality = GateQuality::default();
-                self.groove_entry_time = None;
-                self.groove_entry_evidence = None;
-                self.entered_groove = false;
-                self.groove_rollout_confirm_count = 0;
-                self.groove_stability_started_at = None;
                 self.crossed_deck_threshold = false;
                 self.deck_crossing_confirmed_contact = false;
                 self.first_hook_ground_contact_time = None;
@@ -2060,58 +2259,59 @@ impl Track {
             {
                 self.gate_samples.pop_front();
             }
-            // Mark groove entry: inside 3/4 nm, below 300 ft AGL, and lined up (±10°). The
-            // lateral constraint prevents the timer from starting prematurely while the
-            // aircraft is still performing a wide turn to final on the base leg.
-            //
-            // CATOBAR additionally requires stable-axis confirmation (see the groove-entry
-            // constants block above) before latching `entered_groove`, so a transient
-            // sweep through this box mid-turn is not mistaken for the real "wings level on
-            // centerline" roll-out. V/STOL keeps the box alone: it has no CATOBAR-style final
-            // turn to distinguish from.
-            if x <= GATE_THREE_QUARTER_NM && m_to_ft(alt) <= 300.0 && lineup_deg.abs() <= 10.0 {
-                if self.carrier_info.is_vstol() {
-                    if !self.entered_groove {
-                        self.mark_fresh_groove_entry(plane.time);
-                    }
-                    self.entered_groove = true;
-                } else if !self.entered_groove {
-                    let measurement = groove_stability_measurement(&self.gate_samples, plane.roll);
-                    let sample_is_contiguous = sample.sample_gap_ms <= SAMPLE_GAP_WARNING_MS;
-                    if measurement.is_some_and(|value| value.meets_criteria) && sample_is_contiguous
-                    {
-                        let stability_start =
-                            *self.groove_stability_started_at.get_or_insert(plane.time);
-                        self.groove_rollout_confirm_count += 1;
-                        let stability_duration_s = plane.time - stability_start;
-                        if stability_duration_s >= GROOVE_ENTRY_STABILITY_DURATION_S {
-                            let measurement = measurement.expect("checked as present above");
-                            self.groove_entry_evidence = Some(GrooveEntryEvidence {
-                                timestamp_dcs: plane.time,
-                                utc_mapping_status: "unavailable_no_exact_dcs_utc_anchor",
-                                confirmation_received_unix_ms: (sample.plane_received_unix_ms != 0)
-                                    .then_some(sample.plane_received_unix_ms),
-                                distance_m: x,
-                                lineup_deg: measurement.lineup_deg,
-                                bank_deg: plane.roll,
-                                track_angle_deg: measurement.track_angle_deg,
-                                lineup_rate_deg_per_s: measurement.lineup_rate_deg_per_s,
-                                stability_duration_s,
-                                stability_sample_count: self.groove_rollout_confirm_count,
-                                trigger: "all_stable_axis_criteria_sustained",
-                                criteria: GrooveEntryCriteria::default(),
-                            });
-                            self.mark_fresh_groove_entry(plane.time);
-                            self.entered_groove = true;
-                        }
-                    } else {
-                        self.groove_rollout_confirm_count = 0;
-                        self.groove_stability_started_at = None;
-                    }
+            // V/STOL keeps its historical box-only detector. CATOBAR Case I instead recognizes
+            // the port-side pattern and final turn, then confirms physical roll-out from bank
+            // and inbound progress. The 3/4 NM gate, lineup, route and lineup trend do not block
+            // that decision; their values remain diagnostics and subsequent deviations are kept.
+            if self.carrier_info.is_vstol()
+                && x <= GATE_THREE_QUARTER_NM
+                && m_to_ft(alt) <= 300.0
+                && lineup_deg.abs() <= 10.0
+            {
+                if !self.entered_groove {
+                    self.mark_fresh_groove_entry(plane.time);
                 }
-            } else if !self.carrier_info.is_vstol() {
-                self.groove_rollout_confirm_count = 0;
-                self.groove_stability_started_at = None;
+                self.entered_groove = true;
+            }
+
+            if !self.carrier_info.is_vstol() {
+                let observation = CaseIGrooveObservation {
+                    time_dcs: plane.time,
+                    x,
+                    altitude_relative_ft: m_to_ft(alt),
+                    lineup_deg,
+                    bank_deg: plane.roll,
+                    valid: sample.is_valid(),
+                    inbound: is_inbound,
+                    capture_gap_ms: sample.sample_gap_ms,
+                };
+                match self.case_i_groove_detector.observe(observation) {
+                    CaseIGrooveUpdate::Confirmed if !self.entered_groove => {
+                        let quality = groove_quality_measurement(&self.gate_samples).unwrap_or(
+                            GrooveQualityMeasurement {
+                                track_angle_deg: 0.0,
+                                lineup_rate_deg_per_s: 0.0,
+                                inbound_progress_mps: 0.0,
+                            },
+                        );
+                        self.groove_entry_evidence = Some(
+                            self.case_i_groove_detector.evidence(
+                                observation,
+                                quality,
+                                "unavailable_no_exact_dcs_utc_anchor",
+                                (sample.plane_received_unix_ms != 0)
+                                    .then_some(sample.plane_received_unix_ms),
+                            ),
+                        );
+                        self.mark_fresh_groove_entry(plane.time);
+                        self.entered_groove = true;
+                    }
+                    CaseIGrooveUpdate::BranchReset if !self.entered_groove => {
+                        self.groove_entry_time = None;
+                        self.groove_entry_evidence = None;
+                    }
+                    _ => {}
+                }
             }
 
             // Continuous GS/lineup series, from groove entry to touchdown, using the same
@@ -2121,7 +2321,7 @@ impl Track {
             if self.entered_groove
                 && sample.is_valid()
                 && is_inbound
-                && in_approach
+                && (!self.carrier_info.is_vstol() || in_approach)
                 && gate_lined_up
                 && x >= TRAJECTORY_MIN_DISTANCE_M
                 && self.trajectory_deviations.len() < MAX_TRAJECTORY_SAMPLES
@@ -2137,6 +2337,8 @@ impl Track {
                     distance_m: x,
                     gs_deviation_deg,
                     lineup_deg: trajectory_lineup_deg,
+                    track_angle_deg: groove_quality_measurement(&self.gate_samples)
+                        .map_or(0.0, |quality| quality.track_angle_deg),
                     alt_m: alt,
                     bank_deg: plane.roll,
                     sink_rate_mps,
@@ -3771,7 +3973,7 @@ pub(crate) struct ReplaySample {
 /// `datums`) — see B.2 of the notation/cadence work plan.
 ///
 /// This mirrors the gate/groove/trajectory logic of `Track::next` (as of this writing,
-/// including the CATOBAR groove-entry stable-axis check via the shared measurement helper);
+/// including the shared CATOBAR Case I roll-out detector);
 /// keep the two in sync if that section changes. It intentionally does not replay
 /// telemetry-quality bookkeeping, wire estimation or touchdown detection — the diagnostic only
 /// ever needs gate/trajectory geometry, not a full recovery outcome.
@@ -3791,7 +3993,7 @@ pub(crate) fn replay_gate_and_trajectory(
 }
 
 /// Full deterministic geometry replay used by `groove-ab`. Unlike the historical cadence A/B
-/// wrapper above, this also returns the stable-axis entry evidence. It can reproduce the geometry
+/// wrapper above, this also returns the Case I roll-out evidence. It can reproduce the geometry
 /// exactly from schema-v3 `datums`, but not UTC mapping or event/velocity-derived evidence.
 pub(crate) fn replay_gate_trajectory_and_groove(
     samples: impl IntoIterator<Item = ReplaySample>,
@@ -3808,8 +4010,7 @@ pub(crate) fn replay_gate_trajectory_and_groove(
     let mut gate_samples: VecDeque<ApproachSample> = VecDeque::new();
     let mut previous_x = f64::MAX;
     let mut entered_groove = false;
-    let mut groove_rollout_confirm_count: u32 = 0;
-    let mut groove_stability_started_at: Option<f64> = None;
+    let mut case_i_groove_detector = CaseIGrooveDetector::default();
     let mut groove_entry = None;
 
     for ReplaySample {
@@ -3830,10 +4031,6 @@ pub(crate) fn replay_gate_trajectory_and_groove(
         if x > GATE_THREE_QUARTER_NM {
             gate_deviations.at_three_quarter_nm = None;
             gate_deviations.three_quarter_quality = GateQuality::default();
-            entered_groove = false;
-            groove_rollout_confirm_count = 0;
-            groove_stability_started_at = None;
-            groove_entry = None;
         }
         if x > GATE_HALF_NM {
             gate_deviations.at_half_nm = None;
@@ -3905,55 +4102,65 @@ pub(crate) fn replay_gate_trajectory_and_groove(
             gate_samples.pop_front();
         }
 
-        // Mirrors the CATOBAR stable-axis refinement in `Track::next` exactly.
-        if x <= GATE_THREE_QUARTER_NM && m_to_ft(alt) <= 300.0 && lineup_deg.abs() <= 10.0 {
-            if carrier_is_vstol {
-                if !entered_groove {
+        // V/STOL remains box-only; CATOBAR uses the same pure Case I detector as `Track::next`.
+        if carrier_is_vstol
+            && x <= GATE_THREE_QUARTER_NM
+            && m_to_ft(alt) <= 300.0
+            && lineup_deg.abs() <= 10.0
+        {
+            if !entered_groove {
+                trajectory_deviations.clear();
+            }
+            entered_groove = true;
+        }
+
+        if !carrier_is_vstol {
+            let capture_gap_ms = gate_samples
+                .iter()
+                .rev()
+                .nth(1)
+                .map_or(0.0, |previous| (time - previous.time) * 1_000.0);
+            let observation = CaseIGrooveObservation {
+                time_dcs: time,
+                x,
+                altitude_relative_ft: m_to_ft(alt),
+                lineup_deg,
+                bank_deg: roll_deg,
+                valid,
+                inbound: is_inbound,
+                capture_gap_ms,
+            };
+            match case_i_groove_detector.observe(observation) {
+                CaseIGrooveUpdate::Confirmed => {
+                    let quality = groove_quality_measurement(&gate_samples).unwrap_or(
+                        GrooveQualityMeasurement {
+                            track_angle_deg: 0.0,
+                            lineup_rate_deg_per_s: 0.0,
+                            inbound_progress_mps: 0.0,
+                        },
+                    );
+                    groove_entry = Some(case_i_groove_detector.evidence(
+                        observation,
+                        quality,
+                        "unavailable_offline_replay",
+                        None,
+                    ));
+                    trajectory_deviations.clear();
+                    entered_groove = true;
+                }
+                CaseIGrooveUpdate::BranchReset => {
+                    entered_groove = false;
+                    groove_entry = None;
                     trajectory_deviations.clear();
                 }
-                entered_groove = true;
-            } else if !entered_groove {
-                let measurement = groove_stability_measurement(&gate_samples, roll_deg);
-                let contiguous = gate_samples.iter().rev().nth(1).is_some_and(|previous| {
-                    (time - previous.time) * 1_000.0 <= SAMPLE_GAP_WARNING_MS
-                });
-                if measurement.is_some_and(|value| value.meets_criteria) && contiguous {
-                    let stability_start = *groove_stability_started_at.get_or_insert(time);
-                    groove_rollout_confirm_count += 1;
-                    let stability_duration_s = time - stability_start;
-                    if stability_duration_s >= GROOVE_ENTRY_STABILITY_DURATION_S {
-                        let measurement = measurement.expect("checked as present above");
-                        groove_entry = Some(GrooveEntryEvidence {
-                            timestamp_dcs: time,
-                            utc_mapping_status: "unavailable_offline_replay",
-                            confirmation_received_unix_ms: None,
-                            distance_m: x,
-                            lineup_deg: measurement.lineup_deg,
-                            bank_deg: roll_deg,
-                            track_angle_deg: measurement.track_angle_deg,
-                            lineup_rate_deg_per_s: measurement.lineup_rate_deg_per_s,
-                            stability_duration_s,
-                            stability_sample_count: groove_rollout_confirm_count,
-                            trigger: "all_stable_axis_criteria_sustained",
-                            criteria: GrooveEntryCriteria::default(),
-                        });
-                        trajectory_deviations.clear();
-                        entered_groove = true;
-                    }
-                } else {
-                    groove_rollout_confirm_count = 0;
-                    groove_stability_started_at = None;
-                }
+                CaseIGrooveUpdate::None => {}
             }
-        } else if !carrier_is_vstol {
-            groove_rollout_confirm_count = 0;
-            groove_stability_started_at = None;
         }
 
         if entered_groove
             && valid
             && is_inbound
-            && in_approach
+            && (!carrier_is_vstol || in_approach)
             && gate_lined_up
             && x >= TRAJECTORY_MIN_DISTANCE_M
             && trajectory_deviations.len() < MAX_TRAJECTORY_SAMPLES
@@ -3968,6 +4175,8 @@ pub(crate) fn replay_gate_trajectory_and_groove(
                 distance_m: x,
                 gs_deviation_deg,
                 lineup_deg: trajectory_lineup_deg,
+                track_angle_deg: groove_quality_measurement(&gate_samples)
+                    .map_or(0.0, |quality| quality.track_angle_deg),
                 alt_m: alt,
                 bank_deg: roll_deg,
                 sink_rate_mps,
@@ -4516,99 +4725,323 @@ mod tests {
         track.observe_arrest_kinematics(&sample, &sample.carrier, &sample.plane, hook_altitude_m);
     }
 
-    #[test]
-    fn groove_stability_uses_a_trend_line_not_just_the_two_endpoint_samples() {
-        // A perfectly straight inbound track (y = 0 throughout, x decreasing at a constant
-        // 200 m/s) must confirm roll-out.
-        let clean: VecDeque<ApproachSample> = (0..5)
-            .map(|i| approach_sample(i as f64, 1000.0 - 200.0 * i as f64))
-            .collect();
-        assert!(
-            groove_stability_measurement(&clean, 0.0)
-                .unwrap()
-                .meets_criteria
-        );
-
-        // Regression for the switch from comparing only the buffer's two endpoint samples to a
-        // least-squares trend line over the whole window: a single noisy sample sitting right at
-        // the oldest edge (e.g. one skewed telemetry frame) must no longer dominate the result.
-        // With only the two endpoints compared, the oldest-sample offset would dominate and
-        // wrongly deny a real roll-out for one bad frame. The trend line, informed by the other
-        // four clean samples, stays inside the threshold.
-        let mut noisy_edge = clean.clone();
-        noisy_edge.front_mut().unwrap().y = 150.0;
-        assert!(
-            groove_stability_measurement(&noisy_edge, 0.0)
-                .unwrap()
-                .meets_criteria
-        );
-
-        // The same offset on an interior sample, away from either edge, has even less leverage
-        // on the fitted trend and must not deny roll-out either.
-        let mut noisy_middle = clean.clone();
-        noisy_middle[2].y = 150.0;
-        assert!(
-            groove_stability_measurement(&noisy_middle, 0.0)
-                .unwrap()
-                .meets_criteria
-        );
+    fn case_i_sample(
+        time: f64,
+        x: f64,
+        lineup_deg: f64,
+        altitude_ft: f64,
+        bank: f64,
+    ) -> ReplaySample {
+        ReplaySample {
+            time,
+            x,
+            y: x * lineup_deg.to_radians().tan(),
+            alt: altitude_ft / 3.28084,
+            valid: true,
+            skew_ms: 0.0,
+            roll_deg: bank,
+        }
     }
 
-    #[test]
-    fn groove_stability_rejects_a_track_genuinely_sweeping_across_the_groove_axis() {
-        // Not just noise-tolerant: a track whose lateral position keeps growing throughout the
-        // window (still sweeping through the box mid-turn, not settled on the groove axis) must
-        // still be rejected by the trend line, the same as it was by the two endpoints.
-        let sweeping: VecDeque<ApproachSample> = (0..5)
-            .map(|i| {
-                let mut sample = approach_sample(i as f64, 1000.0 - 200.0 * i as f64);
-                sample.y = 100.0 * i as f64;
-                sample
-            })
-            .collect();
-        assert!(
-            !groove_stability_measurement(&sweeping, 0.0)
-                .unwrap()
-                .meets_criteria
-        );
-    }
-
-    #[test]
-    fn groove_entry_threshold_boundaries_are_inclusive_and_each_excess_is_rejected() {
-        assert!(groove_entry_thresholds_met(10.0, -2.0, 10.0, -0.5));
-        assert!(!groove_entry_thresholds_met(10.01, 0.0, 0.0, 0.0));
-        assert!(!groove_entry_thresholds_met(0.0, 2.01, 0.0, 0.0));
-        assert!(!groove_entry_thresholds_met(0.0, 0.0, -10.01, 0.0));
-        assert!(!groove_entry_thresholds_met(0.0, 0.0, 0.0, 0.501));
-    }
-
-    #[test]
-    fn groove_entry_requires_elapsed_persistence_not_two_frames() {
-        let make_samples = |end: usize| {
-            (0..=end).map(|index| {
+    fn case_i_turn_and_rollout(
+        rollout_samples: usize,
+        rollout_lineup: impl Fn(usize) -> f64,
+    ) -> Vec<ReplaySample> {
+        let mut samples = (0..5)
+            .map(|index| {
                 let time = index as f64 * 0.05;
-                ReplaySample {
-                    time,
-                    x: 1_300.0 - 50.0 * time,
-                    y: 0.0,
-                    alt: 50.0,
-                    valid: true,
-                    skew_ms: 0.0,
-                    roll_deg: 0.0,
-                }
+                case_i_sample(time, 1_700.0 - 20.0 * index as f64, -4.0, 550.0, 22.0)
             })
+            .collect::<Vec<_>>();
+        samples.extend((0..rollout_samples).map(|index| {
+            let time = 0.25 + index as f64 * 0.05;
+            case_i_sample(
+                time,
+                1_600.0 - 20.0 * index as f64,
+                rollout_lineup(index),
+                500.0,
+                8.0,
+            )
+        }));
+        samples
+    }
+
+    #[test]
+    fn nominal_port_final_turn_confirms_physical_rollout() {
+        let samples = case_i_turn_and_rollout(16, |index| -2.0 + index as f64 * 0.15);
+        let (_, _, entry) = replay_gate_trajectory_and_groove(samples, 0.0, 3.5, false);
+        let entry = entry.expect("nominal Case I roll-out should confirm");
+        assert_eq!(entry.rollout_started_at_dcs, 0.25);
+        assert!((entry.timestamp_dcs - 1.0).abs() < 1.0e-9);
+        assert_eq!(entry.stability_sample_count, 16);
+        assert!(entry.port_lineup_corridor_reached);
+        assert_eq!(entry.approach_side, "port");
+    }
+
+    #[test]
+    fn undershoot_remaining_outside_port_corridor_still_enters_groove() {
+        let samples = case_i_turn_and_rollout(16, |_| -3.0);
+        let (_, trajectory, entry) = replay_gate_trajectory_and_groove(samples, 0.0, 3.5, false);
+        let entry = entry.expect("a real undershoot roll-out must not wait for lineup");
+        assert!(!entry.port_lineup_corridor_reached);
+        assert!(entry.lineup_deg < CASE_I_PORT_LINEUP_CORRIDOR_DEG);
+        assert!(trajectory
+            .first()
+            .is_some_and(|sample| sample.lineup_deg < -2.0));
+    }
+
+    #[test]
+    fn rapid_overshoot_crossing_axis_is_recorded_at_rollout() {
+        let samples = case_i_turn_and_rollout(20, |index| -3.0 + index as f64 * 0.5);
+        let (_, trajectory, entry) = replay_gate_trajectory_and_groove(samples, 0.0, 3.5, false);
+        let entry = entry.expect("overshoot must not block physical roll-out");
+        assert!(entry.port_lineup_corridor_reached);
+        assert!(entry.lineup_deg > 2.0);
+        assert!(trajectory.iter().any(|sample| sample.lineup_deg > 2.0));
+    }
+
+    #[test]
+    fn poor_lineup_and_corrections_do_not_delay_entry_and_remain_in_trajectory() {
+        let mut samples =
+            case_i_turn_and_rollout(16, |index| if index % 2 == 0 { -4.0 } else { 3.0 });
+        samples.extend((0..6).map(|index| {
+            case_i_sample(
+                1.05 + index as f64 * 0.05,
+                1_280.0 - 20.0 * index as f64,
+                if index % 2 == 0 { -5.0 } else { 4.0 },
+                450.0,
+                6.0,
+            )
+        }));
+        let (_, trajectory, entry) = replay_gate_trajectory_and_groove(samples, 0.0, 3.5, false);
+        let entry = entry.expect("quality errors are not entry prerequisites");
+        assert!((entry.timestamp_dcs - 1.0).abs() < 1.0e-9);
+        assert!(trajectory
+            .iter()
+            .any(|sample| sample.lineup_deg.abs() >= 4.0));
+        assert!(trajectory
+            .iter()
+            .any(|sample| sample.track_angle_deg.abs() > 10.0));
+    }
+
+    #[test]
+    fn bank_below_limit_for_less_than_point_75_seconds_does_not_confirm() {
+        let samples = case_i_turn_and_rollout(15, |_| -1.0);
+        let (_, _, entry) = replay_gate_trajectory_and_groove(samples, 0.0, 3.5, false);
+        assert!(entry.is_none());
+    }
+
+    #[test]
+    fn temporary_bank_dip_during_turn_does_not_confirm_rollout() {
+        let mut samples = case_i_turn_and_rollout(8, |_| -1.0);
+        samples.push(case_i_sample(0.65, 1_430.0, -1.0, 500.0, 10.1));
+        samples.extend((0..16).map(|index| {
+            case_i_sample(
+                0.70 + index as f64 * 0.05,
+                1_410.0 - 20.0 * index as f64,
+                -1.0,
+                500.0,
+                9.0,
+            )
+        }));
+        let (_, _, entry) = replay_gate_trajectory_and_groove(samples, 0.0, 3.5, false);
+        let entry = entry.expect("a complete roll-out after the oscillation should confirm");
+        assert_eq!(entry.rollout_started_at_dcs, 0.70);
+        assert!((entry.timestamp_dcs - 1.45).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn imperfect_route_confirms_after_point_75_seconds_when_inbound() {
+        let samples = case_i_turn_and_rollout(16, |index| -8.0 + index as f64 * 2.0);
+        let (_, _, entry) = replay_gate_trajectory_and_groove(samples, 0.0, 3.5, false);
+        let entry = entry.expect("route quality must not gate entry");
+        assert!(entry.inbound_progress_mps > 0.0);
+        assert!(entry.track_angle_deg.abs() > GROOVE_ROLLOUT_MAX_TRACK_ANGLE_DEG);
+    }
+
+    #[test]
+    fn wings_level_but_outbound_never_confirms() {
+        let mut samples = case_i_turn_and_rollout(1, |_| -2.0);
+        samples.extend((0..20).map(|index| {
+            case_i_sample(
+                0.30 + index as f64 * 0.05,
+                1_600.0 + 20.0 * index as f64,
+                -1.0,
+                500.0,
+                5.0,
+            )
+        }));
+        let (_, _, entry) = replay_gate_trajectory_and_groove(samples, 0.0, 3.5, false);
+        assert!(entry.is_none());
+    }
+
+    #[test]
+    fn capture_gap_above_300_ms_resets_rollout_confirmation() {
+        let mut samples = case_i_turn_and_rollout(8, |_| -1.0);
+        samples.extend((0..17).map(|index| {
+            case_i_sample(
+                1.0 + index as f64 * 0.05,
+                1_350.0 - 20.0 * index as f64,
+                -1.0,
+                480.0,
+                5.0,
+            )
+        }));
+        let (_, _, entry) = replay_gate_trajectory_and_groove(samples, 0.0, 3.5, false);
+        let entry = entry.expect("a fresh full confirmation after the gap should succeed");
+        assert_eq!(entry.rollout_started_at_dcs, 1.05);
+        assert!((entry.timestamp_dcs - 1.80).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn source_time_return_resets_the_case_i_branch() {
+        let mut detector = CaseIGrooveDetector::default();
+        let turn = CaseIGrooveObservation {
+            time_dcs: 10.0,
+            x: 1_600.0,
+            altitude_relative_ft: 500.0,
+            lineup_deg: -4.0,
+            bank_deg: 20.0,
+            valid: true,
+            inbound: true,
+            capture_gap_ms: 0.0,
         };
+        assert_eq!(detector.observe(turn), CaseIGrooveUpdate::None);
+        assert_eq!(detector.state, CaseIGrooveState::LastTurnArmed);
+        assert_eq!(
+            detector.observe(CaseIGrooveObservation {
+                time_dcs: 9.5,
+                bank_deg: 5.0,
+                ..turn
+            }),
+            CaseIGrooveUpdate::BranchReset
+        );
+        assert_eq!(detector.state, CaseIGrooveState::SearchingPattern);
+        assert!(detector.rollout_started_at_dcs.is_none());
+    }
 
-        // The trend fit first becomes available after one second. Another 0.70 s is not enough.
-        let (_, _, too_short) =
-            replay_gate_trajectory_and_groove(make_samples(34), 0.0, 3.5, false);
-        assert!(too_short.is_none());
+    #[test]
+    fn initial_break_downwind_and_case_ii_straight_in_do_not_trigger() {
+        let mut samples = (0..20)
+            .map(|index| {
+                case_i_sample(
+                    index as f64 * 0.05,
+                    2_000.0 - 10.0 * index as f64,
+                    -2.0,
+                    800.0,
+                    25.0,
+                )
+            })
+            .collect::<Vec<_>>();
+        samples.extend((0..20).map(|index| {
+            case_i_sample(
+                1.0 + index as f64 * 0.05,
+                1_800.0 + 10.0 * index as f64,
+                -8.0,
+                550.0,
+                0.0,
+            )
+        }));
+        samples.extend((0..30).map(|index| {
+            case_i_sample(
+                2.0 + index as f64 * 0.05,
+                1_900.0 - 15.0 * index as f64,
+                0.0,
+                450.0,
+                0.0,
+            )
+        }));
+        let (_, _, entry) = replay_gate_trajectory_and_groove(samples, 0.0, 3.5, false);
+        assert!(
+            entry.is_none(),
+            "no observed port final turn means no implicit Case II/III activation"
+        );
+    }
 
-        let (_, _, confirmed) =
-            replay_gate_trajectory_and_groove(make_samples(35), 0.0, 3.5, false);
-        let confirmed = confirmed.expect("0.75 seconds of stable samples must confirm entry");
-        assert!((confirmed.stability_duration_s - 0.75).abs() < 1.0e-9);
-        assert_eq!(confirmed.stability_sample_count, 16);
+    #[test]
+    fn prior_waveoff_branch_cannot_contaminate_new_case_i_final() {
+        let mut samples = case_i_turn_and_rollout(16, |_| -1.0);
+        samples.extend((0..12).map(|index| {
+            case_i_sample(
+                1.05 + index as f64 * 0.05,
+                1_300.0 + 30.0 * index as f64,
+                2.0,
+                500.0,
+                0.0,
+            )
+        }));
+        samples.extend((0..5).map(|index| {
+            case_i_sample(
+                1.65 + index as f64 * 0.05,
+                1_700.0 - 20.0 * index as f64,
+                -4.0,
+                550.0,
+                22.0,
+            )
+        }));
+        samples.extend((0..16).map(|index| {
+            case_i_sample(
+                1.90 + index as f64 * 0.05,
+                1_600.0 - 20.0 * index as f64,
+                -1.0,
+                500.0,
+                5.0,
+            )
+        }));
+        let (_, trajectory, entry) = replay_gate_trajectory_and_groove(samples, 0.0, 3.5, false);
+        let entry = entry.expect("second final should independently confirm");
+        assert_eq!(entry.rollout_started_at_dcs, 1.90);
+        assert!(trajectory.iter().all(|sample| sample.timestamp_dcs >= 2.65));
+    }
+
+    #[test]
+    fn vstol_box_only_entry_is_unchanged() {
+        let samples = (0..3).map(|index| {
+            case_i_sample(
+                index as f64 * 0.1,
+                1_300.0 - 20.0 * index as f64,
+                0.0,
+                250.0,
+                0.0,
+            )
+        });
+        let (_, trajectory, entry) = replay_gate_trajectory_and_groove(samples, 0.0, 3.5, true);
+        assert!(entry.is_none(), "V/STOL has no CATOBAR groove evidence");
+        assert!(
+            !trajectory.is_empty(),
+            "historical V/STOL box still starts its trajectory"
+        );
+    }
+
+    #[test]
+    fn detector_and_groove_ab_replay_share_the_same_confirmation() {
+        let samples = case_i_turn_and_rollout(16, |_| -1.0);
+        let mut detector = CaseIGrooveDetector::default();
+        let mut previous_x = f64::MAX;
+        let mut direct_confirmation = None;
+        for sample in &samples {
+            let observation = CaseIGrooveObservation {
+                time_dcs: sample.time,
+                x: sample.x,
+                altitude_relative_ft: m_to_ft(sample.alt),
+                lineup_deg: sample.y.atan2(sample.x).to_degrees(),
+                bank_deg: sample.roll_deg,
+                valid: sample.valid,
+                inbound: sample.x < previous_x,
+                capture_gap_ms: detector
+                    .last_time_dcs
+                    .map_or(0.0, |previous| (sample.time - previous) * 1_000.0),
+            };
+            if detector.observe(observation) == CaseIGrooveUpdate::Confirmed {
+                direct_confirmation = Some(sample.time);
+            }
+            previous_x = sample.x;
+        }
+        let (_, _, replay_entry) = replay_gate_trajectory_and_groove(samples, 0.0, 3.5, false);
+        assert_eq!(
+            direct_confirmation,
+            replay_entry.map(|entry| entry.timestamp_dcs)
+        );
     }
 
     fn gate(timestamp_dcs: f64) -> GateDatum {
@@ -5219,6 +5652,7 @@ mod tests {
                 distance_m: 700.0,
                 gs_deviation_deg: 1.5,
                 lineup_deg: 0.0,
+                track_angle_deg: 0.0,
                 alt_m: 0.0,
                 bank_deg: 0.0,
                 sink_rate_mps: 0.0,
@@ -5228,6 +5662,7 @@ mod tests {
                 distance_m: 690.0,
                 gs_deviation_deg: 1.5,
                 lineup_deg: 0.0,
+                track_angle_deg: 0.0,
                 alt_m: 0.0,
                 bank_deg: 0.0,
                 sink_rate_mps: 0.0,
@@ -5594,6 +6029,7 @@ mod tests {
             distance_m: 700.0,
             gs_deviation_deg: 5.0,
             lineup_deg: 0.0,
+            track_angle_deg: 0.0,
             alt_m: 0.0,
             bank_deg: 0.0,
             sink_rate_mps: 0.0,
@@ -6661,7 +7097,7 @@ mod tests {
             };
             assert!(track.next(&carrier_frame, &plane, None));
         }
-        // Outcome classification is the subject of this regression; stable-axis timing is
+        // Outcome classification is the subject of this regression; Case I roll-out timing is
         // covered independently.
         track.entered_groove = true;
         track.mark_fresh_groove_entry(1.35);
