@@ -4,7 +4,7 @@
 > non corrigés et les corrections qui attendent encore une preuve live. L’état courant et les
 > contrats détaillés vivent dans [AGENTS.md](AGENTS.md) ; les changements terminés vivent dans
 > [CHANGES.md](CHANGES.md). Les récits complets des anciennes sessions de test restent consultables
-> avec `git log`/`git show` et ne sont pas reproduits ici. Dernière purge : 8 septembre 2026.
+> avec `git log`/`git show` et ne sont pas reproduits ici. Dernière purge : 9 septembre 2026.
 
 ## P0 — disponibilité de la note et restitution pilote
 
@@ -16,7 +16,12 @@ rétention du ring, le vieux pattern peut être compacté sans rendre la note in
 contrat additif expose périmètre, couverture, points et fallback. Une séquence source invalide
 isolée n'est plus bloquante si des voisins valides adjacents prouvent un trou `<=300 ms` hors de tout
 bracket de gate ; séries, trous plus longs, gates touchées et bornes indéterminées restent
-bloquants. Ces changements doivent encore être revalidés en mission live avant clôture du chantier.
+bloquants. Le corpus humain propre du 8 septembre confirme que la livraison tardive seule ne rend
+plus la note indisponible : 23 rapports sur 28 restent `available/full` malgré un p95 de livraison
+de 650 à 880 ms et un maximum de 1 030 ms, avec capture continue à 20 Hz et zéro perte lecteur.
+Les cinq autres rapports sont `partial` uniquement faute de confirmation DCS de l'arrêt, jamais à
+cause de la livraison. Les observations source invalides et les autres causes de complétude doivent
+encore être revalidées avant clôture globale du chantier.
 
 Reste à développer :
 
@@ -54,17 +59,14 @@ ou la dernière branche en fallback), conserve ses couleurs AoA et atténue les 
 relier. Le JSON expose le nombre de branches, leur sélection et le nombre atténué. Cette logique de
 rendu ne ferme aucune track et ne modifie ni télémétrie, ni issue, ni grading.
 
-Cas de revalidation dans `.ignore/tests-20260907-3-human` : le PNG de pattern
-`LSO-20260907-220813-Justice-s1788809129-g8-p1001014-c5160-t2891150-pattern.png`. La track contient
-deux circuits hauts sans groove/contact/LQM, puis la finale T&G réellement notée. La track ne doit
-pas être fermée sur ces survols, qui restent indiscernables d’un overhead légitime ; le défaut est
-uniquement graphique.
+La revalidation CATOBAR humaine du 8 septembre est acquise sur 28 captures F-14B(U) propres : huit
+rendus à deux branches, dix-huit à trois branches et deux à cinq branches. La revue visuelle des
+deux cas à cinq branches, ainsi que d'un `GRADE:WO` et de traps avec rollout, confirme que la branche
+finale garde ses couleurs, que les circuits antérieurs sont atténués et qu'aucune liaison parasite
+n'est tracée. Le défaut historique du cas `g8` est donc clos pour CATOBAR/F-14B(U).
 
-Les tests déterministes couvrent déjà le pattern simple, deux survols suivis de la finale et une
-discontinuité temporelle. Reste à revoir visuellement le cas `g8` avec une nouvelle capture, car les
-anciens JSON ne sérialisent pas `pattern_datums`, puis à revalider : `GRADE:WO` et bolter suivis d’un
-nouveau circuit, trap avec rollout, pattern compacté, CATOBAR/V/STOL, overhead et waveoff sans LQM.
-La suppression complète des faux départs sans preuve reste le chantier P0 distinct ci-dessus.
+Restent à revalider : pattern compacté jusqu'à sa limite, V/STOL, overhead et waveoff sans LQM. La
+suppression complète des faux départs sans preuve reste le chantier P0 distinct ci-dessus.
 
 ### Expliquer le retard de livraison bufferisée
 
@@ -157,9 +159,11 @@ corpus puis en mission selon sa portée.
 
 ### Corrections implémentées qui attendent encore une preuve live suffisante
 
-- **Segmentation `GRADE:WO`.** Avec un binaire propre et identifié, obtenir des rapports distincts
-  pour `WO -> WO -> WIRE# 2`, un seul LQM accepté par track, et vérifier que la queue conservée
-  jusqu’au départ ne manque pas le circuit suivant.
+- **Segmentation `GRADE:WO`, cas consécutif restant.** Le corpus propre du 8 septembre valide la
+  fermeture et l'absence de contamination pour `WO -> trois T&G -> WIRE# 2` : chaque tentative a
+  son rapport, le WO et le trap n'acceptent chacun qu'un LQM et les passes intermédiaires sont
+  conservées. Il reste à exercer deux `GRADE:WO` consécutifs avant un trap (`WO -> WO -> WIRE# 2`),
+  seul cas de la séquence déterministe qui n'est pas présent dans ce corpus.
 - **Attribution des observations invalides.** Reproduire une livraison tardive avant/dans/après le
   segment noté et vérifier statut source, séquence, tick, bornes, effet de verdict et absence de faux
   `TimeWentBackwards`. Couvrir en particulier l'erreur isolée dans/hors groove, une série, une gate
@@ -174,9 +178,11 @@ corpus puis en mission selon sa portée.
   `arrest_deceleration_onset_time`, la corrélation via onset et la fenêtre de 1,2 s. Couvrir les
   câbles 1–4, plusieurs pilotes/types, bolter/T&G et absence de LQM ; le replay ACMI ne peuple pas
   `plane.velocity` et ne peut pas valider ce chemin.
-- **Porte 3/4 NM conditionnelle.** Quantifier sur un corpus Case I combien de notes remontent quand
-  la porte précède le roll-out, puis faire revoir humainement les écarts de base/finale pour vérifier
-  que la relaxation ne masque pas une situation dangereuse. V/STOL reste inchangé.
+- **Porte 3/4 NM conditionnelle, revue humaine restante.** Sur le corpus du 8 septembre, 24 des 26
+  entrées en groove surviennent après la porte 3/4 NM ; ces passes restent évaluables et trois
+  obtiennent `(OK)`, ce qui confirme quantitativement que la relaxation évite le blocage automatique.
+  Faire encore revoir humainement les écarts de base/finale pour vérifier qu'elle ne masque pas une
+  situation dangereuse. V/STOL reste inchangé.
 - **Bolter et survol.** Valider le plafond 50 ft, la preuve de contact géométrique à 1,0 m et le
   refus d’un bolter contredit par `GRADE:WO`, notamment sur bolter léger, survol bas et rebond.
 - **Crosse F-14.** Vérifier l’offset vertical `+1,0 m` et le gel de lecture au premier contact sur
@@ -205,8 +211,6 @@ corpus puis en mission selon sa portée.
   requise pour confirmer l’issue.
 - **Mémoire de `DCS_server`.** Refaire une mesure longue sur mission et charge constantes dès le
   démarrage du serveur ; la hausse observée sur une mission dynamique n’est pas attribuable à LSO.
-- **Simultanéité réelle.** Tester deux approches complètes jusqu’à publication simultanée ; seuls
-  des faux départs concurrents ont été observés jusqu’ici.
 - **Cadence adaptative pré-groove.** Décision toujours ouverte. Utiliser `cadence-ab` sur un corpus
   non déjà sous-échantillonné ; une première expérience a invalidé deux portes 3/4 NM. Ne promouvoir
   aucun 100/200 ms sans A/B live.

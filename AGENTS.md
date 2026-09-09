@@ -2,10 +2,11 @@
 
 > Document de continuité, à tenir à jour à chaque changement significatif de code ou de contrat.
 > Dépôt `E:\DCS stuffs\Initiative ESG\DCS-gRPC-lso`, branche `feature/refonte-v3-lua-buffer`.
-> Dernier commit : HEAD `18c12c4` ("Préparation externalisation des variables de config"). Working tree
-> actuellement **non propre** : les tranches sûres du P0 sur la restitution graduée et la couverture
-> des observations source invalides sont implémentées ; le rendu du pattern sépare les circuits antérieurs de la branche
-> finale, en plus du ménage de roadmap courant. La correction de segmentation des waveoffs issue du
+> Dernier commit : HEAD `42ebdecd` ("Ajout d'un exemple de fichier de configuration externe"). Working tree
+> actuellement **non propre** : mise à jour documentaire après analyse du corpus humain du 8 septembre
+> 2026. Les tranches sûres du P0 sur la restitution graduée et la couverture des observations source
+> invalides sont implémentées ; le rendu du pattern sépare les circuits antérieurs de la branche
+> finale. La correction de segmentation des waveoffs issue du
 > second corpus humain F-14B(U) du 7 septembre 2026 est incluse dans HEAD. L'entrée en groove
 > CATOBAR exige
 > un axe réellement
@@ -111,6 +112,20 @@ Sur le working tree courant :
   discontinuité temporelle ; la revue visuelle d’un PNG nominal est propre ; le corpus multi-circuits
   historique ne peut pas être rerendu depuis ses JSON, qui ne sérialisent pas `pattern_datums`.
 
+Le corpus humain `.ignore/tests-20260908-1-humans`, capturé avec le binaire propre au commit
+`42ebdecd499526ef9cbc42d7e7d139d37c388bd4` et les traces `-vv`, contient 28 rapports F-14B(U) de
+deux pilotes : 17 T&G, un bolter, un `GRADE:WO` et neuf traps ou signatures d'arrêt. Les 28 captures
+sont continues à 20 Hz (gap maximum 50 ms), sans observation source invalide ni perte de séquence
+lecteur malgré 81 196 évictions internes du ring. La livraison reste tardive (p95 650-880 ms,
+maximum 1 030 ms), mais 23 rapports restent `available/full`; les cinq `partial` ont exclusivement
+`unconfirmed_arrest`. Le corpus valide la séparation live `GRADE:WO -> trois T&G -> WIRE# 2`, sans
+contamination de LQM entre tracks. Les 28 PNG de pattern comptent 8 cas à deux branches, 18 à trois
+et 2 à cinq ; la revue visuelle des deux cas à cinq branches, du WO et de traps confirme la
+séparation et l'atténuation des circuits antérieurs pour CATOBAR/F-14B(U). Deux WO consécutifs,
+V/STOL, pattern compacté à sa limite, overhead et waveoff sans LQM restent à couvrir. Plusieurs
+paires de tracks des deux pilotes se chevauchent jusqu'à publication, dont deux T&G simultanés et
+un bolter concurrent d'un T&G, sans collision d'artefact ni contamination inter-track observée.
+
 La première session humaine du 7 septembre a été capturée avec un binaire issu d'un working tree dirty au
 commit `b6308bc`, sans `-vv`. Elle fournit le corpus de calibration, mais ne constitue une
 revalidation live ni des changements courants ni de la dernière corrélation de brin par onset. La
@@ -119,8 +134,9 @@ binaire encore déclaré dirty au commit `8e1228a` : six approches réelles ont 
 T&G crosse haute, un bolter, deux `GRADE:WO`, puis un trap DCS `WIRE# 2`). Les deux waveoffs et le
 trap ont été fusionnés dans une seule track parce que le premier LQM n'établissait pas une issue ;
 le correctif inclus dans HEAD traite désormais un `GRADE:WO` matching comme l'issue terminale de
-la tentative et attend le départ géométrique normal pour la fermer. Cette correction reste à revalider live avec
-un binaire propre et identifié. Voir [tasking-roadmap.md](tasking-roadmap.md) pour les autres limites.
+la tentative et attend le départ géométrique normal pour la fermer. Le corpus propre du 8 septembre
+valide cette séparation pour un WO suivi de trois T&G puis d'un trap `WIRE# 2`; deux WO consécutifs
+restent à exercer. Voir [tasking-roadmap.md](tasking-roadmap.md) pour les autres limites.
 
 ## Produit et périmètre métier
 
@@ -319,12 +335,14 @@ Chaque observation sérialise `attribution_basis`, les bornes/les séquences voi
 segment, trou court couvert et trou bloquant. Cette tolérance ne crée ni position ni échantillon de
 trajectoire.
 
-Le second corpus humain F-14B(U) du 7 septembre 2026 confirme une capture source à 20 Hz
+Les corpus humains F-14B(U) des 7 et 8 septembre 2026 confirment une capture source à 20 Hz
 (`capture_gap_max_ms = 50`), sans perte de séquence ni intervalle source manqué sur les quatre
 rapports exportés. Les évictions internes du ring (2 210 à 7 224) n'y correspondent donc à aucune
 perte lecteur. La livraison reste en revanche tardive (p95 690 à 830 ms, maximum 870 à 1 020 ms),
-sans observation invalide dans les segments notés de ce corpus ; la cause et l'effet d'un run sans
-`-vv` restent à isoler dans [tasking-roadmap.md](tasking-roadmap.md).
+sans observation invalide dans les segments notés. Le corpus du 8 septembre confirme à nouveau ce
+découplage sur 28 rapports : aucune perte lecteur malgré 81 196 évictions, p95 de livraison entre
+650 et 880 ms et maximum à 1 030 ms ; la cause et l'effet d'un run sans `-vv` restent à isoler dans
+[tasking-roadmap.md](tasking-roadmap.md).
 Des rotations répétées du watchdog indiquent un producteur silencieux ou un canal gRPC dégradé, pas
 une raison d'augmenter ce délai de 2 s sans mesure préalable.
 
@@ -365,8 +383,10 @@ l'état du code (voir "Règles de vérité" plus haut).
   volé ensuite. Aucune source NATOPS ne fait d'un franchissement de porte fixe une condition de
   qualification. **V/STOL garde la règle historique inconditionnelle** (pas d'entrée en groove
   confirmée par roll-out à laquelle ancrer cette relaxation) ; `lso.exe cadence-ab` aussi (ne
-  rejoue jamais la détection d'entrée en groove). `PROJECT-DERIVED`, non revalidé en mission live —
-  voir [tasking-roadmap.md](tasking-roadmap.md).
+  rejoue jamais la détection d'entrée en groove). `PROJECT-DERIVED` : le corpus humain CATOBAR du
+  8 septembre confirme que 24 entrées sur 26 surviennent après cette porte et restent évaluables,
+  dont trois `(OK)` ; la revue humaine de sécurité des écarts de base/finale reste ouverte dans
+  [tasking-roadmap.md](tasking-roadmap.md).
 - Démarrage à l'intérieur : `Late`, jamais de donnée inventée.
 - Formule au seuil `x` : `ideal_alt = base_alt + x * tan(pente_avion)` ;
   `gs_deg = atan2(observed_alt - ideal_alt, x)` ; `lineup = atan2(écart_latéral, x)` (voir

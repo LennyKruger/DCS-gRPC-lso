@@ -18,6 +18,22 @@ This file records user-visible changes. The crate version remains `0.2.0`; chang
 
 ### Fixed
 
+- Live CATOBAR validation on 8 September 2026 (28 clean-build F-14B(U) reports, two human pilots)
+  confirms the pattern renderer separates and attenuates earlier circuits without spurious joins:
+  8 reports contain two branches, 18 contain three and 2 contain five. The same corpus confirms
+  clean attempt separation for `GRADE:WO -> three T&G -> WIRE# 2`, with one accepted LQM in the
+  waveoff and trap tracks and no cross-track contamination (`src/draw.rs`, `src/track.rs`,
+  `src/tasks/record_recovery.rs`).
+- Live buffered-source validation on that corpus confirms late delivery alone no longer suppresses
+  grading: all 28 reports retain continuous 20 Hz capture (50 ms maximum gap), no invalid source
+  snapshots and no reader sequence loss; 23 are `available/full` despite delivery p95 650-880 ms
+  and a 1,030 ms maximum. The five partial reports are explained solely by unconfirmed arrest, not
+  telemetry delivery (`src/telemetry.rs`, `src/track.rs`).
+- Live concurrency validation on that corpus confirms two human F-14B(U) recoveries can be
+  collected and published concurrently without output collision or cross-track contamination.
+  Multiple overlapping pairs completed, including simultaneous T&G reports and an overlapping
+  bolter/T&G pair (`src/commands/run.rs`, `src/tasks/report_pipeline.rs`).
+
 - `InvalidTelemetry` is now proportional to proven loss of scored-segment coverage. One isolated
   invalid buffered-source sequence is diagnostic when immediately bounded by real valid
   sequence/tick/time anchors within 300 ms and outside every valid gate bracket; consecutive,
