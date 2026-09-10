@@ -242,6 +242,7 @@ fn parse_grading(value: &serde_json::Value) -> Grading {
         return match kind {
             "Bolter" => Grading::Bolter,
             "WaveoffUnknown" => Grading::WaveoffUnknown,
+            "ApproachOnly" => Grading::ApproachOnly,
             _ => Grading::Unknown,
         };
     }

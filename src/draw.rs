@@ -1102,6 +1102,9 @@ fn fmt_gate(gate: Option<&GateDatum>, quality: &GateQuality, vstol: bool) -> Str
             "GS {:+.1}\u{00B0}  LU {:+.1}\u{00B0}",
             g.gs_deviation_deg, g.lineup_deg
         ),
+        None if quality.coverage_source == Some("continuous_trajectory_bracket") => {
+            "COVERED — continuous trajectory".to_string()
+        }
         None if quality.status == GateStatus::Late => "LATE".to_string(),
         None if quality.status == GateStatus::Invalid => {
             if quality.reason.as_deref() == Some("stale_gate_bracket") {

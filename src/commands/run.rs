@@ -312,7 +312,6 @@ async fn run(
     let mut coalition_svc = CoalitionServiceClient::new(channel.clone());
     let group_svc = GroupServiceClient::new(channel.clone());
     let mut unit_svc = UnitServiceClient::new(channel.clone());
-    let mut mission_svc = MissionServiceClient::new(channel.clone());
     let mut mission_client = crate::client::MissionClient::new(channel.clone());
     let mut metadata_client = crate::client::MetadataClient::new(channel.clone());
     let dcs_grpc_version = match metadata_client.get_version().await {
@@ -442,6 +441,7 @@ async fn run(
     // preventing duplicate recordings.
     let active_tasks: RecoveryTaskMap = Arc::new(Mutex::new(RecoveryTaskRegistry::default()));
     let active_priority_planes = Arc::new(ActivePriorityPlanes::default());
+    let event_hub = Arc::new(crate::tasks::event_hub::SessionEventHub::default());
 
     let positions_only = opts.positions_only;
     let discord_webhook = if positions_only {
@@ -466,7 +466,10 @@ async fn run(
     let active_tasks2 = active_tasks.clone();
     let priority_planes = active_priority_planes.clone();
     let baseline_manifest_for_tasks = baseline_manifest.clone();
+    let event_hub_for_tasks = event_hub.clone();
     let session_channel = channel.clone();
+    let event_channel = channel.clone();
+    let detector_channel = channel.clone();
     let session_shutdown = shutdown_handle.clone();
     let dcs_grpc_version = dcs_grpc_version.clone();
     let dcs_grpc_compatibility = dcs_grpc_compatibility.to_string();
@@ -493,7 +496,7 @@ async fn run(
             let record_acmi = record_acmi;
             let hook_sampling = hook_sampling;
             let users = users.clone();
-            let channel = channel.clone();
+            let channel = detector_channel.clone();
             let shutdown_handle = shutdown_handle.clone();
             let session_log = session_log.clone();
             let db = db.clone();
@@ -501,6 +504,7 @@ async fn run(
             let dcs_grpc_compatibility = dcs_grpc_compatibility.clone();
             let active_priority_planes = priority_planes.clone();
             let baseline_manifest = baseline_manifest_for_tasks.clone();
+            let event_hub = event_hub_for_tasks.clone();
             let registry_plane_name = plane_name.clone();
             let registry_carrier_name = carrier_name.clone();
             let handle = tokio::spawn(async move {
@@ -536,6 +540,7 @@ async fn run(
                         suspend_detectors_during_recovery,
                         active_priority_planes,
                         baseline_manifest,
+                        event_hub: (!positions_only).then_some(event_hub),
                     })
                     .await
                 {
@@ -578,129 +583,139 @@ async fn run(
         }
     }
 
-    // listen for birth events to track carriers and planes spawned at a later point in time
-    let mut events = mission_svc
-        .stream_events(crate::client::request_with_deadline(
-            mission::v0::StreamEventsRequest {},
-        ))
-        .await?
-        .into_inner();
-    let tx_events = tx.clone();
+    // One session-level event stream feeds both Birth supervision and every active recovery.
+    // It reconnects in place so a transient event failure cannot tear down position collection.
     let include_ki = opts.include_ki;
     let event_handle = tokio::spawn(async move {
-        let _stream_guard = crate::metrics::RUNTIME_METRICS.stream();
-        while let Some(event) = events.next().await {
-            let event = match event {
-                Ok(stubs::mission::v0::StreamEventsResponse {
-                    event: Some(event), ..
-                }) => event,
-                Ok(_) => continue,
+        let mut reconnect_delay = Duration::from_millis(500);
+        loop {
+            let connection = MissionServiceClient::new(event_channel.clone())
+                .stream_events(crate::client::request_with_deadline(
+                    mission::v0::StreamEventsRequest {},
+                ))
+                .await;
+            let mut events = match connection {
+                Ok(response) => {
+                    event_hub.mark_available();
+                    reconnect_delay = Duration::from_millis(500);
+                    response.into_inner()
+                }
                 Err(err) => {
-                    crate::metrics::RUNTIME_METRICS.observe_queue_depth(
-                        tx_events
-                            .max_capacity()
-                            .saturating_sub(tx_events.capacity())
-                            + 1,
-                    );
-                    tx_events.send(err.into()).await.ok();
-                    return;
+                    let detail = format!("{}: {}", err.code(), err.message());
+                    tracing::warn!(%detail, ?reconnect_delay, "session event stream connection failed");
+                    event_hub.mark_unavailable(detail);
+                    tokio::time::sleep(reconnect_delay).await;
+                    reconnect_delay = (reconnect_delay * 2).min(Duration::from_secs(30));
+                    continue;
                 }
             };
-
-            if let Event::Birth(mission::v0::stream_events_response::BirthEvent {
-                initiator:
-                    Some(common::v0::Initiator {
-                        initiator: Some(common::v0::initiator::Initiator::Unit(unit)),
-                    }),
-                ..
-            }) = event
-            {
-                match check_candidate(&mut unit_svc, &unit, include_ki).await {
-                    Ok(Some(Candidate::Plane(plane_info))) => {
-                        let players = match net_client.get_players().await {
-                            Ok(players) => players,
-                            Err(err) => {
-                                tracing::warn!(
-                                    ?err,
-                                    unit_id = unit.id,
-                                    "UCID/slot snapshot unavailable at birth"
-                                );
-                                Vec::new()
-                            }
-                        };
-                        let plane = plane_candidate(&unit, plane_info, &players, session_id);
-                        planes
-                            .lock()
-                            .expect("planes mutex poisoned")
-                            .insert(unit.name.clone(), plane.clone());
-                        let carrier_snapshot =
-                            carriers.lock().expect("carriers mutex poisoned").clone();
-                        for (carrier_name, carrier) in carrier_snapshot {
-                            spawn_detect_recovery_attempt(
-                                carrier.id,
-                                carrier_name,
-                                carrier.carrier_type,
-                                carrier.carrier_info,
-                                plane.id,
-                                unit.name.clone(),
-                                plane.plane_type.clone(),
-                                plane.plane_info,
-                                plane.pilot_name.clone(),
-                                plane.pilot_kind,
-                                plane.pilot_identity.clone(),
-                                plane.pilot_ucid.clone(),
-                            );
-                        }
-                    }
-                    Ok(Some(Candidate::Carrier(carrier_info))) => {
-                        let carrier = CarrierCandidate {
-                            id: unit.id,
-                            carrier_type: unit.r#type.clone().unwrap_or_default(),
-                            carrier_info,
-                        };
-                        carriers
-                            .lock()
-                            .expect("carriers mutex poisoned")
-                            .insert(unit.name.clone(), carrier.clone());
-                        let plane_snapshot = planes.lock().expect("planes mutex poisoned").clone();
-                        for (plane_name, plane) in plane_snapshot {
-                            spawn_detect_recovery_attempt(
-                                carrier.id,
-                                unit.name.clone(),
-                                carrier.carrier_type.clone(),
-                                carrier.carrier_info,
-                                plane.id,
-                                plane_name,
-                                plane.plane_type,
-                                plane.plane_info,
-                                plane.pilot_name,
-                                plane.pilot_kind,
-                                plane.pilot_identity,
-                                plane.pilot_ucid,
-                            );
-                        }
-                    }
-                    Ok(None) => {}
+            let _stream_guard = crate::metrics::RUNTIME_METRICS.stream();
+            let mut stream_failure = "clean_end_of_stream".to_string();
+            while let Some(response) = events.next().await {
+                let (time, event) = match response {
+                    Ok(stubs::mission::v0::StreamEventsResponse {
+                        time,
+                        event: Some(event),
+                        ..
+                    }) => (time, event),
+                    Ok(_) => continue,
                     Err(err) => {
-                        tracing::error!(
-                            unit_name = %unit.name,
-                            %err,
-                            "ignoring unit due to an error while checking its eligibility",
-                        );
+                        stream_failure = format!("{}: {}", err.code(), err.message());
+                        break;
+                    }
+                };
+                event_hub.publish(time, event.clone());
+
+                if let Event::Birth(mission::v0::stream_events_response::BirthEvent {
+                    initiator:
+                        Some(common::v0::Initiator {
+                            initiator: Some(common::v0::initiator::Initiator::Unit(unit)),
+                        }),
+                    ..
+                }) = event
+                {
+                    match check_candidate(&mut unit_svc, &unit, include_ki).await {
+                        Ok(Some(Candidate::Plane(plane_info))) => {
+                            let players = match net_client.get_players().await {
+                                Ok(players) => players,
+                                Err(err) => {
+                                    tracing::warn!(
+                                        ?err,
+                                        unit_id = unit.id,
+                                        "UCID/slot snapshot unavailable at birth"
+                                    );
+                                    Vec::new()
+                                }
+                            };
+                            let plane = plane_candidate(&unit, plane_info, &players, session_id);
+                            planes
+                                .lock()
+                                .expect("planes mutex poisoned")
+                                .insert(unit.name.clone(), plane.clone());
+                            let carrier_snapshot =
+                                carriers.lock().expect("carriers mutex poisoned").clone();
+                            for (carrier_name, carrier) in carrier_snapshot {
+                                spawn_detect_recovery_attempt(
+                                    carrier.id,
+                                    carrier_name,
+                                    carrier.carrier_type,
+                                    carrier.carrier_info,
+                                    plane.id,
+                                    unit.name.clone(),
+                                    plane.plane_type.clone(),
+                                    plane.plane_info,
+                                    plane.pilot_name.clone(),
+                                    plane.pilot_kind,
+                                    plane.pilot_identity.clone(),
+                                    plane.pilot_ucid.clone(),
+                                );
+                            }
+                        }
+                        Ok(Some(Candidate::Carrier(carrier_info))) => {
+                            let carrier = CarrierCandidate {
+                                id: unit.id,
+                                carrier_type: unit.r#type.clone().unwrap_or_default(),
+                                carrier_info,
+                            };
+                            carriers
+                                .lock()
+                                .expect("carriers mutex poisoned")
+                                .insert(unit.name.clone(), carrier.clone());
+                            let plane_snapshot =
+                                planes.lock().expect("planes mutex poisoned").clone();
+                            for (plane_name, plane) in plane_snapshot {
+                                spawn_detect_recovery_attempt(
+                                    carrier.id,
+                                    unit.name.clone(),
+                                    carrier.carrier_type.clone(),
+                                    carrier.carrier_info,
+                                    plane.id,
+                                    plane_name,
+                                    plane.plane_type,
+                                    plane.plane_info,
+                                    plane.pilot_name,
+                                    plane.pilot_kind,
+                                    plane.pilot_identity,
+                                    plane.pilot_ucid,
+                                );
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            tracing::error!(
+                                unit_name = %unit.name,
+                                %err,
+                                "ignoring unit due to an error while checking its eligibility",
+                            );
+                        }
                     }
                 }
             }
+            tracing::warn!(detail = %stream_failure, ?reconnect_delay, "session event stream ended; reconnecting");
+            event_hub.mark_unavailable(stream_failure);
+            tokio::time::sleep(reconnect_delay).await;
+            reconnect_delay = (reconnect_delay * 2).min(Duration::from_secs(30));
         }
-        crate::metrics::RUNTIME_METRICS.observe_queue_depth(
-            tx_events
-                .max_capacity()
-                .saturating_sub(tx_events.capacity())
-                + 1,
-        );
-        tx_events
-            .send(tonic::Status::aborted("Mission event stream ended").into())
-            .await
-            .ok();
     });
 
     let tx_session = tx.clone();

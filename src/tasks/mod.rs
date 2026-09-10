@@ -10,6 +10,7 @@ use crate::utils::shutdown::ShutdownHandle;
 
 pub mod detect_recovery_attempt;
 pub mod event_correlator;
+pub mod event_hub;
 pub mod position_collector;
 pub mod record_recovery;
 pub mod report_pipeline;
@@ -211,6 +212,7 @@ pub struct TaskParams<'a> {
     pub suspend_detectors_during_recovery: bool,
     pub active_priority_planes: Arc<ActivePriorityPlanes>,
     pub baseline_manifest: Arc<BaselineManifest>,
+    pub event_hub: Option<Arc<event_hub::SessionEventHub>>,
 }
 
 #[cfg(test)]

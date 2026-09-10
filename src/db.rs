@@ -429,7 +429,7 @@ mod tests {
             grade_points: Some(3.0),
             points_awarded: true,
             mission_datetime: "2026-08-26T00:00:00Z".to_string(),
-            outcome: "Qualif Bolter".to_string(),
+            outcome: "Approach only — outcome unknown".to_string(),
             pilot_kind: "human".to_string(),
             carrier_id: 1,
             carrier_name: "CVN".to_string(),
@@ -446,11 +446,11 @@ mod tests {
             wire_dcs: Some(3),
             wire_divergent: false,
             confidence: "high".to_string(),
-            cause: "correlated_touchdown".to_string(),
+            cause: "approach_only_outcome_unknown".to_string(),
             secondary_causes_json: "[\"hook_history_truncated\"]".to_string(),
             grading_version: "project-derived-v1".to_string(),
             wire_estimation_confidence: "high".to_string(),
-            grading_availability: "available".to_string(),
+            grading_availability: "available_approach_only".to_string(),
             assessment_scope: "full".to_string(),
             observed_from_distance_m: Some(1_389.0),
             missing_coverage_json: "[]".to_string(),
@@ -463,7 +463,15 @@ mod tests {
         let passes = db.all_passes().expect("query passes");
 
         assert_eq!(passes.len(), 1);
-        assert_eq!(passes[0].outcome, "Qualif Bolter");
+        assert_eq!(passes[0].outcome, "Approach only — outcome unknown");
+        assert_eq!(
+            passes[0].grading_availability.as_deref(),
+            Some("available_approach_only")
+        );
+        assert_eq!(
+            passes[0].cause.as_deref(),
+            Some("approach_only_outcome_unknown")
+        );
         assert_eq!(passes[0].points_awarded, Some(true));
         assert_eq!(passes[0].intended_spot.as_deref(), Some("7.5"));
         assert_eq!(passes[0].actual_nearest_spot.as_deref(), Some("7.5"));

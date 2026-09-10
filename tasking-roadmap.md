@@ -4,40 +4,35 @@
 > non corrigés et les corrections qui attendent encore une preuve live. L’état courant et les
 > contrats détaillés vivent dans [AGENTS.md](AGENTS.md) ; les changements terminés vivent dans
 > [CHANGES.md](CHANGES.md). Les récits complets des anciennes sessions de test restent consultables
-> avec `git log`/`git show` et ne sont pas reproduits ici. Dernière purge : 9 septembre 2026.
+> avec `git log`/`git show` et ne sont pas reproduits ici. Dernière purge : 10 septembre 2026.
 
 ## P0 — disponibilité de la note et restitution pilote
 
 ### Achever la réduction des `Grading unavailable`
 
-Les tranches locales sur la restitution graduée et la couverture des observations invalides sont
-implémentées : capture et livraison bufferisées sont distinguées, le watchdog tient compte de la
-rétention du ring, le vieux pattern peut être compacté sans rendre la note indisponible, et le
-contrat additif expose périmètre, couverture, points et fallback. Une séquence source invalide
+Les tranches locales sur la restitution graduée, la couverture des observations invalides, les
+gates et la résilience événementielle sont implémentées : capture et livraison bufferisées sont
+distinguées, le watchdog tient compte de la rétention du ring, le vieux pattern peut être compacté
+sans rendre la note indisponible, et le contrat additif expose périmètre, couverture, points et
+fallback. Une séquence source invalide
 isolée n'est plus bloquante si des voisins valides adjacents prouvent un trou `<=300 ms` hors de tout
 bracket de gate ; séries, trous plus longs, gates touchées et bornes indéterminées restent
 bloquants. Le corpus humain propre du 8 septembre confirme que la livraison tardive seule ne rend
 plus la note indisponible : 23 rapports sur 28 restent `available/full` malgré un p95 de livraison
 de 650 à 880 ms et un maximum de 1 030 ms, avec capture continue à 20 Hz et zéro perte lecteur.
 Les cinq autres rapports sont `partial` uniquement faute de confirmation DCS de l'arrêt, jamais à
-cause de la livraison. Les observations source invalides et les autres causes de complétude doivent
-encore être revalidées avant clôture globale du chantier.
+cause de la livraison. Une gate ponctuelle absente peut désormais être remplacée comme preuve de
+couverture par deux échantillons continus valides, inbound, chronologiques et espacés d'au plus
+300 ms ; sa provenance reste visible. `StreamEvents` est partagé au niveau de la session, se
+reconnecte, journalise 512 événements et laisse deux secondes de grâce aux LQM/contacts tardifs.
+Une finale reconnaissable sans issue prouvée devient `approach_only` et conserve sa note et ses
+points si sa couverture est complète ; un faux départ sans groove, gate 1/2 ou 1/4 NM ni événement
+d'issue reste absent des surfaces pilote. Ces changements et les observations source invalides
+doivent encore être revalidés en mission DCS avant clôture globale du chantier.
 
 Reste à développer :
 
-1. **Couverture autour des gates.** Permettre à une trajectoire continue réellement bracketée de
-   prouver la couverture d’une distance requise, au lieu de dépendre exclusivement des trois objets
-   gate. Le bracket de 300 ms reste obligatoire. Une capture réellement tardive produit une
-   évaluation partielle sans points. Corriger le texte « fewer than three gates » lorsque la porte
-   3/4 NM est légitimement exclue parce qu’elle précède l’entrée en groove.
-2. **Résilience événementielle.** Porter `StreamEvents` au niveau session avec reconnexion, petit
-   journal borné par IDs/temps DCS et délai de grâce avant finalisation, afin de ne pas perdre un
-   LQM tardif entre deux tracks. Une approche positionnelle complète doit rester visible si le flux
-   d’événements tombe : issue inconnue et points retenus, pas effacement de l’approche.
-3. **Faux départs et finales sans issue.** Ne pas publier sur les surfaces pilote une tentative sans
-   groove, gate significative ni événement d’issue. Une vraie finale sans issue doit devenir
-   `approach_only`, distincte de l’absence d’approche reconnaissable.
-4. **Phase B de la preuve cinématique d'arrêt.** Ne permettre à une signature cinématique de lever
+1. **Phase B de la preuve cinématique d'arrêt.** Ne permettre à une signature cinématique de lever
    `unconfirmed_arrest` qu’après un corpus live avec vérité indépendante couvrant trap, bolter,
    T&G, waveoff, rebond, disparition et unité gelée. Même promue, elle resterait de confiance
    `medium`, sans brin certain ni bonus de câble. Un grade DCS sans `WIRE#` peut être affiché comme
@@ -92,11 +87,6 @@ rendu une note indisponible sur un autre run.
   entièrement `null` dans `RecoveryReport`. Corriger sa propagation depuis `run.rs`. Décider aussi
   s’il doit être horodaté ou rechargé à chaque nouvelle session DCS pour suivre un changement de
   mission. Ajouter un test de bout en bout jusqu’au JSON.
-- **Référence de vent près du niveau mer.** `GetWind` renvoie de façon intermittente un succès
-  `180°/0,0 m/s` à altitude quasi nulle, tandis que la probe à l’altitude avion reste cohérente.
-  Arbitrer entre rejet explicite de cette sentinelle, plancher d’altitude de requête, ou réutilisation
-  prudente de la probe haute. Confirmer d’abord à une altitude intermédiaire et, si possible,
-  diagnostiquer DCS-gRPC/mission hors de ce dépôt. AoA et vent restent contextuels, jamais notés.
 - **Observabilité des opérations.** Ajouter au niveau INFO la fin de génération, la première
   reconnexion échouée, puis une ligne synthétique par insertion SQLite et publication Discord.
 - **Contrat JSON incohérent.** Uniformiser `datums[].alt` actuellement clampé à zéro et
@@ -159,6 +149,21 @@ corpus puis en mission selon sa portée.
 
 ### Corrections implémentées qui attendent encore une preuve live suffisante
 
+- **Référence de vent près du niveau mer.** Diagnostiqué côté `../DCS-gRPC` (`src/rpc/atmosphere.rs`) :
+  `180°/0,0 m/s` est la traduction fidèle d'un vecteur vent DCS `(0,0)`, pas un bug de calcul du
+  fork ni de LSO — le moteur DCS lui-même renvoie intermittemment un vecteur nul près du niveau de
+  la mer, et cette sortie est mathématiquement indiscernable d'un vrai vent calme (aucun rejet
+  possible à l'aveugle sur la seule valeur). Chaque appel `GetWind` (probe basse d'entrée en
+  groove, requête de fin de tentative) est désormais retenté une seule fois — jamais en boucle —
+  s'il reproduit exactement cette sentinelle. Si la probe basse reste suspecte après retry, la
+  référence AoA réutilise la valeur de la probe haute (restée cohérente sur tout le corpus revu)
+  pour les deux points d'interpolation ; la requête de fin de tentative retombe sur cette même
+  probe haute si elle est encore suspecte après son propre retry. `wind_reference_probes.low`
+  continue toujours d'exposer la lecture brute réellement observée (jamais falsifiée) et
+  `wind_reference_probes.low_reading_overridden_by_high`/`wind_reading_is_groove_entry_fallback`
+  signalent chaque repli dans le JSON. Reste à revalider en mission live qu'une nouvelle occurrence
+  de la sentinelle déclenche bien ce repli (le corpus du 8 septembre, utilisé pour concevoir ce
+  correctif, ne peut pas servir de revalidation puisqu'il l'a précédé).
 - **Segmentation `GRADE:WO`, cas consécutif restant.** Le corpus propre du 8 septembre valide la
   fermeture et l'absence de contamination pour `WO -> trois T&G -> WIRE# 2` : chaque tentative a
   son rapport, le WO et le trap n'acceptent chacun qu'un LQM et les passes intermédiaires sont
