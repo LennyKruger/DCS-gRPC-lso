@@ -48,7 +48,7 @@ struct RecoveryReport<'a> {
     session_id: i64,
     generation: u64,
     grading: &'a Grading,
-    /// Gate-only grade before the AV-8B touchdown-accuracy bonus.
+    /// Approach grade before the AV-8B touchdown-accuracy bonus.
     approach_grade: PassGrade,
     /// Final grade shown on the greenie board.
     pass_grade: PassGrade,
@@ -71,6 +71,9 @@ struct RecoveryReport<'a> {
     /// Continuous groove-to-touchdown GS/lineup series (see `TrajectoryDeviation`), additive
     /// to `gate_deviations`. Empty for a pass that never entered the groove.
     trajectory_deviations: &'a [TrajectoryDeviation],
+    /// Auditable CASE I CATOBAR deviation episodes and correction qualifications. Additive to
+    /// schema-v3 and empty for V/STOL.
+    grading_episodes: &'a [crate::grading::GradingEpisode],
     /// Wind at the carrier's position, queried once at report time (with one bounded retry and a
     /// fallback to the groove-entry high probe if `GetWind` keeps reading DCS's known
     /// `180deg/0.0 m/s` sentinel — see `wind_reading_is_groove_entry_fallback` and
@@ -209,7 +212,8 @@ struct ReportCauses<'a> {
 // pass at NoGrade.
 // v5: lineup inside that window uses a fixed 150 m angular reference and exposes its raw offset
 // in metres, so proximity to the ramp does not silently tighten the lateral threshold.
-const GRADING_VERSION: &str = "project-derived-v5";
+// v7: CASE I CATOBAR evaluates correction from the episode peak with zone-specific deadlines.
+const GRADING_VERSION: &str = "project-derived-v7";
 const GRADING_SOURCE: &str = "PROJECT-DERIVED";
 #[derive(Debug)]
 struct HookPoll {
@@ -1552,6 +1556,7 @@ pub async fn record_recovery(
         dcs_grading: track.dcs_grading.as_deref(),
         gate_deviations: &track.gate_deviations,
         trajectory_deviations: &track.trajectory_deviations,
+        grading_episodes: &track.grading_episodes,
         wind_heading_deg: wind_mps.map(|(heading, _)| heading),
         wind_speed_mps: wind_mps.map(|(_, speed)| speed),
         wind_reading_is_groove_entry_fallback,

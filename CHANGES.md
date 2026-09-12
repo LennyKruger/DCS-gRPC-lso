@@ -5,8 +5,23 @@ This file records user-visible changes. The crate version remains `0.2.0`; chang
 
 ## Unreleased
 
+### Changed
+
+- CASE I CATOBAR grading is versioned `project-derived-v7`: correction quality is measured from
+  the deterministic episode peak, uses START/MIDDLE/IN_CLOSE/RAMP deadlines of 3.0/2.5/1.5/0.75 s,
+  requires two stabilizing samples, and weights corrected severity by the peak zone. AoA trend and
+  reversal analysis uses signed distance to the existing aircraft OnSpeed band. Episode JSON adds
+  peak, delay, stabilization, aggravation, inversion and qualification evidence (`src/grading.rs`,
+  `src/tasks/record_recovery.rs`). All coefficients and correction rules remain PROJECT-DERIVED
+  pending comparison with human-LSO assessments.
+
 ### Added
 
+- Additive schema-v3 `grading_episodes` audit trail records CASE I CATOBAR axis, timing, duration,
+  most severe zone and weight, raw/corrected/effective severity, peak, evolution, return to a lower
+  band, oscillations, correction quality and whether the episode affected the grade. Unreliable
+  AoA remains visible with zero grade effect; V/STOL emits an empty list (`src/grading.rs`,
+  `src/track.rs`, `src/tasks/record_recovery.rs`).
 - Session-level `StreamEvents` hub with in-place reconnect, a 512-event DCS-time journal, exact
   aircraft/carrier correlation and a two-second finalization grace period for late LQM/contact
   events. JSON event correlation reports interruption and reconnection counts
@@ -29,6 +44,13 @@ This file records user-visible changes. The crate version remains `0.2.0`; chang
 
 ### Changed
 
+- CASE I CATOBAR grading is versioned `project-derived-v6` and classifies persistent glideslope,
+  lineup and aircraft-specific AoA episodes by START/MIDDLE/IN_CLOSE/RAMP zone and correction
+  quality. Good/average/poor correction adjusts raw severity by -1/0/+1 before the zone weight;
+  only the worst effective episode decides OK/(OK)/--, so axes are never summed. Existing Cut,
+  `_OK_`, T&G cap, outcome, completeness, wire and V/STOL paths remain separate. All new zones,
+  weights, thresholds and correction rules are PROJECT-DERIVED and await human-LSO validation
+  (`src/grading.rs`, `src/track.rs`, `src/tasks/record_recovery.rs`).
 - Grading is now versioned `project-derived-v5`. Continuous lineup inside the final 150 m uses a
   dedicated 150 m angular reference instead of the vertical 75 m flare reference, so the 1.5°
   late-lineup threshold consistently represents about 3.93 m throughout that window. The raw

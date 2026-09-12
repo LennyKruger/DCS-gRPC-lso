@@ -515,7 +515,7 @@ impl CarrierInfo {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Aoa {
     Fast,
     SlightlyFast,

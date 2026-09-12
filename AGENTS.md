@@ -20,7 +20,9 @@
 > un LQM DCS `GRADE:WO` établit désormais l'issue de la tentative courante afin que son départ ferme
 > la track avant le circuit suivant. La sentinelle vent `180°/0,0 m/s` intermittente de `GetWind`
 > (confirmée venir du moteur DCS, pas du fork) déclenche désormais un retry borné puis un repli sur
-> la probe haute cohérente, pour la référence AoA comme pour la requête de fin de tentative. Crate
+> la probe haute cohérente, pour la référence AoA comme pour la requête de fin de tentative. Le
+> grading CASE I CATOBAR `project-derived-v7` classe les épisodes GS/lineup/AoA par zone,
+> persistance et qualité de correction ; V/STOL et les Cuts de sécurité restent séparés. Crate
 > `lso` 0.2.0,
 > Rust 2021 ; les changements postérieurs au tag `0.2.0` sont sous `Unreleased` dans
 > [CHANGES.md](CHANGES.md).
@@ -109,9 +111,13 @@ Sur le HEAD `e62506d`, qui inclut la correction de segmentation des waveoffs :
 
 Sur le working tree courant :
 
-- `cargo test --locked --no-fail-fast` : **278 réussis, 0 échec** (276 tests du binaire + 2 tests
+- `cargo test --locked --no-fail-fast` : **292 réussis, 0 échec** (290 tests du binaire + 2 tests
   de provenance) ;
 - `cargo fmt --check` et `cargo clippy --locked --all-targets -- -D warnings` propres ;
+- les tests du grading v7 couvrent les quatre zones et leurs délais post-pic, corrections
+  bonne/moyenne/mauvaise, aggravation initiale puis correction rapide récompensée,
+  stagnation/aggravation/oscillation, bruit isolé, axes multiples
+  sans cumul, AoA F/A-18C/F-14/T-45, AoA non fiable sans pénalité et priorité du Cut ;
 - les tests P0 couvrent gate ponctuelle absente mais bracketée par la trajectoire continue à
   `<=300 ms`, refus au-delà, finale `ApproachOnly` avec points conservés, rejeu filtré du journal
   événementiel, LQM tardif et reconnexion explicitement comptée ;
@@ -179,9 +185,10 @@ débrief (JSON, PNG, ACMI, SQLite, Discord, board HTTP).
 - `lso run` live ; `lso file` rejoue seulement un ACMI créé par LSO ; `lso cadence-ab` et
   `lso groove-ab` sont des diagnostics hors-ligne en lecture seule, jamais des rejeux live.
 
-Le grade est un score **PROJECT-DERIVED** `project-derived-v5`, jamais une certification
-USN/USMC. Puissance moteur, mouvement du pont, et auteur réel du waveoff ne sont pas notés. AoA et
-vent sont persistés dans le rapport (contexte uniquement, jamais notés). Sink rate (`sink_rate_mps`)
+Le grade est un score **PROJECT-DERIVED** `project-derived-v7`, jamais une certification
+USN/USMC. Puissance moteur, mouvement du pont, et auteur réel du waveoff ne sont pas notés. L'AoA
+entre dans le classificateur CASE I CATOBAR uniquement quand la référence de vent est établie ; le
+vent reste contextuel. Sink rate (`sink_rate_mps`)
 et gîte (`bank_deg`), calculés depuis la télémétrie continue, restent contexte uniquement sur leur
 amplitude/tendance générale, mais alimentent chacun un Cut dédié en cas d'excès soutenu près du pont
 (voir "Gates, outcomes et câble" plus bas, qui fait foi pour la spécification exacte). Ne pas
@@ -508,24 +515,31 @@ l'état du code (voir "Règles de vérité" plus haut).
   de contact (voir le franchissement de seuil de pont ci-dessus) et est la cause probable la plus
   vraisemblable du biais de -1 brin observé sur l'estimation Rust du câble
   (`Track::wire_estimate_at`, voir [tasking-roadmap.md](tasking-roadmap.md)).
-- Grading v5 (`project-derived-v5`) : en plus des trois gates ponctuelles, la trajectoire continue
-  du groove au touchdown (`trajectory_deviations`) peut dégrader — jamais améliorer — l'amplitude
-  retenue, sous réserve d'un garde de persistance (une seule frame aberrante isolée ne compte plus,
-  il faut au moins 2 échantillons consécutifs au-dessus du seuil ; jamais appliqué au Cut ni à la
-  pondération de fin d'approche, qui restent sensibles à un seul échantillon) ; un facteur de
-  tendance (`TREND_WINDOW_S = 4 s`) plafonne à `(OK)` au lieu de `OK` une passe dont la pente
-  GS/lineup s'aggrave encore d'au moins `TREND_WORSENING_DEG_PER_S = 0,075°/s` sur cette fenêtre ;
-  une détection de surcorrection (NATOPS `OC`, même fenêtre de 4 s) plafonne de la même façon une
-  passe montrant au moins `OSCILLATION_MIN_REVERSALS = 2` inversions de direction d'au moins
-  `OSCILLATION_MIN_SWING_DEG = 0,3°` chacune (écart net proche de zéro mais oscillation réelle,
-  invisible au facteur de tendance seul) ; une pondération temporelle (`LATE_WINDOW_DISTANCE_M =
-  150 m`) plafonne à `--` un écart franchissant `LATE_WINDOW_GS_DEG = 0,8°` ou `LATE_WINDOW_LU_DEG =
-  1,5°` (entre les seuils généraux `*_SLIGHT`/`*_SIGNIFICANT`) dans les 150 derniers mètres avant la
-  coupe. Dans cette fenêtre, le lineup angulaire est normalisé sur
-  `NEAR_TOUCHDOWN_LINEUP_REFERENCE_M = 150 m` : le seuil de 1,5° représente donc toujours environ
-  3,93 m d'écart latéral, au lieu de se resserrer artificiellement à mesure que `x` diminue ;
-  `trajectory_deviations[].lineup_deviation_m` conserve en plus l'écart signé brut. Cette règle
-  n'est jamais appliquée à un `NoGrade`/`Cut` déjà acquis ni au Cut lui-même ; un Cut dédié (seuils
+- Grading v7 (`project-derived-v7`), CASE I CATOBAR uniquement : la trajectoire continue du groove
+  au touchdown est classée séparément sur les axes glideslope, lineup et AoA. Les zones
+  `START` (>1/2 NM), `MIDDLE` (1/2–1/4 NM), `IN_CLOSE` (1/4 NM–150 m) et `RAMP` (<=150 m) portent
+  respectivement les poids abstraits 1,0/1,2/1,5/2,0. Les classes brutes sont GS
+  `<0,5/0,5–1,0/1,0–2,5/>=2,5°`, lineup `<1,0/1,0–2,0/2,0–3,0/>=3,0°` et AoA
+  `OnSpeed/SlightlyFast|SlightlySlow/Fast|Slow`, exclusivement via `AirplaneInfo::aoa_rating` de
+  `src/data.rs`; aucun niveau AoA « extrême » n'existe et l'AoA seule ne produit jamais un Cut.
+  Une anomalie ordinaire isolée est ignorée ; les runs consécutifs non nuls deviennent des
+  `GradingEpisode`. Le pic est le maximum de gravité puis, à égalité, l'erreur normalisée la plus
+  éloignée de la cible ; une égalité complète retient le premier sample. L'analyse commence au pic.
+  Une correction bonne retire un niveau, moyenne conserve le niveau, mauvaise en ajoute un, borné
+  à 0..3. Elle emploie une fenêtre de tendance de 4 s à `0,075°/s`, le franchissement durable d'un
+  niveau dans le délai de la zone du pic (START 3,0 s, MIDDLE 2,5 s, IN CLOSE 1,5 s, RAMP 0,75 s),
+  au moins deux samples stabilisés, et l'oscillation à deux inversions d'au moins 0,3°. Au RAMP,
+  une amélioration non stabilisée avant la fin exploitable est mauvaise. Pour l'AoA, l'erreur signée
+  vaut zéro dans OnSpeed, négative côté Fast et positive côté Slow, avec pour amplitude la distance
+  à la limite OnSpeed la plus proche, exclusivement dérivée de `AirplaneInfo::aoa_rating`. La
+  gravité effective vaut niveau corrigé × poids de la zone du pic ; seul le pire épisode décide, sans
+  somme ni double sanction : `<1,5 => OK`, `<3,0 => (OK)`, sinon `--`. Sans référence AoA fiable,
+  les épisodes AoA restent sérialisés avec `affects_grade=false`, diagnostic explicite et gravité
+  effective nulle. Toutes ces zones, coefficients, bandes et règles de correction sont
+  **PROJECT-DERIVED** et attendent une validation face à des appréciations de LSO humains.
+  La géométrie proche du pont garde `NEAR_TOUCHDOWN_LINEUP_REFERENCE_M = 150 m` et
+  `NEAR_TOUCHDOWN_ANGLE_REFERENCE_M = 75 m`; `trajectory_deviations[].lineup_deviation_m` conserve
+  l'écart signé brut. Indépendamment du classificateur, un Cut dédié (seuils
   `PROJECT-DERIVED`, **non chiffrés par NATOPS** — les deux NATOPS de référence ne codifient
   `TMRD`/`W`/`TMA`/`DLW`/`DRW` que comme codes de commentaire qualitatifs, jamais un nombre)
   sanctionne un sink rate (`SINK_RATE_CUT_MPS = 8.0 m/s`, environ le double du régime nominal de
@@ -554,16 +568,14 @@ l'état du code (voir "Règles de vérité" plus haut).
   attendu près du pont n'explose plus artificiellement. Voir
   [tasking-roadmap.md](tasking-roadmap.md) pour le détail des deux bugs.
 
-**Table de note CATOBAR** (`project-derived-v5`, `PROJECT-DERIVED` sauf mention contraire ;
-`abs(GS)`/`abs(LU)` = pire valeur sur les gates comptées (voir ci-dessus pour la porte 3/4 NM) **et**
-la trajectoire continue) :
+**Table de note CATOBAR** (`project-derived-v7`, classification d'épisodes `PROJECT-DERIVED`) :
 
 | Résultat | Règle | Points |
 |---|---|---:|
-| `_OK_` | `OK` ci-dessous resserré à `abs(GS) <= 0,4/0,3°` (haut/bas) et `abs(LU) <= 0,5°` partout, **et** temps de groove 15-18 s ; jamais pour un touch-and-go | 5.0 |
-| `OK` | gates comptées valides ; `abs(GS) < 0,5°`, `abs(LU) < 1,0°` | 4.0 |
-| `(OK)` | pas d'écart significatif ; `abs(GS) >= 0,5°` ou `abs(LU) >= 1,0°` | 3.0 |
-| `--` | `abs(GS) >= 1,0°` ou `abs(LU) >= 2,0°` | 2.0 |
+| `_OK_` | candidat `OK`, aucun épisode significatif, trajectoire stable, amplitudes strictes `GS +0,4/-0,3°` et `LU 0,5°`, groove 15-18 s ; jamais pour un touch-and-go | 5.0 |
+| `OK` | pire gravité effective `<1,5` | 4.0 |
+| `(OK)` | pire gravité effective de `1,5` inclus à `<3,0` | 3.0 |
+| `--` | pire gravité effective `>=3,0` | 2.0 |
 | `C` | GS strictement sous `-2,5°` à la gate 1/4 NM, ou n'importe où dans la trajectoire continue à 463 m ou en dessous ; ou sink rate soutenu (>=3 échantillons) `>= 8,0 m/s` ou gîte `>= 30°` à l'intérieur de 463 m | 0.0 |
 | `B` | bolter confirmé et gates comptées valides | 2.5 |
 | `WO?` | remise de gaz/go-around neutre, initiateur inconnu | aucun |
@@ -585,9 +597,9 @@ interne ; `cause`/`causes` (voir "Contrats de données") distinguent déjà :
 `causes.secondary` liste le reste. Un consommateur qui a besoin de cette distinction lit déjà
 `cause`/`causes`, jamais le symbole `NC` seul.
 
-CATOBAR conserve les règles projet existantes (`OK`, `(OK)`, `--`, `C`, `B`, `WO?`, `NC`), plus
-désormais `_OK_` automatique (5 septembre 2026, `is_amplitude_perfect`/`grade_from_gates`,
-`src/grading.rs`) : uniquement depuis une passe déjà `Ok` par toutes les règles ci-dessus, si en
+CATOBAR conserve les symboles projet (`OK`, `(OK)`, `--`, `C`, `B`, `WO?`, `NC`) et `_OK_`
+automatique (`is_amplitude_perfect`/`compute_catobar_assessment`, `src/grading.rs`) : uniquement
+depuis une passe déjà `Ok`, sans épisode significatif, si en
 plus (1) chaque porte et chaque échantillon continu reste dans `OK_PERFECT_GS_HIGH_DEG`/
 `OK_PERFECT_GS_LOW_DEG` (+0,4°/-0,3°) et `OK_PERFECT_LU_ABS_DEG` (0,5°) — gardes sans pardon sur les
 portes (preuves déjà validées bracket/skew), avec le même pardon anti-bruit qu'ailleurs
@@ -676,7 +688,10 @@ fiabilité des événements DCS réels côté Tarawa — voir [tasking-roadmap.m
 AoA dans `datums`/`pattern_datums` est corrigé du vent une fois une référence de vent établie
 (deux appels `AtmosphereService.GetWind` à l'entrée du groove, interpolés par altitude), sinon
 retombe sur l'approximation brute (jamais une valeur fabriquée) ; `wind_reference_established`
-enregistre lequel des deux cas s'est produit. Purement diagnostique/contextuel, jamais noté.
+enregistre lequel des deux cas s'est produit. En CASE I CATOBAR, seuls les échantillons issus
+d'une référence établie peuvent affecter le grade via les tables avion de `src/data.rs`. Sans cette
+référence, les épisodes restent diagnostiques (`affects_grade=false`) et n'infligent aucune
+pénalité. V/STOL n'utilise jamais l'AoA pour sa note.
 
 `GetWind` peut renvoyer de façon intermittente un vecteur vent nul (`180°/0,0 m/s`) : confirmé
 provenir du moteur DCS lui-même, pas d'un bug de calcul côté LSO ni du fork (`../DCS-gRPC`,
@@ -995,6 +1010,12 @@ Les ajouts P0 courants sont `Grading::ApproachOnly`,
 `gate_deviations.*_quality.coverage_source = "continuous_trajectory_bracket"`,
 `grading_availability = "available_approach_only"` et les compteurs
 `event_correlation.unavailability_count`/`reconnection_count`. Ils restent additifs au schema-v3.
+`grading_episodes` ajoute au même schema-v3 l'axe, les temps/durée, la zone et son poids, les
+gravités brute/corrigée/effective, le pic (instant, zone, valeur brute, erreur normalisée et
+direction/classe), les délais vers l'amélioration durable et AUCUN, le niveau et le nombre de
+samples stabilisés, l'aggravation postérieure, les inversions, la qualité et la justification
+déterministe de correction, `affects_grade` et le diagnostic éventuel d'AoA non fiable.
+Le tableau est vide pour V/STOL.
 
 SQLite utilise le vocabulaire snake_case du JSON. L'absence d'un nouveau champ signifie
 legacy/unknown, jamais favorable. `points_awarded` (`src/db.rs`, booléen) distingue explicitement

@@ -36,7 +36,7 @@ Reste à développer :
    `unconfirmed_arrest` qu’après un corpus live avec vérité indépendante couvrant trap, bolter,
    T&G, waveoff, rebond, disparition et unité gelée. Même promue, elle resterait de confiance
    `medium`, sans brin certain ni bonus de câble. Un grade DCS sans `WIRE#` peut être affiché comme
-   fallback DCS, jamais transformé en grade ou points `project-derived-v5`.
+   fallback DCS, jamais transformé en grade ou points `project-derived-v7`.
 
 Contraintes communes : ne pas relever les seuils 300/1 000 ms, ne pas interpoler une longue
 coupure, ne pas assimiler les évictions internes du ring à une perte lecteur, et n’accorder aucun
@@ -130,7 +130,15 @@ corpus puis en mission selon sa portée.
   75 m pour le glide, normalise séparément le lineup sur 150 m dans toute la fenêtre tardive et
   sérialise l’écart brut `lineup_deviation_m`. Revalider ce candidat sur une nouvelle mission avec
   vérité LSO et vent nettement différent ; vérifier qu’un vrai écart bref supérieur à environ
-  3,93 m reste bien sanctionné et comparer les verdicts `project-derived-v5` aux commentaires LQM.
+  3,93 m reste bien sanctionné et comparer les verdicts `project-derived-v7` aux commentaires LQM.
+- **Classificateur CASE I CATOBAR v7.** Confronter les zones START/MIDDLE/IN_CLOSE/RAMP, leurs
+  poids 1,0/1,2/1,5/2,0, les bandes GS/lineup/AoA, les délais post-pic 3,0/2,5/1,5/0,75 s, la
+  stabilisation sur deux samples, l'erreur AoA normalisée à OnSpeed, la tendance 4 s à 0,075°/s
+  et l'oscillation 2×0,3° à des
+  appréciations synchronisées de LSO humains sur F/A-18C, F-14 et T-45. Chercher explicitement les
+  corrections récompensées à tort, les épisodes séparés par un bref retour dans la bande neutre,
+  les surcorrections passant par zéro et les égalités entre axes/zones. Aucun coefficient ni seuil
+  de cette version, y compris la remise de gravité -1/0/+1, n'est validé opérationnellement.
 - **Temps de groove et `_OK_`.** Les corpus disponibles donnent des durées tantôt sous 15 s, tantôt
   au-dessus de 18 s, et aucun `_OK_` live. Déterminer si l’entrée physique par roll-out, la géométrie du
   pattern, le type avion ou la fenêtre 15–18 s expliquent cet échec. La fenêtre est `OFFICIAL`, la
@@ -140,13 +148,10 @@ corpus puis en mission selon sa portée.
   samples consécutifs sont trop permissifs. Arbitrer seulement après un corpus avec vérité LSO,
   vents forts et corrections tardives. Vérifier que `dangerous_sink_rate_or_bank` ne s’applique
   jamais à un waveoff/survol sans toucher. La gîte de 30° reste elle aussi à valider.
-- **Persistance et oscillation.** Rejouer les seuils
-  `PERSISTENCE_MIN_CONSECUTIVE_SAMPLES`, `OSCILLATION_MIN_SWING_DEG` et
-  `OSCILLATION_MIN_REVERSALS` sur un corpus live varié pour chercher faux positifs et vrais écarts
-  masqués.
 - **AoA géométrique.** Construire un comparateur ancienne/nouvelle formule pour distinguer le déclin
-  progressif observé dans le groove de l’artefact ponctuel à hauteur de pont. Cela reste un contexte
-  affiché, jamais noté.
+  progressif observé dans le groove de l’artefact ponctuel à hauteur de pont. Le v6 ne pénalise
+  l'AoA que lorsque la référence de vent est établie, mais cette condition ne transforme pas
+  l'estimation géométrique en mesure cockpit : vérifier les faux épisodes par type avant promotion.
 
 ### Corrections implémentées qui attendent encore une preuve live suffisante
 

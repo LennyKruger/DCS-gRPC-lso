@@ -5,8 +5,8 @@ use ultraviolet::{DRotor3, DVec3};
 
 use crate::data::{AirplaneInfo, CarrierInfo, CarrierRecovery};
 use crate::grading::{
-    compute_pass_grade_with_reason, compute_vstol_approach_grade_points,
-    compute_vstol_final_grade_from_points, PassGrade, SpotGrade,
+    compute_catobar_assessment, compute_vstol_approach_grade_points,
+    compute_vstol_final_grade_from_points, CatobarEvidence, GradingEpisode, PassGrade, SpotGrade,
 };
 use crate::telemetry::{
     AlignmentMethod, InvalidSourceObservation, InvalidSourceVerdictEffect,
@@ -1618,7 +1618,8 @@ impl Grading {
 pub struct TrackResult {
     pub pilot_name: String,
     pub grading: Grading,
-    /// Gate-only approach grade before any V/STOL touchdown bonus.
+    /// Approach grade before any V/STOL touchdown bonus. CASE I CATOBAR uses the episode
+    /// classifier; V/STOL retains its gate-average model.
     pub approach_grade: PassGrade,
     /// Final display grade. For CATOBAR this is identical to approach_grade;
     /// for V/STOL it includes the spot-7.5 bonus.
@@ -1634,6 +1635,9 @@ pub struct TrackResult {
     /// `record_recovery.rs`). A short generic placeholder for V/STOL, which does not yet have a
     /// detailed per-gate breakdown of its own.
     pub grade_reason: String,
+    /// Additive schema-v3 audit trail for the PROJECT-DERIVED CASE I CATOBAR classifier.
+    /// Empty for V/STOL and for tracks without a continuous groove trajectory.
+    pub grading_episodes: Vec<GradingEpisode>,
     pub spot_grade: Option<SpotGrade>,
     pub spot_distance_m: Option<f64>,
     pub intended_spot: Option<&'static str>,
@@ -2789,38 +2793,47 @@ impl Track {
         // deliberately reuses the same GS/LU gate tiers, referenced to its 3.0°
         // glide slope, but excludes CATOBAR-only wire/groove bonuses.  AOA is
         // visual information only and is not part of the points calculation.
-        let (approach_grade, approach_points, grade_reason) = if self.carrier_info.is_vstol() {
-            let (grade, points) = compute_vstol_approach_grade_points(
-                &grading,
-                &self.gate_deviations,
-                &self.trajectory_deviations,
-            );
-            // V/STOL does not yet have a detailed per-gate rationale of its own (see
-            // `grade_reason`'s doc comment) -- a short, generic placeholder naming the final
-            // grade is still more useful than an empty field.
-            (
-                grade,
-                points,
-                format!(
-                    "{}: V/STOL approach grade averaged from gate scores.",
-                    grade.label()
-                ),
-            )
-        } else {
-            let (grade, reason) = compute_pass_grade_with_reason(
-                &grading,
-                &self.gate_deviations,
-                &self.trajectory_deviations,
-                groove_time_secs,
-                self.groove_entry_time,
-            );
-            (grade, grade.points(), reason)
-        };
+        let (approach_grade, approach_points, grade_reason, grading_episodes) =
+            if self.carrier_info.is_vstol() {
+                let (grade, points) = compute_vstol_approach_grade_points(
+                    &grading,
+                    &self.gate_deviations,
+                    &self.trajectory_deviations,
+                );
+                // V/STOL does not yet have a detailed per-gate rationale of its own (see
+                // `grade_reason`'s doc comment) -- a short, generic placeholder naming the final
+                // grade is still more useful than an empty field.
+                (
+                    grade,
+                    points,
+                    format!(
+                        "{}: V/STOL approach grade averaged from gate scores.",
+                        grade.label()
+                    ),
+                    Vec::new(),
+                )
+            } else {
+                let assessment = compute_catobar_assessment(CatobarEvidence {
+                    grading: &grading,
+                    gates: &self.gate_deviations,
+                    trajectory: &self.trajectory_deviations,
+                    datums: &self.datums,
+                    plane_info: self.plane_info,
+                    aoa_reliable: self.wind_reference.is_some(),
+                    groove_time_secs,
+                    groove_entry_time: self.groove_entry_time,
+                });
+                (
+                    assessment.grade,
+                    assessment.grade.points(),
+                    assessment.reason,
+                    assessment.episodes,
+                )
+            };
         let spot_grade = self.spot_distance_m.map(SpotGrade::from_distance_m);
 
-        // CATOBAR is intentionally untouched. Only a successfully recovered V/STOL
-        // pass receives the spot-accuracy bonus and is then mapped back to the same
-        // greenie-board labels used by CATOBAR (_OK_/OK/(OK)/--/C).
+        // Only a successfully recovered V/STOL pass receives the spot-accuracy bonus and is then
+        // mapped back to the same greenie-board labels used by CATOBAR (_OK_/OK/(OK)/--/C).
         let (mut pass_grade, mut grade_points) =
             if self.carrier_info.is_vstol() && matches!(&grading, Grading::Recovered { .. }) {
                 match (spot_grade, approach_points) {
@@ -2902,6 +2915,7 @@ impl Track {
             pass_grade,
             grade_points,
             grade_reason,
+            grading_episodes,
             spot_grade,
             spot_distance_m: self.spot_distance_m,
             intended_spot: self.carrier_info.is_vstol().then_some("7.5"),

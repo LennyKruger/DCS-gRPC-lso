@@ -455,48 +455,38 @@ note lisible. Les trois photos ont déjà tranché une question préalable — l
 notable du tout (étape 5) ? — mais une fois cette question réglée, le calcul ne se limite pas à
 "regarder le pire écart parmi les trois photos".
 
-1. **L'amplitude** est jugée sur le pire écart (vertical ou latéral) observé, en combinant les
-   trois photos avec **toute la trajectoire du groove au touchdown** — un écart significatif
-   *entre* deux portes, invisible aux trois photos seules, peut ainsi dégrader la note, mais
-   jamais l'améliorer par rapport à ce que les trois photos indiquaient déjà. Un seul instantané
-   isolé au-dessus du seuil, dans la trajectoire continue, ne suffit pas : il faut qu'au moins
-   deux mesures consécutives confirment l'écart, pour qu'une simple frame de télémétrie aberrante ne
-   pénalise pas à tort une approche par ailleurs propre. Cette exigence ne s'applique jamais à un
-   écart vraiment dangereux tout près du pont (voir `C` (Cut) plus bas) ni à la règle "proximité du
-   pont" du point 3 — ces deux-là restent sensibles au moindre instantané, volontairement.
-2. **La tendance** est ensuite regardée : si l'écart est encore clairement en train de s'aggraver
-   dans les 4 dernières secondes avant le touchdown, la note est plafonnée à `(OK)` même si
-   l'amplitude seule aurait mérité `OK` — c'est l'écho direct de la distinction NATOPS entre
-   `OK` ("écarts raisonnables **avec de bonnes corrections**") et `(OK)` ("écarts raisonnables",
-   sans cette précision). Un pilote qui corrige en oscillant autour de l'axe (un peu à gauche, un
-   peu à droite, un peu à gauche...) peut avoir un écart net proche de zéro sur ces 4 secondes tout
-   en pilotant de façon peu maîtrisée : le programme compte désormais aussi le nombre
-   d'inversions de correction sur cette même fenêtre, et plafonne pareillement à `(OK)` si le
-   pilote a clairement oscillé plutôt que corrigé une fois pour toutes.
-3. **La proximité du pont** est enfin prise en compte : un écart modéré (ni négligeable, ni
-   franchement dangereux) situé dans les 150 derniers mètres avant la coupe plafonne la note à
-   `--` au lieu de `OK`/`(OK)`, parce qu'il ne reste quasiment plus de temps pour le corriger à cet
-   endroit. Le même écart, plus tôt dans l'approche, est noté normalement. Pour le lineup, cette
-   zone garde une échelle fixe : le seuil de 1,5° correspond partout à environ 3,9 m d'écart
-   latéral. La simple proximité du pont ne grossit donc plus artificiellement un petit décalage ;
-   le rapport conserve aussi l'écart réel en mètres afin qu'un LSO puisse contrôler ce diagnostic.
-4. **`_OK_`, la passe parfaite (nouveau, 5 septembre 2026).** Une fois qu'une passe a déjà mérité
-   `OK` par les trois points ci-dessus, le programme regarde s'il ne s'agit pas d'une passe
-   carrément parfaite. Il faut alors, en plus, que **chaque** photo et **chaque** instant de la
-   trajectoire continue soit resté dans une fenêtre encore plus étroite (à peu près deux fois plus
-   stricte que pour `OK` simple — le pardon habituel pour une frame de télémétrie isolée
-   s'applique quand même), **et** que le temps passé dans le groove soit tombé entre 15 et 18
-   secondes, la durée que le manuel officiel décrit pour un groove standard. `_OK_` ne dépend
-   jamais du brin accroché (1, 2, 3 ou 4, ça ne change rien) ni d'un touch-and-go volontaire (qui
-   ne peut jamais l'obtenir, seulement `OK` au mieux) : c'est une note d'approche parfaite, pas une
-   récompense pour un brin en particulier.
+1. **Le programme découpe le groove en quatre zones.** `START` va de la sortie du dernier virage à
+   ½ NM, `MIDDLE` de ½ à ¼ NM, `IN CLOSE` de ¼ NM à 150 m et `RAMP` couvre les 150 derniers mètres.
+   La même erreur compte davantage lorsqu'elle survient tard : les poids sont respectivement
+   1,0, 1,2, 1,5 et 2,0. Ces nombres pondèrent une gravité abstraite ; ils ne multiplient jamais
+   directement les angles mesurés.
+2. **Chaque axe est observé séparément.** La pente, le lineup et l'incidence propre au type d'avion
+   sont rangés dans des bandes « aucune », « petite », « moyenne » ou « grosse ». Une seule mesure
+   anormale isolée est ignorée. Plusieurs mesures consécutives forment un épisode dont le rapport
+   conserve le début, la durée, la zone, le pic, l'évolution et les éventuelles oscillations.
+3. **La correction change la gravité d'un épisode.** Le programme part du pire instant de
+   l'épisode : une aggravation initiale n'annule donc plus une réaction franche qui suit ce pic.
+   Une correction qui franchit durablement une bande dans le délai propre à l'endroit du pic
+   (3 s au START, 2,5 s au MIDDLE, 1,5 s en IN CLOSE, 0,75 s au RAMP) puis se stabilise sur au
+   moins deux mesures retire un niveau. Une correction réelle mais tardive, lente ou incomplète ne
+   change rien. Une stagnation, une aggravation ou des corrections répétées dans les deux sens
+   ajoutent un niveau. Le programme regarde notamment la tendance sur quatre secondes et compte
+   les inversions suffisamment grandes pour ne pas confondre une oscillation avec du petit bruit.
+4. **Seul le pire épisode décide.** La gravité corrigée est multipliée par le poids de sa zone. Les
+   erreurs de plusieurs axes ne sont jamais additionnées, ce qui évite de punir deux fois un même
+   moment de pilotage. Une valeur finale sous 1,5 donne un candidat `OK`, de 1,5 à moins de 3 donne
+   `(OK)`, et 3 ou davantage donne `--`.
+5. **`_OK_`, la passe parfaite.** Elle reste accessible uniquement depuis un candidat `OK` sans
+   épisode significatif, avec une trajectoire stable, les amplitudes strictes déjà exigées et un
+   groove de 15 à 18 secondes. Elle ne dépend jamais du brin accroché et un touch-and-go reste
+   plafonné à `OK`.
 
 | Le résultat de cette analyse | Note | Points |
 |---|---|---:|
 | Approche parfaite (voir point 4) et temps de groove 15-18 s | `_OK_` | 5.0 |
-| Très proche de zéro partout, aucune dégradation en fin de trajectoire | `OK` | 4.0 |
-| Écart modéré, ou trajectoire encore en train de se dégrader en fin d'approche | `(OK)` | 3.0 |
-| Écart important, ou écart modéré trop proche du pont pour être corrigé | `--` | 2.0 |
+| Pire épisode pondéré sous 1,5 | `OK` | 4.0 |
+| Pire épisode pondéré entre 1,5 et moins de 3 | `(OK)` | 3.0 |
+| Pire épisode pondéré à 3 ou davantage | `--` | 2.0 |
 | Très bas et dangereux à la toute dernière photo (¼ NM), ou taux de descente/gîte franchement dangereux et soutenu à ce même endroit | `C` (Cut) | 0.0 |
 | Bolter confirmé (voir étape 6) | `B` | 2.5 |
 | Remise de gaz | `WO?` | pas de points |
@@ -508,17 +498,19 @@ partielle peut donc conserver son appréciation avec la mention « sans points �
 par DCS, un bolter, un touch-and-go ou une remise de gaz restent visibles. Le grade DCS brut peut
 servir de recours clairement étiqueté, mais n'est jamais converti en note ou points du projet.
 
-**Exemple fictif :** pour Wolf 1-1, le pire écart relevé sur toute la trajectoire était 0.4° (à ¾
-NM), la tendance était stable et rien d'anormal ne s'est produit dans les 150 derniers mètres. Le
-programme sort donc **`OK`, 4.0 points** — 0.4° dépasse la fenêtre encore plus étroite exigée pour
-`_OK_`, donc cette passe, déjà très propre, n'atteint pas la perfection.
+**Exemple fictif :** Wolf 1-1 présente un écart moyen de lineup en `IN CLOSE`, puis revient vers
+l'axe mais trop tard pour stabiliser complètement la finale. Cet épisode est déterminant et la
+raison affichée est courte : **`(OK): lineup moyen en IN CLOSE, corrigé tardivement ou
+incomplètement.`**
 
 > Important à savoir : cette grille de seuils reste une règle **du projet**
-> (`PROJECT-DERIVED`, version `project-derived-v5`), pas une reconstruction certifiée de la
+> (`PROJECT-DERIVED`, version `project-derived-v7`), pas une reconstruction certifiée de la
 > doctrine officielle de l'US Navy — le rapport et la documentation technique le rappellent
-> systématiquement. Le vrai LSO humain juge aussi l'AoA, la puissance, l'assiette, le mouvement du
-> pont et bien d'autres dimensions qui ne sont, pour l'instant, ni mesurables de façon fiable ni
-> intégrées au calcul de la note dans ce projet.
+> systématiquement. L'AoA est mesurée comme une distance signée à la bande OnSpeed propre à
+> l'avion. Les zones, délais, coefficients, bandes d'écart, stabilisation minimale, seuils de
+> tendance et d'oscillation et remises de gravité sont des choix
+> du projet et doivent encore être confrontés à des appréciations de LSO humains. Puissance,
+> assiette et mouvement du pont ne sont toujours pas notés.
 
 > **Sur `_OK_` précisément :** le symbole `_OK_` et son sens ("passe parfaite") sont bien officiels
 > (manuel LSO américain, section 11.4.1). La durée de groove 15-18 s citée au point 4 est aussi un
@@ -530,7 +522,7 @@ programme sort donc **`OK`, 4.0 points** — 0.4° dépasse la fenêtre encore p
 > `_OK_` à un brin précis (le brin 3) — ce lien a été délibérément écarté : rien dans les manuels ne
 > justifie qu'un brin précis mérite une meilleure note qu'un autre.
 
-### Le vent et l'incidence (AoA), affichés mais jamais notés
+### Le vent et l'incidence (AoA)
 
 Le rapport contient désormais le vent au moment de l'appontage (direction et vitesse) — purement
 informatif, pour donner du contexte à une déviation (une dérive par vent de travers fort n'a pas le
@@ -547,8 +539,11 @@ vitesse et de l'orientation de l'avion), désormais corrigée du vent une fois c
 début de groove. Ce n'est toujours pas la vraie valeur lue sur l'instrument de bord du cockpit :
 une piste explorée pour la lire directement depuis le modèle 3D de l'avion (le "draw argument") a
 été abandonnée faute de source fiable pour identifier la bonne valeur par type d'avion — voir
-`tasking-roadmap.md`. L'AoA reste affichée à titre informatif uniquement ; elle n'entre jamais dans
-le calcul de la note.
+`tasking-roadmap.md`. Pour une approche CASE I CATOBAR, elle entre maintenant dans les épisodes en
+réutilisant uniquement les bandes déjà connues pour le F/A-18C, le F-14 ou le T-45. Si la référence
+de vent n'a pas pu être établie, l'épisode reste visible dans le JSON mais n'enlève aucun point.
+Il n'existe pas de bande AoA « extrême » dans cette version et l'AoA seule ne peut jamais provoquer
+un Cut. L'AV-8B/Tarawa conserve strictement sa notation antérieure sans AoA.
 
 Le rapport garde aussi, pour chaque instant de la trajectoire continue (étape 4), le taux de
 descente et l'angle de gîte (bank) de l'avion — deux éléments qu'un vrai LSO commente à l'oral (un

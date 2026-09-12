@@ -1,4 +1,5 @@
-use crate::track::{GateDeviations, Grading, TrajectoryDeviation};
+use crate::data::{AirplaneInfo, Aoa};
+use crate::track::{Datum, GateDeviations, Grading, TrajectoryDeviation};
 
 // ---------------------------------------------------------------------------
 // SOURCE: PROJECT-DERIVED grading contract v1.
@@ -94,6 +95,155 @@ const BANK_ANGLE_CUT_DEG: f64 = 30.0;
 /// so a single hard telemetry bump or one noisy frame must never trigger it on its own. Three
 /// consecutive samples is still well under a second at scoring cadence.
 const DANGER_CUT_MIN_CONSECUTIVE_SAMPLES: usize = 3;
+
+/// CASE I CATOBAR episode model. Every threshold, zone boundary, weight and correction rule in
+/// this block is PROJECT-DERIVED and requires comparison with human-LSO assessments before it can
+/// be treated as operationally calibrated.
+const EPISODE_STABLE_SAMPLES: usize = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GradingAxis {
+    Glideslope,
+    Lineup,
+    Aoa,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EpisodeSeverity {
+    None,
+    Small,
+    Medium,
+    Large,
+}
+
+impl EpisodeSeverity {
+    const fn level(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Small => 1,
+            Self::Medium => 2,
+            Self::Large => 3,
+        }
+    }
+
+    const fn from_level(level: u8) -> Self {
+        match level {
+            0 => Self::None,
+            1 => Self::Small,
+            2 => Self::Medium,
+            _ => Self::Large,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApproachZone {
+    Start,
+    Middle,
+    InClose,
+    Ramp,
+}
+
+impl ApproachZone {
+    const fn weight(self) -> f64 {
+        match self {
+            Self::Start => 1.0,
+            Self::Middle => 1.2,
+            Self::InClose => 1.5,
+            Self::Ramp => 2.0,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Start => "START",
+            Self::Middle => "MIDDLE",
+            Self::InClose => "IN CLOSE",
+            Self::Ramp => "RAMP",
+        }
+    }
+
+    const fn good_correction_deadline_s(self) -> f64 {
+        match self {
+            Self::Start => 3.0,
+            Self::Middle => 2.5,
+            Self::InClose => 1.5,
+            Self::Ramp => 0.75,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EpisodeEvolution {
+    TowardTarget,
+    AwayFromTarget,
+    Stagnant,
+    Mixed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CorrectionQuality {
+    Good,
+    Average,
+    Poor,
+    NotAssessed,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct GradingEpisode {
+    pub axis: GradingAxis,
+    pub started_at_dcs: f64,
+    pub ended_at_dcs: f64,
+    pub duration_s: f64,
+    pub most_severe_zone: ApproachZone,
+    pub zone_weight: f64,
+    pub maximum_severity: EpisodeSeverity,
+    pub corrected_severity: EpisodeSeverity,
+    pub effective_severity: f64,
+    pub peak_value: f64,
+    pub peak_normalized_error: f64,
+    pub peak_at_dcs: f64,
+    pub peak_zone: ApproachZone,
+    pub peak_classification: &'static str,
+    pub evolution: EpisodeEvolution,
+    pub returned_to_less_severe_band: bool,
+    pub oscillation_reversals: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_durable_improvement_delay_s: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub return_to_none_delay_s: Option<f64>,
+    pub stabilized_severity: EpisodeSeverity,
+    pub stabilization_samples: usize,
+    pub post_correction_aggravation: bool,
+    pub correction_reason: &'static str,
+    pub correction: CorrectionQuality,
+    pub affects_grade: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CatobarAssessment {
+    pub grade: PassGrade,
+    pub reason: String,
+    pub episodes: Vec<GradingEpisode>,
+}
+
+pub struct CatobarEvidence<'a> {
+    pub grading: &'a Grading,
+    pub gates: &'a GateDeviations,
+    pub trajectory: &'a [TrajectoryDeviation],
+    pub datums: &'a [Datum],
+    pub plane_info: &'a AirplaneInfo,
+    pub aoa_reliable: bool,
+    pub groove_time_secs: Option<f64>,
+    pub groove_entry_time: Option<f64>,
+}
 
 /// `_OK_` ("Okay underline", NAVAIR 00-80T-104 §11.4.1, `OFFICIAL` symbol meaning "Perfect
 /// pass") amplitude tolerance, degrees. The *symbol* and its meaning are official; these
@@ -447,6 +597,65 @@ pub fn compute_vstol_approach_grade_points(
     }
 }
 
+/// Production CASE I CATOBAR assessment. This is the only path that adds aircraft-specific AoA
+/// episodes; callers without trustworthy wind-referenced AoA should pass `false`, which keeps the
+/// episodes auditable while forcing `affects_grade = false` and zero effective severity.
+pub fn compute_catobar_assessment(evidence: CatobarEvidence<'_>) -> CatobarAssessment {
+    let CatobarEvidence {
+        grading,
+        gates,
+        trajectory,
+        datums,
+        plane_info,
+        aoa_reliable,
+        groove_time_secs,
+        groove_entry_time,
+    } = evidence;
+    let (base_grade, base_reason) = compute_pass_grade_with_reason(
+        grading,
+        gates,
+        trajectory,
+        groove_time_secs,
+        groove_entry_time,
+    );
+    let episodes = classify_catobar_episodes(trajectory, datums, Some(plane_info), aoa_reliable);
+    let eligible = !trajectory.is_empty()
+        && gates.all_valid(groove_entry_time)
+        && matches!(
+            grading,
+            Grading::Recovered { .. } | Grading::TouchAndGo { .. } | Grading::ApproachOnly
+        )
+        && base_grade != PassGrade::Cut;
+    if !eligible {
+        return CatobarAssessment {
+            grade: base_grade,
+            reason: base_reason,
+            episodes,
+        };
+    }
+
+    let (episode_grade, episode_reason) = grade_from_episode_set(&episodes);
+    let has_scoring_episode = episodes.iter().any(|episode| episode.affects_grade);
+    let mut grade = episode_grade;
+    let mut reason = episode_reason;
+    if base_grade == PassGrade::Perfect && !has_scoring_episode {
+        grade = PassGrade::Perfect;
+        reason = base_reason;
+    }
+    if matches!(grading, Grading::TouchAndGo { .. }) && grade == PassGrade::Perfect {
+        grade = PassGrade::Ok;
+        reason = "OK: trajectoire parfaite, plafonnée pour un touch-and-go.".to_string();
+    }
+    if matches!(grading, Grading::ApproachOnly) {
+        reason = format!("Approach only (outcome unknown): {reason}");
+    }
+    CatobarAssessment {
+        grade,
+        reason,
+        episodes,
+    }
+}
+
 fn vstol_grade_from_coverage(
     gates: &GateDeviations,
     trajectory: &[TrajectoryDeviation],
@@ -549,6 +758,374 @@ fn grade_gate_values(gs_deviation_deg: f64, lineup_deg: f64, quarter_nm: bool) -
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct AxisObservation {
+    time: f64,
+    distance_m: f64,
+    value: f64,
+    normalized_error: f64,
+    severity: EpisodeSeverity,
+    classification: &'static str,
+}
+
+fn approach_zone(distance_m: f64) -> ApproachZone {
+    if distance_m > crate::track::GATE_HALF_NM {
+        ApproachZone::Start
+    } else if distance_m > crate::track::GATE_QUARTER_NM {
+        ApproachZone::Middle
+    } else if distance_m > LATE_WINDOW_DISTANCE_M {
+        ApproachZone::InClose
+    } else {
+        ApproachZone::Ramp
+    }
+}
+
+fn gs_severity(value: f64) -> EpisodeSeverity {
+    match value.abs() {
+        v if v < 0.5 => EpisodeSeverity::None,
+        v if v < 1.0 => EpisodeSeverity::Small,
+        v if v < 2.5 => EpisodeSeverity::Medium,
+        _ => EpisodeSeverity::Large,
+    }
+}
+
+fn lineup_severity(value: f64) -> EpisodeSeverity {
+    match value.abs() {
+        v if v < 1.0 => EpisodeSeverity::None,
+        v if v < 2.0 => EpisodeSeverity::Small,
+        v if v < 3.0 => EpisodeSeverity::Medium,
+        _ => EpisodeSeverity::Large,
+    }
+}
+
+fn aoa_severity(rating: Aoa) -> EpisodeSeverity {
+    match rating {
+        Aoa::OnSpeed => EpisodeSeverity::None,
+        Aoa::SlightlyFast | Aoa::SlightlySlow => EpisodeSeverity::Small,
+        Aoa::Fast | Aoa::Slow => EpisodeSeverity::Medium,
+    }
+}
+
+/// Signed distance to the nearest edge of the aircraft's existing OnSpeed band. The band is
+/// discovered through `AirplaneInfo::aoa_rating`; no parallel aircraft table or AoA threshold is
+/// introduced here. Negative is Fast, positive is Slow.
+fn normalized_aoa_error(plane: &AirplaneInfo, aoa: f64) -> Option<f64> {
+    let rating = (plane.aoa_rating)(aoa);
+    if rating == Aoa::OnSpeed {
+        return Some(0.0);
+    }
+    let direction = match rating {
+        Aoa::Fast | Aoa::SlightlyFast => 1.0,
+        Aoa::Slow | Aoa::SlightlySlow => -1.0,
+        Aoa::OnSpeed => unreachable!(),
+    };
+    let mut outside = aoa;
+    let mut step = 0.25;
+    let mut inside = None;
+    for _ in 0..32 {
+        let candidate = aoa + direction * step;
+        if (plane.aoa_rating)(candidate) == Aoa::OnSpeed {
+            inside = Some(candidate);
+            break;
+        }
+        outside = candidate;
+        step *= 2.0;
+    }
+    let mut inside = inside?;
+    for _ in 0..48 {
+        let midpoint = (outside + inside) / 2.0;
+        if (plane.aoa_rating)(midpoint) == Aoa::OnSpeed {
+            inside = midpoint;
+        } else {
+            outside = midpoint;
+        }
+    }
+    Some(aoa - inside)
+}
+
+fn build_axis_episodes(
+    axis: GradingAxis,
+    observations: &[AxisObservation],
+    affects_grade: bool,
+    diagnostic: Option<&'static str>,
+) -> Vec<GradingEpisode> {
+    let mut episodes = Vec::new();
+    let mut start = 0;
+    while start < observations.len() {
+        while start < observations.len() && observations[start].severity == EpisodeSeverity::None {
+            start += 1;
+        }
+        if start == observations.len() {
+            break;
+        }
+        let mut end = start;
+        let mut none_run = 0;
+        while end + 1 < observations.len() {
+            end += 1;
+            if observations[end].severity == EpisodeSeverity::None {
+                none_run += 1;
+                if none_run == EPISODE_STABLE_SAMPLES {
+                    break;
+                }
+            } else {
+                none_run = 0;
+            }
+        }
+
+        // A single ordinary anomaly is treated as telemetry/aim-point noise. Safety Cut checks
+        // are evaluated separately before this classifier and deliberately do not use this guard.
+        if end > start
+            && observations[start..=end]
+                .iter()
+                .filter(|s| s.severity != EpisodeSeverity::None)
+                .count()
+                >= PERSISTENCE_MIN_CONSECUTIVE_SAMPLES
+        {
+            let slice = &observations[start..=end];
+            let maximum_severity = slice
+                .iter()
+                .map(|sample| sample.severity)
+                .max()
+                .unwrap_or(EpisodeSeverity::None);
+            // Earliest sample wins a complete tie, making repeated equal maxima deterministic.
+            let (peak_index, peak) = slice
+                .iter()
+                .enumerate()
+                .filter(|(_, sample)| sample.severity == maximum_severity)
+                .max_by(|(left_index, left), (right_index, right)| {
+                    left.normalized_error
+                        .abs()
+                        .total_cmp(&right.normalized_error.abs())
+                        .then_with(|| right_index.cmp(left_index))
+                })
+                .unwrap_or((0, &slice[0]));
+            let peak_value = peak.value;
+            let peak_zone = approach_zone(peak.distance_m);
+            let post_peak = &slice[peak_index..];
+            let reversals = count_reversals(post_peak.iter().map(|sample| sample.normalized_error));
+            let max_level = maximum_severity.level();
+            let duration_s = (slice[slice.len() - 1].time - slice[0].time).max(0.0);
+            let trend_end = post_peak.last().unwrap_or(peak);
+            let trend_start = trend_end.time - TREND_WINDOW_S;
+            let trend_first = post_peak
+                .iter()
+                .find(|sample| sample.time >= trend_start)
+                .unwrap_or(peak);
+            let trend_dt = trend_end.time - trend_first.time;
+            let trend_slope = (trend_dt > 0.0).then(|| {
+                (trend_end.normalized_error.abs() - trend_first.normalized_error.abs()) / trend_dt
+            });
+            let improving_by_trend =
+                trend_slope.is_some_and(|slope| slope <= -TREND_WORSENING_DEG_PER_S);
+            let durable_improvement_index = (1..post_peak.len()).find(|&index| {
+                post_peak[index].severity.level() < max_level
+                    && post_peak[index..]
+                        .iter()
+                        .take(EPISODE_STABLE_SAMPLES)
+                        .filter(|sample| sample.severity.level() < max_level)
+                        .count()
+                        == EPISODE_STABLE_SAMPLES
+            });
+            let first_improvement_s =
+                durable_improvement_index.map(|index| post_peak[index].time - peak.time);
+            let return_to_none_index = (1..post_peak.len()).find(|&index| {
+                post_peak[index..]
+                    .iter()
+                    .take(EPISODE_STABLE_SAMPLES)
+                    .filter(|sample| sample.severity == EpisodeSeverity::None)
+                    .count()
+                    == EPISODE_STABLE_SAMPLES
+            });
+            let return_to_none_s =
+                return_to_none_index.map(|index| post_peak[index].time - peak.time);
+            let stabilization_start = return_to_none_index.or(durable_improvement_index);
+            let (stabilized_severity, stabilization_samples) = stabilization_start.map_or(
+                (post_peak.last().unwrap_or(peak).severity, 0),
+                |index| {
+                    let severity = post_peak[index].severity;
+                    let count = post_peak[index..]
+                        .iter()
+                        .take_while(|sample| sample.severity == severity)
+                        .count();
+                    (severity, count)
+                },
+            );
+            let post_correction_aggravation = stabilization_start.is_some_and(|index| {
+                post_peak[index + stabilization_samples..]
+                    .iter()
+                    .any(|sample| sample.severity.level() > stabilized_severity.level())
+            });
+            let improved = first_improvement_s.is_some() || improving_by_trend;
+            let evolution = if reversals >= OSCILLATION_MIN_REVERSALS || post_correction_aggravation
+            {
+                EpisodeEvolution::Mixed
+            } else if !improved {
+                EpisodeEvolution::AwayFromTarget
+            } else if improved {
+                EpisodeEvolution::TowardTarget
+            } else {
+                EpisodeEvolution::Stagnant
+            };
+            let (correction, correction_reason) = if !affects_grade {
+                (CorrectionQuality::NotAssessed, "aoa_reference_unreliable")
+            } else if reversals >= OSCILLATION_MIN_REVERSALS {
+                (CorrectionQuality::Poor, "repeated_significant_inversions")
+            } else if post_correction_aggravation {
+                (CorrectionQuality::Poor, "aggravation_after_improvement")
+            } else if !improved {
+                (CorrectionQuality::Poor, "no_real_post_peak_improvement")
+            } else if peak_zone == ApproachZone::Ramp
+                && stabilization_samples < EPISODE_STABLE_SAMPLES
+            {
+                (
+                    CorrectionQuality::Poor,
+                    "ramp_correction_not_stabilized_before_trajectory_end",
+                )
+            } else if first_improvement_s
+                .is_some_and(|elapsed| elapsed <= peak_zone.good_correction_deadline_s())
+                && stabilization_samples >= EPISODE_STABLE_SAMPLES
+                && (return_to_none_s.is_some() || stabilized_severity.level() < max_level)
+            {
+                (
+                    CorrectionQuality::Good,
+                    "post_peak_improvement_within_zone_deadline_and_stabilized",
+                )
+            } else {
+                (
+                    CorrectionQuality::Average,
+                    "real_post_peak_improvement_late_incomplete_or_insufficiently_stabilized",
+                )
+            };
+            let corrected_level = match correction {
+                CorrectionQuality::Good => max_level.saturating_sub(1),
+                CorrectionQuality::Average | CorrectionQuality::NotAssessed => max_level,
+                CorrectionQuality::Poor => (max_level + 1).min(3),
+            };
+            let effective_severity = if affects_grade {
+                f64::from(corrected_level) * peak_zone.weight()
+            } else {
+                0.0
+            };
+            episodes.push(GradingEpisode {
+                axis,
+                started_at_dcs: slice[0].time,
+                ended_at_dcs: slice[slice.len() - 1].time,
+                duration_s,
+                most_severe_zone: peak_zone,
+                zone_weight: peak_zone.weight(),
+                maximum_severity,
+                corrected_severity: EpisodeSeverity::from_level(corrected_level),
+                effective_severity,
+                peak_value,
+                peak_normalized_error: peak.normalized_error,
+                peak_at_dcs: peak.time,
+                peak_zone,
+                peak_classification: peak.classification,
+                evolution,
+                returned_to_less_severe_band: first_improvement_s.is_some(),
+                oscillation_reversals: reversals,
+                first_durable_improvement_delay_s: first_improvement_s,
+                return_to_none_delay_s: return_to_none_s,
+                stabilized_severity,
+                stabilization_samples,
+                post_correction_aggravation,
+                correction_reason,
+                correction,
+                affects_grade,
+                diagnostic,
+            });
+        }
+        start = end + 1;
+    }
+    episodes
+}
+
+fn classify_catobar_episodes(
+    trajectory: &[TrajectoryDeviation],
+    datums: &[Datum],
+    plane_info: Option<&AirplaneInfo>,
+    aoa_reliable: bool,
+) -> Vec<GradingEpisode> {
+    let gs = trajectory
+        .iter()
+        .filter(|sample| sample.gs_deviation_deg.is_finite())
+        .map(|sample| AxisObservation {
+            time: sample.timestamp_dcs,
+            distance_m: sample.distance_m,
+            value: sample.gs_deviation_deg,
+            normalized_error: sample.gs_deviation_deg,
+            severity: gs_severity(sample.gs_deviation_deg),
+            classification: if sample.gs_deviation_deg >= 0.0 {
+                "high"
+            } else {
+                "low"
+            },
+        })
+        .collect::<Vec<_>>();
+    let lineup = trajectory
+        .iter()
+        .filter(|sample| sample.lineup_deg.is_finite())
+        .map(|sample| AxisObservation {
+            time: sample.timestamp_dcs,
+            distance_m: sample.distance_m,
+            value: sample.lineup_deg,
+            normalized_error: sample.lineup_deg,
+            severity: lineup_severity(sample.lineup_deg),
+            classification: if sample.lineup_deg >= 0.0 {
+                "right"
+            } else {
+                "left"
+            },
+        })
+        .collect::<Vec<_>>();
+    let mut episodes = build_axis_episodes(GradingAxis::Glideslope, &gs, true, None);
+    episodes.extend(build_axis_episodes(
+        GradingAxis::Lineup,
+        &lineup,
+        true,
+        None,
+    ));
+
+    if let (Some(plane), Some(first), Some(last)) =
+        (plane_info, trajectory.first(), trajectory.last())
+    {
+        let aoa = datums
+            .iter()
+            .filter(|sample| {
+                sample.time >= first.timestamp_dcs
+                    && sample.time <= last.timestamp_dcs
+                    && sample.x > 0.0
+                    && sample.aoa.is_finite()
+            })
+            .filter_map(|sample| {
+                let rating = (plane.aoa_rating)(sample.aoa);
+                Some(AxisObservation {
+                    time: sample.time,
+                    distance_m: sample.x,
+                    value: sample.aoa,
+                    normalized_error: normalized_aoa_error(plane, sample.aoa)?,
+                    severity: aoa_severity(rating),
+                    classification: match rating {
+                        Aoa::Fast => "fast",
+                        Aoa::SlightlyFast => "slightly_fast",
+                        Aoa::OnSpeed => "on_speed",
+                        Aoa::SlightlySlow => "slightly_slow",
+                        Aoa::Slow => "slow",
+                    },
+                })
+            })
+            .collect::<Vec<_>>();
+        episodes.extend(build_axis_episodes(
+            GradingAxis::Aoa,
+            &aoa,
+            aoa_reliable,
+            (!aoa_reliable).then_some("aoa_reference_unavailable_no_grade_effect"),
+        ));
+    }
+    episodes.sort_by(|left, right| left.started_at_dcs.total_cmp(&right.started_at_dcs));
+    episodes
+}
+
 /// `trajectory` is the continuous groove-to-touchdown series (see
 /// `TrajectoryDeviation`); passing `&[]` reproduces the historical
 /// three-gates-only behaviour exactly (all folds below start from the same
@@ -623,43 +1200,60 @@ pub(crate) fn grade_from_gates_with_reason(
         return (PassGrade::Cut, reason);
     }
 
-    // Worst positive (high) and negative (low) GS deviation, and worst lineup, across the
-    // three gates *and* the continuous trajectory. Combining both means a spike between two
-    // gates can no longer be graded better than if a gate had happened to land on it — see
-    // `docs/GRADING_REFERENCE.md`, CATOBAR score. The trajectory side is filtered through
-    // `persistent_trajectory_values` first (A.1 robustness guard): an isolated single-frame
-    // spike above the gates' own bracket/skew-validated evidence never counts on its own.
-    let (persistent_gs, persistent_lu) = persistent_trajectory_values(trajectory);
-    // A 3/4 NM gate that does not count toward completeness (see `three_quarter_counts`) must
-    // not count toward amplitude either -- otherwise a turn-artifact reading would still tank the
-    // grade it was excluded to protect.
+    let episodes = classify_catobar_episodes(trajectory, &[], None, false);
+    let (tier, reason) = if trajectory.is_empty() {
+        // Legacy/offline fallback for schema-v3 reports that contain gates but no continuous
+        // samples. Live CASE I CATOBAR tracks always use the episode classifier below.
+        legacy_gate_only_grade(gates, groove_entry_time)
+    } else {
+        grade_from_episode_set(&episodes)
+    };
+
+    // `_OK_` (NAVAIR 00-80T-104 §11.4.1, "Perfect pass"): only reachable from a pass that has
+    // already cleared every check above and landed on plain `Ok` — this is a strict tightening
+    // of `Ok`, never an alternate path, so trend/oscillation/late-window already vouch for the
+    // approach before this even runs. See `OK_PERFECT_*` for why the amplitude band is
+    // PROJECT-DERIVED (MOOSE Airboss-sourced) while the groove-time window is NATOPS `OFFICIAL`.
+    if tier == PassGrade::Ok
+        && episodes.is_empty()
+        && is_amplitude_perfect(gates, trajectory)
+        && trend_worsening_detail(trajectory).is_none()
+        && oscillation_detail(trajectory).is_none()
+        && groove_time_secs.is_some_and(|t| {
+            (OK_PERFECT_GROOVE_TIME_MIN_S..=OK_PERFECT_GROOVE_TIME_MAX_S).contains(&t)
+        })
+    {
+        (
+            PassGrade::Perfect,
+            format!(
+                "_OK_: textbook pass on every gate and the continuous approach, groove time {:.1} s.",
+                groove_time_secs.unwrap_or_default()
+            ),
+        )
+    } else {
+        (tier, reason)
+    }
+}
+
+fn legacy_gate_only_grade(
+    gates: &GateDeviations,
+    groove_entry_time: Option<f64>,
+) -> (PassGrade, String) {
     let three_quarter = if gates.three_quarter_counts(groove_entry_time) {
         gates.at_three_quarter_nm.as_ref()
     } else {
         None
     };
-    let all_gs: Vec<f64> = [
+    let all_gs = [
         three_quarter.map(|g| g.gs_deviation_deg),
         gates.at_half_nm.as_ref().map(|g| g.gs_deviation_deg),
         gates.at_quarter_nm.as_ref().map(|g| g.gs_deviation_deg),
     ]
     .into_iter()
     .flatten()
-    .chain(persistent_gs)
-    .collect();
-
-    let worst_gs_high = all_gs
-        .iter()
-        .copied()
-        .filter(|&v| v > 0.0)
-        .fold(0.0_f64, f64::max);
-    let worst_gs_low = all_gs
-        .iter()
-        .copied()
-        .filter(|&v| v < 0.0)
-        .fold(0.0_f64, f64::min)
-        .abs();
-
+    .collect::<Vec<_>>();
+    let worst_gs_high = all_gs.iter().copied().fold(0.0_f64, f64::max);
+    let worst_gs_low = all_gs.iter().copied().fold(0.0_f64, f64::min).abs();
     let worst_lu = [
         three_quarter.map(|g| g.lineup_deg.abs()),
         gates.at_half_nm.as_ref().map(|g| g.lineup_deg.abs()),
@@ -667,13 +1261,8 @@ pub(crate) fn grade_from_gates_with_reason(
     ]
     .into_iter()
     .flatten()
-    .chain(persistent_lu)
     .fold(0.0_f64, f64::max);
-
-    // Apply the PROJECT-DERIVED grade tiers.
-    // GS uses the CATOBAR-derived tiers retained for both paths: slight at 0.5°, significant at 1.0°.
-    // Lineup has three tiers: slight (1.0°) → (OK), medium (2.0°) → --, large (3.0°) → --
-    let (mut tier, mut reason) = if worst_gs_high >= GS_SIGNIFICANT {
+    if worst_gs_high >= GS_SIGNIFICANT {
         (
             PassGrade::NoGrade,
             format!("--: glideslope {worst_gs_high:.1}° high — well outside tolerance."),
@@ -707,78 +1296,69 @@ pub(crate) fn grade_from_gates_with_reason(
             PassGrade::OkParentheses,
             format!("(OK): lineup off by {worst_lu:.1}° — OK needs better than {LU_SLIGHT:.1}°."),
         )
-    } else if let Some((axis, _slope)) = trend_worsening_detail(trajectory) {
-        // NATOPS distinguishes OK ("reasonable deviations with good corrections") from (OK)
-        // ("fair — reasonable deviations") precisely on whether corrections were good, not on
-        // amplitude alone (see docs/GRADING_REFERENCE.md, "Continuous trajectory"). Deviations
-        // are already within OK margins at this point; a trajectory that is still measurably
-        // worsening this close to touchdown cannot claim "good corrections", so it is capped at
-        // (OK) instead. Trend is deliberately never used to raise a grade the amplitude rules
-        // already placed below Ok — only to hold Ok back when it would otherwise be granted.
-        (
-            PassGrade::OkParentheses,
-            format!(
-                "(OK): within tolerance, but {axis} kept getting worse over the last few seconds instead of being corrected."
-            ),
-        )
-    } else if let Some((axis, reversals)) = oscillation_detail(trajectory) {
-        // A.4 (NATOPS `OC` — overcontrolled): `trend_worsening` only sees the *net* slope
-        // between the start and end of the window, so a pilot correcting back and forth
-        // (+0.5°/-0.5°/+0.5°...) can show a near-zero net slope while still exhibiting exactly
-        // the alternating, over-controlled piloting NATOPS penalizes. Counting direction
-        // reversals instead catches that shape. Same downgrade-only contract as the trend
-        // check: never raises a grade, only holds Ok back.
-        (
-            PassGrade::OkParentheses,
-            format!(
-                "(OK): within tolerance, but {axis} swung back and forth {reversals} times instead of settling down."
-            ),
-        )
     } else {
         (
             PassGrade::Ok,
             "OK: within tolerance on every gate and the continuous approach.".to_string(),
         )
-    };
-
-    // A.3: weight the last moments before the ramp more heavily. Rather than reweighting
-    // worst_gs_high/worst_gs_low/worst_lu above (which would also rescale the three named
-    // gates and complicate every existing threshold), this is a separate, narrower,
-    // downgrade-only check: a deviation that would only ever earn (OK) elsewhere in the
-    // approach is treated as NoGrade if it happens inside LATE_WINDOW_DISTANCE_M, where there
-    // is no distance left to correct it. It never raises a grade, and never touches Cut or an
-    // already-NoGrade result. See docs/GRADING_REFERENCE.md, "Late-approach weighting".
-    if matches!(tier, PassGrade::Ok | PassGrade::OkParentheses) {
-        if let Some((axis, value, distance_m)) = late_window_detail(trajectory) {
-            tier = PassGrade::NoGrade;
-            reason = format!(
-                "--: {axis} off by {:.1}° in the final {LATE_WINDOW_DISTANCE_M:.0} m before the ramp ({distance_m:.0} m out) — too close in to still correct.",
-                value.abs()
-            );
-        }
     }
+}
 
-    // `_OK_` (NAVAIR 00-80T-104 §11.4.1, "Perfect pass"): only reachable from a pass that has
-    // already cleared every check above and landed on plain `Ok` — this is a strict tightening
-    // of `Ok`, never an alternate path, so trend/oscillation/late-window already vouch for the
-    // approach before this even runs. See `OK_PERFECT_*` for why the amplitude band is
-    // PROJECT-DERIVED (MOOSE Airboss-sourced) while the groove-time window is NATOPS `OFFICIAL`.
-    if tier == PassGrade::Ok
-        && is_amplitude_perfect(gates, trajectory)
-        && groove_time_secs.is_some_and(|t| {
-            (OK_PERFECT_GROOVE_TIME_MIN_S..=OK_PERFECT_GROOVE_TIME_MAX_S).contains(&t)
+fn grade_from_episode_set(episodes: &[GradingEpisode]) -> (PassGrade, String) {
+    let Some(worst) = episodes
+        .iter()
+        .filter(|episode| episode.affects_grade)
+        .max_by(|left, right| {
+            left.effective_severity
+                .total_cmp(&right.effective_severity)
+                .then_with(|| left.maximum_severity.cmp(&right.maximum_severity))
         })
-    {
-        (
-            PassGrade::Perfect,
-            format!(
-                "_OK_: textbook pass on every gate and the continuous approach, groove time {:.1} s.",
-                groove_time_secs.unwrap_or_default()
-            ),
-        )
+    else {
+        return (
+            PassGrade::Ok,
+            "OK: trajectoire stable, sans épisode significatif.".to_string(),
+        );
+    };
+    let grade = if worst.effective_severity < 1.5 {
+        PassGrade::Ok
+    } else if worst.effective_severity < 3.0 {
+        PassGrade::OkParentheses
     } else {
-        (tier, reason)
-    }
+        PassGrade::NoGrade
+    };
+    (grade, episode_reason(grade, worst))
+}
+
+fn episode_reason(grade: PassGrade, episode: &GradingEpisode) -> String {
+    let axis = match episode.axis {
+        GradingAxis::Glideslope => "écart de pente".to_string(),
+        GradingAxis::Lineup => "lineup".to_string(),
+        GradingAxis::Aoa => format!(
+            "AoA {}",
+            match episode.peak_classification {
+                "fast" | "slightly_fast" => "rapide",
+                "slow" | "slightly_slow" => "lent",
+                _ => "hors vitesse",
+            }
+        ),
+    };
+    let severity = match episode.maximum_severity {
+        EpisodeSeverity::None => "nul",
+        EpisodeSeverity::Small => "léger",
+        EpisodeSeverity::Medium => "moyen",
+        EpisodeSeverity::Large => "gros",
+    };
+    let correction = match episode.correction {
+        CorrectionQuality::Good => "corrigé rapidement après le pic et stabilisé",
+        CorrectionQuality::Average => "correction réelle après le pic, mais tardive ou incomplète",
+        CorrectionQuality::Poor => "sans retour stable vers la cible après le pic",
+        CorrectionQuality::NotAssessed => "conservé à titre diagnostique",
+    };
+    format!(
+        "{}: {axis} {severity} en {}, {correction}.",
+        grade.label(),
+        episode.most_severe_zone.label()
+    )
 }
 
 /// Whether every gate and every continuous-trajectory sample stayed inside the `_OK_` tolerance
@@ -817,26 +1397,6 @@ fn is_amplitude_perfect(gates: &GateDeviations, trajectory: &[TrajectoryDeviatio
         .any(|&keep| keep)
 }
 
-/// Whether any continuous trajectory sample inside `LATE_WINDOW_DISTANCE_M` of touchdown
-/// crossed the (stricter) late-window GS/lineup thresholds, and which axis/value/distance did so
-/// -- used to build a plain-language reason (see `grade_from_gates_with_reason`).
-/// Checks GS before lineup, matching the order the original boolean OR evaluated them in; when
-/// both axes trip on the same sample this only reports one, which is fine for a short summary.
-fn late_window_detail(trajectory: &[TrajectoryDeviation]) -> Option<(&'static str, f64, f64)> {
-    trajectory
-        .iter()
-        .filter(|d| d.distance_m <= LATE_WINDOW_DISTANCE_M)
-        .find_map(|d| {
-            if d.gs_deviation_deg.abs() >= LATE_WINDOW_GS_DEG {
-                Some(("glideslope", d.gs_deviation_deg, d.distance_m))
-            } else if d.lineup_deg.abs() >= LATE_WINDOW_LU_DEG {
-                Some(("lineup", d.lineup_deg, d.distance_m))
-            } else {
-                None
-            }
-        })
-}
-
 /// Whether GS or lineup deviation was clearly getting worse, not better, in the final
 /// `TREND_WINDOW_S` seconds of the recorded trajectory, and which axis/slope did so. A simple
 /// two-point slope of the deviation's absolute value over that window, as prescribed by A.2 of
@@ -867,40 +1427,6 @@ fn trend_worsening_detail(trajectory: &[TrajectoryDeviation]) -> Option<(&'stati
     } else {
         None
     }
-}
-
-/// A.1 robustness guard (see `PERSISTENCE_MIN_CONSECUTIVE_SAMPLES`): splits the continuous
-/// trajectory into its GS and (signed) lineup deviation series, and drops any sample whose
-/// exceedance of its own `*_SLIGHT` threshold is not confirmed by
-/// `PERSISTENCE_MIN_CONSECUTIVE_SAMPLES` consecutive samples in the same direction. Samples
-/// already inside tolerance are always kept (there is nothing to confirm). Returns the two
-/// filtered series ready to fold into `worst_gs_high`/`worst_gs_low`/`worst_lu` alongside the
-/// three gates.
-fn persistent_trajectory_values(trajectory: &[TrajectoryDeviation]) -> (Vec<f64>, Vec<f64>) {
-    let gs_elevated: Vec<bool> = trajectory
-        .iter()
-        .map(|d| d.gs_deviation_deg >= GS_SLIGHT_HIGH || d.gs_deviation_deg <= -GS_SLIGHT_LOW)
-        .collect();
-    let lu_elevated: Vec<bool> = trajectory
-        .iter()
-        .map(|d| d.lineup_deg.abs() >= LU_SLIGHT)
-        .collect();
-    let gs_keep = persistent_mask(&gs_elevated, PERSISTENCE_MIN_CONSECUTIVE_SAMPLES);
-    let lu_keep = persistent_mask(&lu_elevated, PERSISTENCE_MIN_CONSECUTIVE_SAMPLES);
-
-    let gs = trajectory
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| !gs_elevated[*i] || gs_keep[*i])
-        .map(|(_, d)| d.gs_deviation_deg)
-        .collect();
-    let lu = trajectory
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| !lu_elevated[*i] || lu_keep[*i])
-        .map(|(_, d)| d.lineup_deg.abs())
-        .collect();
-    (gs, lu)
 }
 
 /// For each run of consecutive `true` values in `elevated`, marks the whole run `true` in the
@@ -1281,14 +1807,12 @@ mod tests {
     }
 
     #[test]
-    fn continuous_series_can_only_worsen_never_improve_the_grade() {
-        // A trajectory sample milder than the worst gate must never pull the grade back up.
+    fn continuous_series_is_the_catobar_episode_source_when_present() {
+        // Gates remain coverage evidence, but their duplicate amplitude is not double-counted
+        // once the continuous CASE I trajectory is available to build episodes.
         let g = gates_deg(1.2, 0.0, 0.0, 0.0, 0.0, 0.0);
         let trajectory = [trajectory_point(700.0, 0.1, 0.0)];
-        assert_eq!(
-            grade_from_gates(&g, &trajectory, None, None),
-            grade_from_gates(&g, &[], None, None)
-        );
+        assert_eq!(grade_from_gates(&g, &trajectory, None, None), PassGrade::Ok);
     }
 
     #[test]
@@ -1408,7 +1932,7 @@ mod tests {
     }
 
     #[test]
-    fn worsening_trend_caps_an_otherwise_ok_pass_at_ok_parentheses() {
+    fn worsening_inside_the_none_band_does_not_create_an_episode() {
         // Pass B from the design discussion: nickel at the start, drifting to worse (but still
         // within OK amplitude margins) by the end. NATOPS reserves OK for "reasonable deviations
         // WITH GOOD CORRECTIONS" -- a trajectory that is still getting worse this close to
@@ -1419,10 +1943,7 @@ mod tests {
             trajectory_point_at(0.0, 900.0, 0.05, 0.0),
             trajectory_point_at(4.0, 500.0, 0.45, 0.0),
         ];
-        assert_eq!(
-            grade_from_gates(&g, &trajectory, None, None),
-            PassGrade::OkParentheses
-        );
+        assert_eq!(grade_from_gates(&g, &trajectory, None, None), PassGrade::Ok);
     }
 
     #[test]
@@ -1451,7 +1972,7 @@ mod tests {
     }
 
     #[test]
-    fn windowing_prevents_a_long_clean_history_from_masking_a_recent_worsening_trend() {
+    fn worsening_inside_the_none_band_remains_noise_even_in_the_last_four_seconds() {
         // Clean from groove entry (t=0) through t=17, then a real worsening drift in the final
         // 4 s (t=17 -> t=21). Comparing only the true first and last samples of the whole
         // approach would dilute this recent drift into an unremarkable 0.35/21 =~ 0.017 deg/s
@@ -1462,14 +1983,11 @@ mod tests {
             trajectory_point_at(17.0, 700.0, 0.05, 0.0),
             trajectory_point_at(21.0, 500.0, 0.40, 0.0),
         ];
-        assert_eq!(
-            grade_from_gates(&g, &trajectory, None, None),
-            PassGrade::OkParentheses
-        );
+        assert_eq!(grade_from_gates(&g, &trajectory, None, None), PassGrade::Ok);
     }
 
     #[test]
-    fn worsening_trend_never_downgrades_a_pass_already_below_ok() {
+    fn gate_amplitude_is_not_double_counted_when_continuous_evidence_exists() {
         // Trend is only ever checked at the Ok/(OK) boundary; a pass already at (OK) or worse
         // from amplitude alone is not pushed down an additional tier by a worsening trend.
         let g = gates_deg(0.6, 0.0, 0.0, 0.0, 0.0, 0.0);
@@ -1477,10 +1995,7 @@ mod tests {
             trajectory_point_at(0.0, 900.0, 0.05, 0.0),
             trajectory_point_at(4.0, 500.0, 0.45, 0.0),
         ];
-        assert_eq!(
-            grade_from_gates(&g, &trajectory, None, None),
-            PassGrade::OkParentheses
-        );
+        assert_eq!(grade_from_gates(&g, &trajectory, None, None), PassGrade::Ok);
     }
 
     #[test]
@@ -1500,10 +2015,10 @@ mod tests {
         // entirely. Two direction reversals within `OSCILLATION_WINDOW_S` is enough to flag it.
         let g = gates_deg(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         let trajectory = [
-            trajectory_point_at(0.0, 900.0, 0.4, 0.0),
-            trajectory_point_at(1.0, 800.0, -0.4, 0.0),
-            trajectory_point_at(2.0, 700.0, 0.4, 0.0),
-            trajectory_point_at(3.0, 600.0, -0.4, 0.0),
+            trajectory_point_at(0.0, 900.0, 0.6, 0.0),
+            trajectory_point_at(1.0, 800.0, -0.6, 0.0),
+            trajectory_point_at(2.0, 700.0, 0.6, 0.0),
+            trajectory_point_at(3.0, 600.0, -0.6, 0.0),
         ];
         assert_eq!(
             grade_from_gates(&g, &trajectory, None, None),
@@ -1545,7 +2060,10 @@ mod tests {
         // alone would only ever grant (OK) here. Happening at 100 m -- inside
         // LATE_WINDOW_DISTANCE_M, with no room left to correct -- caps it at NoGrade instead.
         let g = gates_deg(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-        let trajectory = [trajectory_point(100.0, 0.9, 0.0)];
+        let trajectory = [
+            trajectory_point(110.0, 0.9, 0.0),
+            trajectory_point(100.0, 0.9, 0.0),
+        ];
         assert_eq!(
             grade_from_gates(&g, &trajectory, None, None),
             PassGrade::NoGrade
@@ -1557,7 +2075,10 @@ mod tests {
         // Same logic, lineup axis: 1.6 deg is above LATE_WINDOW_LU_DEG (1.5) but below
         // LU_MEDIUM (2.0).
         let g = gates_deg(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-        let trajectory = [trajectory_point(100.0, 0.0, 1.6)];
+        let trajectory = [
+            trajectory_point(110.0, 0.0, 1.6),
+            trajectory_point(100.0, 0.0, 1.6),
+        ];
         assert_eq!(
             grade_from_gates(&g, &trajectory, None, None),
             PassGrade::NoGrade
@@ -1583,7 +2104,7 @@ mod tests {
     }
 
     #[test]
-    fn late_window_below_its_own_threshold_does_not_downgrade() {
+    fn ramp_weight_applies_to_every_nonzero_episode_tier() {
         // 0.6 deg at 100 m crosses the general GS_SLIGHT_HIGH tier ((OK)) but not the stricter
         // LATE_WINDOW_GS_DEG (0.8) -- the late-window check must not fire on every deviation
         // found close to the ramp, only ones that cross its own, stricter threshold. Two
@@ -1595,7 +2116,7 @@ mod tests {
         ];
         assert_eq!(
             grade_from_gates(&g, &trajectory, None, None),
-            PassGrade::OkParentheses
+            PassGrade::NoGrade
         );
     }
 
@@ -1604,7 +2125,10 @@ mod tests {
         // A pass already at NoGrade from amplitude alone is not further affected; the
         // late-window check only ever holds back Ok/(OK), like trend does for Ok alone.
         let g = gates_deg(1.2, 0.0, 0.0, 0.0, 0.0, 0.0);
-        let trajectory = [trajectory_point(100.0, 0.9, 0.0)];
+        let trajectory = [
+            trajectory_point(110.0, 1.2, 0.0),
+            trajectory_point(100.0, 1.2, 0.0),
+        ];
         assert_eq!(
             grade_from_gates(&g, &trajectory, None, None),
             PassGrade::NoGrade
@@ -2153,12 +2677,15 @@ mod tests {
     fn reason_nograde_from_late_window() {
         // LATE_WINDOW_LU_DEG = 1.5, LATE_WINDOW_DISTANCE_M = 150.
         let g = gates_deg(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-        let trajectory = [trajectory_point(100.0, 0.0, 1.6)];
+        let trajectory = [
+            trajectory_point(110.0, 0.0, 1.6),
+            trajectory_point(100.0, 0.0, 1.6),
+        ];
         let (grade, reason) = grade_from_gates_with_reason(&g, &trajectory, None, None);
         assert_eq!(grade, PassGrade::NoGrade);
         assert_eq!(
             reason,
-            "--: lineup off by 1.6° in the final 150 m before the ramp (100 m out) — too close in to still correct."
+            "--: lineup léger en RAMP, sans retour stable vers la cible après le pic."
         );
     }
 
@@ -2175,7 +2702,7 @@ mod tests {
     }
 
     #[test]
-    fn reason_okparentheses_from_trend_worsening() {
+    fn reason_does_not_invent_an_episode_inside_the_none_band() {
         let g = gates_deg(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         // TREND_WORSENING_DEG_PER_S = 0.075, over TREND_WINDOW_S = 4s: 0.0 -> 0.4 deg lineup.
         let trajectory = [
@@ -2183,11 +2710,8 @@ mod tests {
             trajectory_point_at(4.0, 250.0, 0.0, 0.4),
         ];
         let (grade, reason) = grade_from_gates_with_reason(&g, &trajectory, None, None);
-        assert_eq!(grade, PassGrade::OkParentheses);
-        assert_eq!(
-            reason,
-            "(OK): within tolerance, but lineup kept getting worse over the last few seconds instead of being corrected."
-        );
+        assert_eq!(grade, PassGrade::Ok);
+        assert_eq!(reason, "OK: trajectoire stable, sans épisode significatif.");
     }
 
     #[test]
@@ -2195,16 +2719,16 @@ mod tests {
         let g = gates_deg(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         // OSCILLATION_MIN_REVERSALS = 2, OSCILLATION_MIN_SWING_DEG = 0.3.
         let trajectory = [
-            trajectory_point_at(0.0, 300.0, 0.0, 0.4),
-            trajectory_point_at(1.0, 280.0, 0.0, -0.4),
-            trajectory_point_at(2.0, 260.0, 0.0, 0.4),
-            trajectory_point_at(3.0, 240.0, 0.0, -0.4),
+            trajectory_point_at(0.0, 300.0, 0.0, 1.2),
+            trajectory_point_at(1.0, 280.0, 0.0, -1.2),
+            trajectory_point_at(2.0, 260.0, 0.0, 1.2),
+            trajectory_point_at(3.0, 240.0, 0.0, -1.2),
         ];
         let (grade, reason) = grade_from_gates_with_reason(&g, &trajectory, None, None);
-        assert_eq!(grade, PassGrade::OkParentheses);
+        assert_eq!(grade, PassGrade::NoGrade);
         assert_eq!(
             reason,
-            "(OK): within tolerance, but lineup swung back and forth 2 times instead of settling down."
+            "--: lineup léger en IN CLOSE, sans retour stable vers la cible après le pic."
         );
     }
 
@@ -2280,5 +2804,382 @@ mod tests {
             reason,
             "Grading unavailable: required gate coverage was not captured in valid chronological brackets. A positioning/detection limitation, not a pilot failure."
         );
+    }
+
+    fn observations(
+        values: &[(f64, f64, f64)],
+        severity: fn(f64) -> EpisodeSeverity,
+    ) -> Vec<AxisObservation> {
+        values
+            .iter()
+            .map(|&(time, distance_m, value)| AxisObservation {
+                time,
+                distance_m,
+                value,
+                normalized_error: value,
+                severity: severity(value),
+                classification: if value >= 0.0 { "positive" } else { "negative" },
+            })
+            .collect()
+    }
+
+    #[test]
+    fn identical_small_error_is_weighted_in_each_of_the_four_zones() {
+        let cases = [
+            (1_100.0, ApproachZone::Start, 2.0),
+            (700.0, ApproachZone::Middle, 2.4),
+            (300.0, ApproachZone::InClose, 3.0),
+            (100.0, ApproachZone::Ramp, 4.0),
+        ];
+        for (distance, zone, effective) in cases {
+            let samples = observations(
+                &[(0.0, distance, 0.6), (1.0, distance - 1.0, 0.6)],
+                gs_severity,
+            );
+            let episodes = build_axis_episodes(GradingAxis::Glideslope, &samples, true, None);
+            assert_eq!(episodes.len(), 1);
+            assert_eq!(episodes[0].most_severe_zone, zone);
+            assert!((episodes[0].effective_severity - effective).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn good_average_and_poor_corrections_adjust_one_level_only() {
+        let good = observations(
+            &[
+                (0.0, 1_200.0, 1.2),
+                (0.5, 1_150.0, 0.8),
+                (1.0, 1_100.0, 0.2),
+                (1.5, 1_050.0, 0.1),
+            ],
+            gs_severity,
+        );
+        let average = observations(
+            &[
+                (0.0, 1_200.0, 1.2),
+                (3.1, 1_100.0, 0.8),
+                (4.0, 1_050.0, 0.2),
+                (5.0, 1_000.0, 0.1),
+            ],
+            gs_severity,
+        );
+        let poor = observations(
+            &[
+                (0.0, 1_200.0, 1.2),
+                (1.0, 1_100.0, 1.2),
+                (2.0, 1_000.0, 1.2),
+            ],
+            gs_severity,
+        );
+        let episode = |samples: &[AxisObservation]| {
+            build_axis_episodes(GradingAxis::Glideslope, samples, true, None).remove(0)
+        };
+        let good = episode(&good);
+        let average = episode(&average);
+        let poor = episode(&poor);
+        assert_eq!(good.correction, CorrectionQuality::Good);
+        assert_eq!(good.corrected_severity, EpisodeSeverity::Small);
+        assert_eq!(grade_from_episode_set(&[good]).0, PassGrade::Ok);
+        assert_eq!(average.correction, CorrectionQuality::Average);
+        assert_eq!(average.corrected_severity, EpisodeSeverity::Medium);
+        assert_eq!(
+            grade_from_episode_set(&[average]).0,
+            PassGrade::OkParentheses
+        );
+        assert_eq!(poor.correction, CorrectionQuality::Poor);
+        assert_eq!(poor.corrected_severity, EpisodeSeverity::Large);
+        assert_eq!(grade_from_episode_set(&[poor]).0, PassGrade::NoGrade);
+    }
+
+    #[test]
+    fn stagnation_aggravation_and_oscillation_are_poor_corrections() {
+        let cases = [
+            observations(&[(0.0, 1_200.0, 0.6), (1.0, 1_100.0, 0.6)], gs_severity),
+            observations(&[(0.0, 1_200.0, 0.6), (1.0, 1_100.0, 1.2)], gs_severity),
+            observations(
+                &[
+                    (0.0, 1_200.0, 0.6),
+                    (1.0, 1_100.0, -0.6),
+                    (2.0, 1_000.0, 0.6),
+                    (3.0, 950.0, -0.6),
+                ],
+                gs_severity,
+            ),
+        ];
+        for samples in cases {
+            let episode =
+                build_axis_episodes(GradingAxis::Glideslope, &samples, true, None).remove(0);
+            assert_eq!(episode.correction, CorrectionQuality::Poor);
+        }
+    }
+
+    #[test]
+    fn isolated_noise_is_ignored_and_multiple_axes_are_not_summed() {
+        let isolated = observations(&[(0.0, 1_200.0, 1.2)], gs_severity);
+        assert!(build_axis_episodes(GradingAxis::Glideslope, &isolated, true, None).is_empty());
+
+        let gs = observations(&[(0.0, 1_200.0, 0.6), (1.0, 1_100.0, 0.6)], gs_severity);
+        let lu = observations(&[(0.0, 1_200.0, 1.2), (1.0, 1_100.0, 1.2)], lineup_severity);
+        let mut episodes = build_axis_episodes(GradingAxis::Glideslope, &gs, true, None);
+        episodes.extend(build_axis_episodes(GradingAxis::Lineup, &lu, true, None));
+        assert_eq!(
+            grade_from_episode_set(&episodes).0,
+            PassGrade::OkParentheses
+        );
+    }
+
+    #[test]
+    fn aircraft_specific_aoa_tables_feed_episodes_and_unreliable_aoa_never_penalizes() {
+        let trajectory = [
+            trajectory_point_at(0.0, 1_200.0, 0.0, 0.0),
+            trajectory_point_at(2.0, 1_000.0, 0.0, 0.0),
+        ];
+        for (aircraft, aoa) in [("FA-18C_hornet", 7.0), ("F-14B", 10.0), ("T-45", 6.2)] {
+            let datums = [
+                Datum {
+                    time: 0.0,
+                    x: 1_200.0,
+                    aoa,
+                    ..Datum::default()
+                },
+                Datum {
+                    time: 1.0,
+                    x: 1_100.0,
+                    aoa,
+                    ..Datum::default()
+                },
+            ];
+            let plane = AirplaneInfo::by_type(aircraft).unwrap();
+            let episodes = classify_catobar_episodes(&trajectory, &datums, Some(plane), true);
+            let aoa_episode = episodes
+                .iter()
+                .find(|episode| episode.axis == GradingAxis::Aoa)
+                .unwrap();
+            assert_eq!(aoa_episode.maximum_severity, EpisodeSeverity::Small);
+            assert!(aoa_episode.affects_grade);
+
+            let diagnostic = classify_catobar_episodes(&trajectory, &datums, Some(plane), false);
+            let aoa_episode = diagnostic
+                .iter()
+                .find(|episode| episode.axis == GradingAxis::Aoa)
+                .unwrap();
+            assert!(!aoa_episode.affects_grade);
+            assert_eq!(aoa_episode.effective_severity, 0.0);
+            assert_eq!(grade_from_episode_set(&diagnostic).0, PassGrade::Ok);
+        }
+    }
+
+    #[test]
+    fn safety_cut_remains_prioritary_and_cannot_be_corrected_away() {
+        let gates = gates_deg(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let trajectory = [trajectory_point_at(0.0, 300.0, -2.6, 0.0)];
+        let grading = Grading::Recovered {
+            cable: Some(3),
+            cable_estimated: None,
+        };
+        let assessment = compute_catobar_assessment(CatobarEvidence {
+            grading: &grading,
+            gates: &gates,
+            trajectory: &trajectory,
+            datums: &[],
+            plane_info: AirplaneInfo::by_type("FA-18C_hornet").unwrap(),
+            aoa_reliable: false,
+            groove_time_secs: Some(16.0),
+            groove_entry_time: None,
+        });
+        assert_eq!(assessment.grade, PassGrade::Cut);
+    }
+
+    #[test]
+    fn production_catobar_path_preserves_perfect_tg_bolter_and_waveoff_outcomes() {
+        let gates = gates_deg(0.1, 0.1, 0.1, 0.1, 0.1, 0.1);
+        let trajectory = [
+            trajectory_point_at(0.0, 1_100.0, 0.1, 0.1),
+            trajectory_point_at(1.0, 900.0, 0.1, 0.1),
+        ];
+        let plane = AirplaneInfo::by_type("FA-18C_hornet").unwrap();
+        let assess = |grading: &Grading| {
+            compute_catobar_assessment(CatobarEvidence {
+                grading,
+                gates: &gates,
+                trajectory: &trajectory,
+                datums: &[],
+                plane_info: plane,
+                aoa_reliable: false,
+                groove_time_secs: Some(16.0),
+                groove_entry_time: None,
+            })
+            .grade
+        };
+        assert_eq!(
+            assess(&Grading::Recovered {
+                cable: Some(3),
+                cable_estimated: None,
+            }),
+            PassGrade::Perfect
+        );
+        assert_eq!(
+            assess(&Grading::TouchAndGo {
+                cable_estimated: None,
+            }),
+            PassGrade::Ok
+        );
+        assert_eq!(assess(&Grading::Bolter), PassGrade::Bolter);
+        assert_eq!(assess(&Grading::WaveoffUnknown), PassGrade::WaveoffUnknown);
+    }
+
+    #[test]
+    fn episode_json_is_additive_and_auditable() {
+        let samples = observations(&[(0.0, 700.0, 1.2), (0.1, 690.0, 1.2)], gs_severity);
+        let episode = build_axis_episodes(GradingAxis::Glideslope, &samples, true, None).remove(0);
+        let json = serde_json::to_value(episode).unwrap();
+        assert_eq!(json["axis"], "glideslope");
+        assert_eq!(json["most_severe_zone"], "middle");
+        assert_eq!(json["correction"], "poor");
+        assert_eq!(json["affects_grade"], true);
+        assert!(json.get("effective_severity").is_some());
+        assert!(json.get("peak_classification").is_some());
+        assert!(json.get("peak_at_dcs").is_some());
+        assert!(json.get("peak_zone").is_some());
+        assert!(json.get("peak_normalized_error").is_some());
+        assert!(json.get("stabilization_samples").is_some());
+        assert!(json.get("correction_reason").is_some());
+    }
+
+    #[test]
+    fn initial_aggravation_can_be_good_when_post_peak_recovery_is_fast_and_stable() {
+        let samples = observations(
+            &[
+                (0.0, 1_200.0, 0.6),
+                (0.5, 1_150.0, 1.4),
+                (1.0, 1_100.0, 0.8),
+                (1.5, 1_050.0, 0.2),
+                (2.0, 1_000.0, 0.1),
+            ],
+            gs_severity,
+        );
+        let episode = build_axis_episodes(GradingAxis::Glideslope, &samples, true, None).remove(0);
+        assert_eq!(episode.peak_at_dcs, 0.5);
+        assert_eq!(episode.correction, CorrectionQuality::Good);
+        assert_eq!(episode.first_durable_improvement_delay_s, Some(0.5));
+        assert_eq!(episode.return_to_none_delay_s, Some(1.0));
+    }
+
+    #[test]
+    fn zone_deadlines_are_measured_from_the_peak() {
+        for (distance, deadline) in [(1_100.0, 3.0), (700.0, 2.5), (300.0, 1.5), (100.0, 0.75)] {
+            let good = observations(
+                &[
+                    (0.0, distance, 1.2),
+                    (deadline, distance - 1.0, 0.8),
+                    (deadline + 0.1, distance - 2.0, 0.8),
+                ],
+                gs_severity,
+            );
+            assert_eq!(
+                build_axis_episodes(GradingAxis::Glideslope, &good, true, None)[0].correction,
+                CorrectionQuality::Good
+            );
+            let late = observations(
+                &[
+                    (0.0, distance, 1.2),
+                    (deadline + 0.01, distance - 1.0, 0.8),
+                    (deadline + 0.11, distance - 2.0, 0.8),
+                ],
+                gs_severity,
+            );
+            assert_eq!(
+                build_axis_episodes(GradingAxis::Glideslope, &late, true, None)[0].correction,
+                CorrectionQuality::Average
+            );
+        }
+    }
+
+    #[test]
+    fn peak_zone_not_later_completion_zone_sets_weight_but_later_higher_peak_replaces_it() {
+        let corrected_across_zone = observations(
+            &[(0.0, 500.0, 1.2), (0.5, 450.0, 0.8), (1.0, 400.0, 0.8)],
+            gs_severity,
+        );
+        let episode =
+            build_axis_episodes(GradingAxis::Glideslope, &corrected_across_zone, true, None)[0]
+                .clone();
+        assert_eq!(episode.peak_zone, ApproachZone::Middle);
+        assert_eq!(episode.zone_weight, 1.2);
+
+        let later_peak = observations(
+            &[(0.0, 500.0, 1.2), (0.5, 400.0, 1.8), (1.0, 350.0, 0.8)],
+            gs_severity,
+        );
+        assert_eq!(
+            build_axis_episodes(GradingAxis::Glideslope, &later_peak, true, None)[0].peak_zone,
+            ApproachZone::InClose
+        );
+    }
+
+    #[test]
+    fn isolated_reversal_is_average_but_two_significant_reversals_are_poor() {
+        let one = observations(
+            &[(0.0, 700.0, 1.4), (0.5, 650.0, 0.8), (1.0, 600.0, 1.2)],
+            gs_severity,
+        );
+        assert_eq!(
+            build_axis_episodes(GradingAxis::Glideslope, &one, true, None)[0].correction,
+            CorrectionQuality::Average
+        );
+        let two = observations(
+            &[
+                (0.0, 700.0, 1.4),
+                (0.5, 650.0, 0.8),
+                (1.0, 600.0, 1.2),
+                (1.5, 550.0, 0.8),
+            ],
+            gs_severity,
+        );
+        let episode = &build_axis_episodes(GradingAxis::Glideslope, &two, true, None)[0];
+        assert!(episode.oscillation_reversals >= 2);
+        assert_eq!(episode.correction, CorrectionQuality::Poor);
+    }
+
+    #[test]
+    fn ramp_requires_post_peak_stabilization_before_the_trajectory_ends() {
+        let insufficient = observations(&[(0.0, 100.0, 1.2), (0.5, 80.0, 0.8)], gs_severity);
+        assert_eq!(
+            build_axis_episodes(GradingAxis::Glideslope, &insufficient, true, None)[0].correction,
+            CorrectionQuality::Poor
+        );
+        let complete = observations(
+            &[(0.0, 100.0, 1.2), (0.5, 80.0, 0.8), (0.6, 70.0, 0.8)],
+            gs_severity,
+        );
+        assert_eq!(
+            build_axis_episodes(GradingAxis::Glideslope, &complete, true, None)[0].correction,
+            CorrectionQuality::Good
+        );
+    }
+
+    #[test]
+    fn aoa_normalization_tracks_fast_and_slow_toward_each_existing_onspeed_table() {
+        for aircraft in ["FA-18C_hornet", "F-14B", "T-45"] {
+            let plane = AirplaneInfo::by_type(aircraft).unwrap();
+            let mut fast = None;
+            let mut slow = None;
+            for step in -400..=400 {
+                let aoa = f64::from(step) / 10.0;
+                match (plane.aoa_rating)(aoa) {
+                    Aoa::SlightlyFast => fast = Some(aoa),
+                    Aoa::SlightlySlow if slow.is_none() => slow = Some(aoa),
+                    _ => {}
+                }
+            }
+            let fast = fast.unwrap();
+            let slow = slow.unwrap();
+            assert!(normalized_aoa_error(plane, fast).unwrap() < 0.0);
+            assert!(normalized_aoa_error(plane, slow).unwrap() > 0.0);
+            let toward_fast = normalized_aoa_error(plane, fast + 0.1).unwrap().abs();
+            let toward_slow = normalized_aoa_error(plane, slow - 0.1).unwrap().abs();
+            assert!(toward_fast < normalized_aoa_error(plane, fast).unwrap().abs());
+            assert!(toward_slow < normalized_aoa_error(plane, slow).unwrap().abs());
+        }
     }
 }
