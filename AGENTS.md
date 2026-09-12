@@ -109,7 +109,7 @@ Sur le HEAD `e62506d`, qui inclut la correction de segmentation des waveoffs :
 
 Sur le working tree courant :
 
-- `cargo test --locked --no-fail-fast` : **277 réussis, 0 échec** (275 tests du binaire + 2 tests
+- `cargo test --locked --no-fail-fast` : **278 réussis, 0 échec** (276 tests du binaire + 2 tests
   de provenance) ;
 - `cargo fmt --check` et `cargo clippy --locked --all-targets -- -D warnings` propres ;
 - les tests P0 couvrent gate ponctuelle absente mais bracketée par la trajectoire continue à
@@ -119,6 +119,8 @@ Sur le working tree courant :
   lineup/route/corrections imparfaits, durée de roll-out insuffisante ou suffisante, outbound, gap
   `>300 ms`, retour du temps source, faux initial/break/vent arrière/straight-in, waveoff puis
   nouvelle branche, V/STOL inchangé et parité du détecteur pur avec `groove-ab` ;
+- la géométrie lineup près du pont couvre une sévérité latérale constante dans les 150 derniers
+  mètres, l'exposition de l'écart brut et le maintien de la sanction d'un vrai écart de 5 m ;
 - la segmentation pure du pattern couvre un circuit simple, deux survols suivis de la finale et une
   discontinuité temporelle ; la revue visuelle d’un PNG nominal est propre ; le corpus multi-circuits
   historique ne peut pas être rerendu depuis ses JSON, qui ne sérialisent pas `pattern_datums` ;
@@ -138,6 +140,11 @@ séparation et l'atténuation des circuits antérieurs pour CATOBAR/F-14B(U). De
 V/STOL, pattern compacté à sa limite, overhead et waveoff sans LQM restent à couvrir. Plusieurs
 paires de tracks des deux pilotes se chevauchent jusqu'à publication, dont deux T&G simultanés et
 un bolter concurrent d'un T&G, sans collision d'artefact ni contamination inter-track observée.
+La reconstruction de l'écart latéral brut depuis les trajectoires sérialisées identifie 320
+échantillons répartis sur 12 rapports qui franchissaient `LATE_WINDOW_LU_DEG = 1,5°` uniquement
+parce que le dénominateur tombait de 150 à 75 m ; ils restent sous le seuil lorsque la même
+sévérité de 3,93 m est conservée sur toute la fenêtre. Cette analyse calibre le correctif logiciel,
+mais sa comparaison à une nouvelle vérité LSO en mission reste ouverte.
 
 Le rejeu hors ligne `groove-ab` du détecteur Case I courant sur les 12 + 4 + 28 JSON humains des
 7 et 8 septembre retrouve une entrée sur les 44 rapports ; 20 de ces roll-outs restent à bâbord du
@@ -172,7 +179,7 @@ débrief (JSON, PNG, ACMI, SQLite, Discord, board HTTP).
 - `lso run` live ; `lso file` rejoue seulement un ACMI créé par LSO ; `lso cadence-ab` et
   `lso groove-ab` sont des diagnostics hors-ligne en lecture seule, jamais des rejeux live.
 
-Le grade est un score **PROJECT-DERIVED** `project-derived-v4`, jamais une certification
+Le grade est un score **PROJECT-DERIVED** `project-derived-v5`, jamais une certification
 USN/USMC. Puissance moteur, mouvement du pont, et auteur réel du waveoff ne sont pas notés. AoA et
 vent sont persistés dans le rapport (contexte uniquement, jamais notés). Sink rate (`sink_rate_mps`)
 et gîte (`bank_deg`), calculés depuis la télémétrie continue, restent contexte uniquement sur leur
@@ -501,7 +508,7 @@ l'état du code (voir "Règles de vérité" plus haut).
   de contact (voir le franchissement de seuil de pont ci-dessus) et est la cause probable la plus
   vraisemblable du biais de -1 brin observé sur l'estimation Rust du câble
   (`Track::wire_estimate_at`, voir [tasking-roadmap.md](tasking-roadmap.md)).
-- Grading v4 (`project-derived-v4`) : en plus des trois gates ponctuelles, la trajectoire continue
+- Grading v5 (`project-derived-v5`) : en plus des trois gates ponctuelles, la trajectoire continue
   du groove au touchdown (`trajectory_deviations`) peut dégrader — jamais améliorer — l'amplitude
   retenue, sous réserve d'un garde de persistance (une seule frame aberrante isolée ne compte plus,
   il faut au moins 2 échantillons consécutifs au-dessus du seuil ; jamais appliqué au Cut ni à la
@@ -514,7 +521,11 @@ l'état du code (voir "Règles de vérité" plus haut).
   invisible au facteur de tendance seul) ; une pondération temporelle (`LATE_WINDOW_DISTANCE_M =
   150 m`) plafonne à `--` un écart franchissant `LATE_WINDOW_GS_DEG = 0,8°` ou `LATE_WINDOW_LU_DEG =
   1,5°` (entre les seuils généraux `*_SLIGHT`/`*_SIGNIFICANT`) dans les 150 derniers mètres avant la
-  coupe, jamais appliqué à un `NoGrade`/`Cut` déjà acquis ni au Cut lui-même ; un Cut dédié (seuils
+  coupe. Dans cette fenêtre, le lineup angulaire est normalisé sur
+  `NEAR_TOUCHDOWN_LINEUP_REFERENCE_M = 150 m` : le seuil de 1,5° représente donc toujours environ
+  3,93 m d'écart latéral, au lieu de se resserrer artificiellement à mesure que `x` diminue ;
+  `trajectory_deviations[].lineup_deviation_m` conserve en plus l'écart signé brut. Cette règle
+  n'est jamais appliquée à un `NoGrade`/`Cut` déjà acquis ni au Cut lui-même ; un Cut dédié (seuils
   `PROJECT-DERIVED`, **non chiffrés par NATOPS** — les deux NATOPS de référence ne codifient
   `TMRD`/`W`/`TMA`/`DLW`/`DRW` que comme codes de commentaire qualitatifs, jamais un nombre)
   sanctionne un sink rate (`SINK_RATE_CUT_MPS = 8.0 m/s`, environ le double du régime nominal de
@@ -526,8 +537,8 @@ l'état du code (voir "Règles de vérité" plus haut).
   aussi `alt_m`/`bank_deg`/`sink_rate_mps` en contexte sur
   le reste de leur amplitude/tendance (non notée en dehors de ce Cut). Un échantillon n'est plus
   poussé sous
-  `TRAJECTORY_MIN_DISTANCE_M` (3 m, `src/track.rs`) : `gs_deviation_deg`/`lineup_deg` sont
-  `atan2(écart_m, x)`, et sous ce plancher un flare réaliste de quelques décimètres produisait un
+  `TRAJECTORY_MIN_DISTANCE_M` (3 m, `src/track.rs`) : les angles sont issus d'un `atan2` entre
+  l'écart et une distance de référence bornée, et sous ce plancher un flare réaliste produisait un
   angle de plusieurs dizaines de degrés sans signification géométrique (bug confirmé live le 5
   septembre 2026, corrigé le même jour). Au-dessus de ce plancher mais en dessous de
   `NEAR_TOUCHDOWN_ANGLE_REFERENCE_M` (75 m, ajouté le 5 septembre 2026 suite à un second test live
@@ -536,13 +547,14 @@ l'état du code (voir "Règles de vérité" plus haut).
   second test, appontages propres comme Cut) grossissait mécaniquement jusqu'à des dizaines de
   degrés dans les derniers mètres, faisant retomber à `NoGrade` deux passes par ailleurs
   irréprochables — dont une notée `_OK_` par DCS lui-même. Corrigé en substituant cette distance de
-  référence fixe à `x` dans le calcul d'angle une fois `x` sous ce seuil
+  référence fixe à `x` dans le calcul vertical une fois `x` sous ce seuil
   (`trajectory_deviation_angles_deg`, partagée par `Track::next` et `replay_gate_and_trajectory`) :
-  un écart réel et important continue de dégrader la note comme avant, seul l'arrondi normal et
+  Le lineup utilise séparément 150 m, calibré sur les 28 rapports humains F-14B(U) du 8 septembre
+  2026 : un écart réel et important continue de dégrader la note, seul l'arrondi normal et
   attendu près du pont n'explose plus artificiellement. Voir
   [tasking-roadmap.md](tasking-roadmap.md) pour le détail des deux bugs.
 
-**Table de note CATOBAR** (`project-derived-v4`, `PROJECT-DERIVED` sauf mention contraire ;
+**Table de note CATOBAR** (`project-derived-v5`, `PROJECT-DERIVED` sauf mention contraire ;
 `abs(GS)`/`abs(LU)` = pire valeur sur les gates comptées (voir ci-dessus pour la porte 3/4 NM) **et**
 la trajectoire continue) :
 
@@ -949,7 +961,8 @@ journalise display et chaîne debug. Les échecs SQLite/PNG/ACMI/Discord arriven
 JSON reste `schema_version: 3`, évolution additive : aucun ancien champ supprimé/renommé ; `cause`
 reste l'alias primaire ; `causes` contient primaire/secondaires ; `event_correlation`,
 `wind_heading_deg`/`wind_speed_mps`, `wind_reference_established` et `trajectory_deviations` sont
-des ajouts récents ; `trajectory_deviations[].alt_m`/`bank_deg`/`sink_rate_mps` et
+des ajouts récents ; `trajectory_deviations[].lineup_deviation_m`/`alt_m`/`bank_deg`/
+`sink_rate_mps` et
 `datums[].roll_deg` sont des ajouts additifs plus récents encore (contexte sur leur
 amplitude/tendance générale, mais `bank_deg`/`sink_rate_mps` alimentent chacun le Cut dédié
 sink-rate/bank — voir "Gates, outcomes et câble") ; diagnostics possibles

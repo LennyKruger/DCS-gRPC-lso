@@ -29,6 +29,12 @@ This file records user-visible changes. The crate version remains `0.2.0`; chang
 
 ### Changed
 
+- Grading is now versioned `project-derived-v5`. Continuous lineup inside the final 150 m uses a
+  dedicated 150 m angular reference instead of the vertical 75 m flare reference, so the 1.5°
+  late-lineup threshold consistently represents about 3.93 m throughout that window. The raw
+  signed lateral displacement is serialized additively as
+  `trajectory_deviations[].lineup_deviation_m`; the 75 m glideslope guard is unchanged
+  (`src/track.rs`, `src/tasks/record_recovery.rs`).
 - Case I CATOBAR groove entry now follows an explicit port-pattern/final-turn/roll-out state
   machine: the last turn arms only inbound below 600 ft, and `|bank| <= 10°` must then persist for
   0.75 source seconds. The 3/4 NM distance, lineup, ground route and lineup trend no longer delay a

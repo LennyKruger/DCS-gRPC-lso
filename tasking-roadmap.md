@@ -36,7 +36,7 @@ Reste à développer :
    `unconfirmed_arrest` qu’après un corpus live avec vérité indépendante couvrant trap, bolter,
    T&G, waveoff, rebond, disparition et unité gelée. Même promue, elle resterait de confiance
    `medium`, sans brin certain ni bonus de câble. Un grade DCS sans `WIRE#` peut être affiché comme
-   fallback DCS, jamais transformé en grade ou points `project-derived-v4`.
+   fallback DCS, jamais transformé en grade ou points `project-derived-v5`.
 
 Contraintes communes : ne pas relever les seuils 300/1 000 ms, ne pas interpoler une longue
 coupure, ne pas assimiler les évictions internes du ring à une perte lecteur, et n’accorder aucun
@@ -124,12 +124,13 @@ corpus puis en mission selon sa portée.
 
 ### Calibration du grading et de la géométrie
 
-- **Lineup près du pont.** Sur deux corpus IA, l’écart latéral réel converge vers l’axe en mètres
-  mais sa conversion angulaire grossit assez tôt pour franchir `LATE_WINDOW_LU_DEG` vers 150–200 m
-  et plafonner toutes les passes à `--`. Tester avec un vent nettement différent et avec un pilote
-  humain sur la même mission/navire. Ajouter l’écart latéral en mètres à
-  `trajectory_deviations` ou à un diagnostic dédié. Arbitrer ensuite la métrique de sévérité tardive
-  et la valeur de `NEAR_TOUCHDOWN_ANGLE_REFERENCE_M = 75 m`, sans masquer un vrai écart bref.
+- **Lineup près du pont — correction à revalider live.** Le corpus humain F-14B(U) du 8 septembre
+  confirme que le plancher angulaire commun de 75 m resserrait artificiellement le seuil lineup
+  tardif : `1,5°` représentait 3,93 m à 150 m mais seulement 1,96 m en close. Le code courant garde
+  75 m pour le glide, normalise séparément le lineup sur 150 m dans toute la fenêtre tardive et
+  sérialise l’écart brut `lineup_deviation_m`. Revalider ce candidat sur une nouvelle mission avec
+  vérité LSO et vent nettement différent ; vérifier qu’un vrai écart bref supérieur à environ
+  3,93 m reste bien sanctionné et comparer les verdicts `project-derived-v5` aux commentaires LQM.
 - **Temps de groove et `_OK_`.** Les corpus disponibles donnent des durées tantôt sous 15 s, tantôt
   au-dessus de 18 s, et aucun `_OK_` live. Déterminer si l’entrée physique par roll-out, la géométrie du
   pattern, le type avion ou la fenêtre 15–18 s expliquent cet échec. La fenêtre est `OFFICIAL`, la

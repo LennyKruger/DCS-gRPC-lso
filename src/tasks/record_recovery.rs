@@ -206,9 +206,10 @@ struct ReportCauses<'a> {
 // (`trajectory_deviations`), not only the three point-in-time gates.
 // v3: a worsening correction trend in the final seconds can cap an otherwise-Ok pass at (OK).
 // v4: a moderate deviation inside the last 150 m before the ramp can cap an otherwise-Ok/(OK)
-// pass at NoGrade — see docs/GRADING_REFERENCE.md, "Continuous trajectory", "Correction trend"
-// and "Late-approach weighting".
-const GRADING_VERSION: &str = "project-derived-v4";
+// pass at NoGrade.
+// v5: lineup inside that window uses a fixed 150 m angular reference and exposes its raw offset
+// in metres, so proximity to the ramp does not silently tighten the lateral threshold.
+const GRADING_VERSION: &str = "project-derived-v5";
 const GRADING_SOURCE: &str = "PROJECT-DERIVED";
 #[derive(Debug)]
 struct HookPoll {

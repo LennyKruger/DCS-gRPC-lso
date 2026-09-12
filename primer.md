@@ -476,7 +476,10 @@ notable du tout (étape 5) ? — mais une fois cette question réglée, le calcu
 3. **La proximité du pont** est enfin prise en compte : un écart modéré (ni négligeable, ni
    franchement dangereux) situé dans les 150 derniers mètres avant la coupe plafonne la note à
    `--` au lieu de `OK`/`(OK)`, parce qu'il ne reste quasiment plus de temps pour le corriger à cet
-   endroit. Le même écart, plus tôt dans l'approche, est noté normalement.
+   endroit. Le même écart, plus tôt dans l'approche, est noté normalement. Pour le lineup, cette
+   zone garde une échelle fixe : le seuil de 1,5° correspond partout à environ 3,9 m d'écart
+   latéral. La simple proximité du pont ne grossit donc plus artificiellement un petit décalage ;
+   le rapport conserve aussi l'écart réel en mètres afin qu'un LSO puisse contrôler ce diagnostic.
 4. **`_OK_`, la passe parfaite (nouveau, 5 septembre 2026).** Une fois qu'une passe a déjà mérité
    `OK` par les trois points ci-dessus, le programme regarde s'il ne s'agit pas d'une passe
    carrément parfaite. Il faut alors, en plus, que **chaque** photo et **chaque** instant de la
@@ -511,7 +514,7 @@ programme sort donc **`OK`, 4.0 points** — 0.4° dépasse la fenêtre encore p
 `_OK_`, donc cette passe, déjà très propre, n'atteint pas la perfection.
 
 > Important à savoir : cette grille de seuils reste une règle **du projet**
-> (`PROJECT-DERIVED`, version `project-derived-v4`), pas une reconstruction certifiée de la
+> (`PROJECT-DERIVED`, version `project-derived-v5`), pas une reconstruction certifiée de la
 > doctrine officielle de l'US Navy — le rapport et la documentation technique le rappellent
 > systématiquement. Le vrai LSO humain juge aussi l'AoA, la puissance, l'assiette, le mouvement du
 > pont et bien d'autres dimensions qui ne sont, pour l'instant, ni mesurables de façon fiable ni
