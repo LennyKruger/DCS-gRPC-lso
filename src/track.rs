@@ -55,7 +55,7 @@ use crate::utils::{m_to_ft, m_to_nm};
 /// ¾ nm gate — first LSO grading sample (1 nm = 1 852 m → ¾ nm ≈ 1 389 m).
 pub(crate) const GATE_THREE_QUARTER_NM: f64 = 1389.0;
 /// ½ nm gate — primary grading reference.
-const GATE_HALF_NM: f64 = 926.0;
+pub(crate) const GATE_HALF_NM: f64 = 926.0;
 /// ¼ nm gate — ramp / "in close"; dangerously low here triggers a Cut pass.
 pub(crate) const GATE_QUARTER_NM: f64 = 463.0;
 
@@ -112,8 +112,8 @@ const MAX_TRAJECTORY_SAMPLES: usize = 4_000;
 /// down to just short of the ramp.
 const TRAJECTORY_MIN_DISTANCE_M: f64 = 3.0;
 /// Fixed reference distance (metres) substituted for the real, shrinking `x` when computing
-/// `gs_deviation_deg`/`lineup_deg` for a `trajectory_deviations` sample closer to the ship than
-/// this. `TRAJECTORY_MIN_DISTANCE_M` above stops the outright blow-up as `x -> 0`, but it does not
+/// `gs_deviation_deg` for a `trajectory_deviations` sample closer to the ship than this.
+/// `TRAJECTORY_MIN_DISTANCE_M` above stops the outright blow-up as `x -> 0`, but it does not
 /// stop a much more moderate, still-misleading version of the same effect between that floor and
 /// several tens of metres out: an ordinary, essentially constant flare offset of a few
 /// decimetres — confirmed live on 5 September 2026 to be a near-constant few tenths of a metre,
@@ -132,6 +132,13 @@ const TRAJECTORY_MIN_DISTANCE_M: f64 = 3.0;
 /// final seconds using its own reasonably real geometry rather than one held all the way back to
 /// a gate distance.
 const NEAR_TOUCHDOWN_ANGLE_REFERENCE_M: f64 = 75.0;
+/// Lineup uses a longer fixed reference inside the complete late-grading window. Human F-14B(U)
+/// telemetry from 8 September 2026 showed that the former 75 m denominator made the 1.5 degree
+/// late threshold tighten from 3.93 m at 150 m to 1.96 m in close even when the aircraft's real
+/// lateral displacement was stable or converging. Holding the denominator at 150 m makes that
+/// angular threshold represent one consistent lateral error throughout the window while still
+/// exposing the raw measured displacement in `TrajectoryDeviation::lineup_deviation_m`.
+const NEAR_TOUCHDOWN_LINEUP_REFERENCE_M: f64 = 150.0;
 const MAX_EVENT_EVIDENCE: usize = 256;
 const MAX_INVALID_SOURCE_EVIDENCE: usize = 512;
 /// At the maximum supported 4 Hz hook cadence this retains about 8.5 minutes, comfortably beyond
@@ -636,8 +643,24 @@ pub struct WindProbe {
 pub struct WindReferenceProbes {
     /// Queried at the aircraft's own altitude at groove entry.
     pub high: WindProbe,
-    /// Queried at the carrier's deck altitude.
+    /// Queried at the carrier's deck altitude. Always the raw reading actually observed (after
+    /// at most one bounded retry), even when `low_reading_overridden_by_high` is `true` below —
+    /// this field never lies about what was measured.
     pub low: WindProbe,
+    /// `true` when `low` above still looked like DCS's known `180deg/0.0 m/s` sentinel
+    /// (`is_wind_sentinel`) after one retry, and the `WindReference` used for AoA correction
+    /// reused `high`'s wind vector for the low-altitude point instead — see `tasking-roadmap.md`,
+    /// P1. `low` keeps reporting the raw, still-suspect reading either way.
+    pub low_reading_overridden_by_high: bool,
+}
+
+/// Whether a `GetWind` reading matches the exact degenerate output produced when DCS returns a
+/// zero wind vector (`heading = atan2(0,0) + 180 = 180`, `speed = 0.0`) — a known intermittent
+/// anomaly near sea level, not distinguishable by value alone from a genuinely calm mission (see
+/// `tasking-roadmap.md`, P1). Used only to decide whether to retry/fall back; never to reject a
+/// reading outright.
+pub(crate) fn is_wind_sentinel(reading: (u16, f32)) -> bool {
+    reading == (180, 0.0)
 }
 
 impl WindReference {
@@ -827,6 +850,11 @@ pub struct GateQuality {
     pub bracket_start_time_dcs: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bracket_end_time_dcs: Option<f64>,
+    /// Additive provenance for coverage recovered from the continuous groove trajectory when
+    /// the point-in-time gate object itself was not retained. `None` means the normal gate
+    /// capture path was used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coverage_source: Option<&'static str>,
 }
 
 impl Default for GateQuality {
@@ -837,6 +865,7 @@ impl Default for GateQuality {
             bracket_gap_ms: None,
             bracket_start_time_dcs: None,
             bracket_end_time_dcs: None,
+            coverage_source: None,
         }
     }
 }
@@ -893,29 +922,67 @@ impl GateDeviations {
     /// `three_quarter_counts` for what `groove_entry_time` does here.
     pub fn all_valid(&self, groove_entry_time: Option<f64>) -> bool {
         if !self.three_quarter_counts(groove_entry_time) {
-            return self
-                .at_half_nm
-                .as_ref()
-                .zip(self.at_quarter_nm.as_ref())
-                .is_some_and(|(half, quarter)| half.timestamp_dcs < quarter.timestamp_dcs)
+            return gate_evidence_time(&self.at_half_nm, &self.half_quality)
+                .zip(gate_evidence_time(
+                    &self.at_quarter_nm,
+                    &self.quarter_quality,
+                ))
+                .is_some_and(|(half, quarter)| half < quarter)
                 && self.half_quality.status == GateStatus::Valid
                 && self.quarter_quality.status == GateStatus::Valid;
         }
 
-        let ordered = self
-            .at_three_quarter_nm
-            .as_ref()
-            .zip(self.at_half_nm.as_ref())
-            .zip(self.at_quarter_nm.as_ref())
-            .is_some_and(|((three_quarter, half), quarter)| {
-                three_quarter.timestamp_dcs < half.timestamp_dcs
-                    && half.timestamp_dcs < quarter.timestamp_dcs
-            });
+        let ordered = gate_evidence_time(&self.at_three_quarter_nm, &self.three_quarter_quality)
+            .zip(gate_evidence_time(&self.at_half_nm, &self.half_quality))
+            .zip(gate_evidence_time(
+                &self.at_quarter_nm,
+                &self.quarter_quality,
+            ))
+            .is_some_and(|((three_quarter, half), quarter)| three_quarter < half && half < quarter);
         ordered
             && self.three_quarter_quality.status == GateStatus::Valid
             && self.half_quality.status == GateStatus::Valid
             && self.quarter_quality.status == GateStatus::Valid
     }
+}
+
+fn gate_evidence_time(datum: &Option<GateDatum>, quality: &GateQuality) -> Option<f64> {
+    datum.as_ref().map(|gate| gate.timestamp_dcs).or_else(|| {
+        quality
+            .bracket_start_time_dcs
+            .zip(quality.bracket_end_time_dcs)
+            .map(|(start, end)| start + (end - start) / 2.0)
+    })
+}
+
+fn recover_gate_coverage_from_trajectory(
+    trajectory: &[TrajectoryDeviation],
+    gate: f64,
+    datum: &Option<GateDatum>,
+    quality: &mut GateQuality,
+) {
+    if datum.is_some() && quality.status == GateStatus::Valid {
+        return;
+    }
+
+    let bracket = trajectory.windows(2).find(|pair| {
+        let previous = &pair[0];
+        let current = &pair[1];
+        previous.distance_m > gate
+            && current.distance_m <= gate
+            && current.timestamp_dcs > previous.timestamp_dcs
+            && (current.timestamp_dcs - previous.timestamp_dcs) * 1_000.0 <= SAMPLE_GAP_WARNING_MS
+    });
+    let Some([previous, current]) = bracket else {
+        return;
+    };
+
+    quality.status = GateStatus::Valid;
+    quality.reason = Some("covered_by_continuous_trajectory".to_string());
+    quality.bracket_gap_ms = Some((current.timestamp_dcs - previous.timestamp_dcs) * 1_000.0);
+    quality.bracket_start_time_dcs = Some(previous.timestamp_dcs);
+    quality.bracket_end_time_dcs = Some(current.timestamp_dcs);
+    quality.coverage_source = Some("continuous_trajectory_bracket");
 }
 
 /// GS/lineup deviation computed at one aircraft position along the final approach, using the
@@ -932,6 +999,9 @@ pub struct TrajectoryDeviation {
     pub distance_m: f64,
     pub gs_deviation_deg: f64,
     pub lineup_deg: f64,
+    /// Signed lateral displacement from the landing-area centreline in metres. Additive raw
+    /// diagnostic retained alongside the normalized angular lineup used by grading.
+    pub lineup_deviation_m: f64,
     /// Ground-track angle relative to the landing-area axis (0° = directly inbound). Additive
     /// diagnostic; it preserves imperfect routing and corrections after physical roll-out but is
     /// not a grading input.
@@ -1491,6 +1561,10 @@ fn linear_regression_slope(
 pub enum Grading {
     #[default]
     Unknown,
+    /// A geometrically recognisable final approach whose terminal outcome could not be proven.
+    /// The measured approach may still be graded; this is distinct from both a waveoff and a
+    /// false start that never became an approach.
+    ApproachOnly,
     Bolter,
     TouchAndGo {
         cable_estimated: Option<u8>,
@@ -1517,6 +1591,7 @@ impl Grading {
     pub fn pilot_facing_outcome(&self, is_vstol: bool) -> String {
         match (is_vstol, self) {
             (_, Self::Unknown) => String::new(),
+            (_, Self::ApproachOnly) => "Approach only — outcome unknown".to_string(),
             (_, Self::Bolter) => "Bolter".to_string(),
             // Intentional bolters are valid only for arrested recoveries. Keep the
             // V/STOL fallback defensive in case an invalid grading reaches this layer.
@@ -1597,6 +1672,21 @@ pub struct TrackResult {
 }
 
 impl Track {
+    pub(crate) fn last_observed_time_dcs(&self) -> Option<f64> {
+        self.datums
+            .last()
+            .map(|datum| datum.time)
+            .or(self.previous_sample_time)
+    }
+
+    pub(crate) fn has_recognisable_approach(&self) -> bool {
+        self.entered_groove
+            || self.gate_deviations.at_three_quarter_nm.is_some()
+            || self.gate_deviations.at_half_nm.is_some()
+            || self.gate_deviations.at_quarter_nm.is_some()
+            || !self.trajectory_deviations.is_empty()
+    }
+
     pub fn new(
         pilot_name: impl Into<String>,
         carrier_info: &'static CarrierInfo,
@@ -1697,8 +1787,17 @@ impl Track {
     /// Record the two raw `GetWind` responses behind the just-established `WindReference`, purely
     /// for diagnosis (see `WindReferenceProbes`). Call alongside `set_wind_reference`, with the
     /// same two probes before they were converted to velocity vectors.
-    pub fn set_wind_reference_probes(&mut self, high: WindProbe, low: WindProbe) {
-        self.wind_reference_probes = Some(WindReferenceProbes { high, low });
+    pub fn set_wind_reference_probes(
+        &mut self,
+        high: WindProbe,
+        low: WindProbe,
+        low_reading_overridden_by_high: bool,
+    ) {
+        self.wind_reference_probes = Some(WindReferenceProbes {
+            high,
+            low,
+            low_reading_overridden_by_high,
+        });
     }
 
     /// The AoA to record for this sample: wind-corrected if a reference is available, otherwise
@@ -2337,6 +2436,7 @@ impl Track {
                     distance_m: x,
                     gs_deviation_deg,
                     lineup_deg: trajectory_lineup_deg,
+                    lineup_deviation_m: y,
                     track_angle_deg: groove_quality_measurement(&self.gate_samples)
                         .map_or(0.0, |quality| quality.track_angle_deg),
                     alt_m: alt,
@@ -2546,15 +2646,44 @@ impl Track {
     }
 
     pub fn finish(mut self) -> TrackResult {
+        // A point-in-time gate object is a convenient measurement, not the only possible proof
+        // that the required distance was observed. The continuous groove trajectory contains
+        // the same valid, inbound source samples. When two adjacent samples bracket a gate in at
+        // most 300 ms, retain that bracket as coverage evidence. No position or deviation is
+        // invented: grading amplitude continues to use the trajectory samples themselves.
+        recover_gate_coverage_from_trajectory(
+            &self.trajectory_deviations,
+            GATE_THREE_QUARTER_NM,
+            &self.gate_deviations.at_three_quarter_nm,
+            &mut self.gate_deviations.three_quarter_quality,
+        );
+        recover_gate_coverage_from_trajectory(
+            &self.trajectory_deviations,
+            GATE_HALF_NM,
+            &self.gate_deviations.at_half_nm,
+            &mut self.gate_deviations.half_quality,
+        );
+        recover_gate_coverage_from_trajectory(
+            &self.trajectory_deviations,
+            GATE_QUARTER_NM,
+            &self.gate_deviations.at_quarter_nm,
+            &mut self.gate_deviations.quarter_quality,
+        );
+
         // Source-invalid observations can be delivered in a later batch. Attribute them only
         // now, from their own capture timestamp against the final scored-segment bounds; client
         // receipt time is retained for diagnosis but is never substituted for source time.
         self.attribute_invalid_source_observations();
 
-        // If the plane entered the groove but never landed and no other grading was set,
-        // it performed a waveoff.
-        if self.grading.is_none() && self.entered_groove {
-            self.grading = Some(Grading::WaveoffUnknown);
+        // Entering the groove proves an approach, not its terminal outcome. Without contact,
+        // LQM waveoff evidence or the geometric departure guard, keep that distinction explicit
+        // instead of inventing a waveoff.
+        if self.grading.is_none()
+            && (self.entered_groove
+                || self.gate_deviations.at_half_nm.is_some()
+                || self.gate_deviations.at_quarter_nm.is_some())
+        {
+            self.grading = Some(Grading::ApproachOnly);
         }
 
         // Still correlated on the event-reported touchdown time (`landing_time`) for the upper
@@ -2661,8 +2790,11 @@ impl Track {
         // glide slope, but excludes CATOBAR-only wire/groove bonuses.  AOA is
         // visual information only and is not part of the points calculation.
         let (approach_grade, approach_points, grade_reason) = if self.carrier_info.is_vstol() {
-            let (grade, points) =
-                compute_vstol_approach_grade_points(&grading, &self.gate_deviations);
+            let (grade, points) = compute_vstol_approach_grade_points(
+                &grading,
+                &self.gate_deviations,
+                &self.trajectory_deviations,
+            );
             // V/STOL does not yet have a detailed per-gate rationale of its own (see
             // `grade_reason`'s doc comment) -- a short, generic placeholder naming the final
             // grade is still more useful than an empty field.
@@ -2943,7 +3075,12 @@ impl Track {
         let state = &self.arrest_kinematic_state;
         let outcome_conflicts_with_arrest = matches!(
             self.grading,
-            Some(Grading::Bolter | Grading::TouchAndGo { .. } | Grading::WaveoffUnknown)
+            Some(
+                Grading::Bolter
+                    | Grading::TouchAndGo { .. }
+                    | Grading::WaveoffUnknown
+                    | Grading::ApproachOnly,
+            )
         );
         let hold_complete = state.best_low_speed_hold_s >= ARREST_LOW_SPEED_HOLD_S
             && state.best_low_speed_hold_samples >= ARREST_MIN_LOW_SPEED_SAMPLES;
@@ -3577,20 +3714,21 @@ fn sink_rate_since(previous: Option<&TrajectoryDeviation>, alt_m: f64, time: f64
         .unwrap_or(0.0)
 }
 
-/// `gs_deviation_deg`/`lineup_deg` for a `trajectory_deviations` sample, converting the raw
-/// vertical (`gs_deviation_m`) and lateral (`lateral_offset_m`) offsets to angles with
-/// `NEAR_TOUCHDOWN_ANGLE_REFERENCE_M` substituted for `x` once `x` drops below it (see that
-/// constant). Shared by `Track::next` and `replay_gate_and_trajectory` so a persisted report's
-/// angles can always be reconstructed identically from either path.
+/// `gs_deviation_deg`/`lineup_deg` for a `trajectory_deviations` sample. Vertical geometry keeps
+/// the 75 m flare guard; lateral geometry uses the 150 m late-window reference so a fixed offset
+/// has a fixed severity throughout that window.
 fn trajectory_deviation_angles_deg(
     gs_deviation_m: f64,
     lateral_offset_m: f64,
     x: f64,
 ) -> (f64, f64) {
-    let denominator = x.max(NEAR_TOUCHDOWN_ANGLE_REFERENCE_M);
     (
-        gs_deviation_m.atan2(denominator).to_degrees(),
-        lateral_offset_m.atan2(denominator).to_degrees(),
+        gs_deviation_m
+            .atan2(x.max(NEAR_TOUCHDOWN_ANGLE_REFERENCE_M))
+            .to_degrees(),
+        lateral_offset_m
+            .atan2(x.max(NEAR_TOUCHDOWN_LINEUP_REFERENCE_M))
+            .to_degrees(),
     )
 }
 
@@ -4175,6 +4313,7 @@ pub(crate) fn replay_gate_trajectory_and_groove(
                 distance_m: x,
                 gs_deviation_deg,
                 lineup_deg: trajectory_lineup_deg,
+                lineup_deviation_m: y,
                 track_angle_deg: groove_quality_measurement(&gate_samples)
                     .map_or(0.0, |quality| quality.track_angle_deg),
                 alt_m: alt,
@@ -4374,14 +4513,56 @@ mod tests {
             heading_deg: 95,
             speed_mps: 1.2,
         };
-        track.set_wind_reference_probes(high, low);
+        track.set_wind_reference_probes(high, low, false);
 
         let result = track.finish();
         assert!(result.wind_reference_established);
         assert_eq!(
             result.wind_reference_probes,
-            Some(WindReferenceProbes { high, low })
+            Some(WindReferenceProbes {
+                high,
+                low,
+                low_reading_overridden_by_high: false,
+            })
         );
+    }
+
+    #[test]
+    fn low_wind_probe_sentinel_falls_back_to_high_probe_after_bounded_retry() {
+        // Regression for tasking-roadmap.md P1: the low-altitude probe intermittently reads
+        // DCS's `180deg/0.0 m/s` sentinel while the high probe stays coherent. Simulates the
+        // caller-side decision `record_recovery.rs` makes after one retry still looks suspect --
+        // this test only pins the `Track`-level bookkeeping, not the retry itself (no I/O here).
+        let carrier = CarrierInfo::by_type("CVN_71").unwrap();
+        let plane_info = AirplaneInfo::by_type("FA-18C_hornet").unwrap();
+        let mut track = Track::new("pilot", carrier, plane_info);
+        let high = WindProbe {
+            alt_m: 300.0,
+            heading_deg: 95,
+            speed_mps: 1.2,
+        };
+        let low = WindProbe {
+            alt_m: 0.0,
+            heading_deg: 180,
+            speed_mps: 0.0,
+        };
+        assert!(is_wind_sentinel((low.heading_deg, low.speed_mps)));
+        assert!(!is_wind_sentinel((high.heading_deg, high.speed_mps)));
+        // The AoA reference vector uses `high`'s wind for both points -- `low`'s raw sentinel
+        // reading is kept only in `WindReferenceProbes` for diagnosis, never for correction.
+        track.set_wind_reference(
+            high.alt_m,
+            wind_velocity_vector(high.heading_deg, high.speed_mps),
+            low.alt_m,
+            wind_velocity_vector(high.heading_deg, high.speed_mps),
+        );
+        track.set_wind_reference_probes(high, low, true);
+
+        let result = track.finish();
+        assert!(result.wind_reference_established);
+        let probes = result.wind_reference_probes.unwrap();
+        assert_eq!(probes.low, low);
+        assert!(probes.low_reading_overridden_by_high);
     }
 
     fn approach_sample(time: f64, x: f64) -> ApproachSample {
@@ -4598,6 +4779,7 @@ mod tests {
                 bracket_gap_ms: Some(200.0),
                 bracket_start_time_dcs: Some(15.0),
                 bracket_end_time_dcs: Some(15.2),
+                coverage_source: None,
             },
             ..GateDeviations::default()
         };
@@ -5065,6 +5247,120 @@ mod tests {
             bracket_gap_ms: Some(100.0),
             ..GateQuality::default()
         }
+    }
+
+    fn trajectory_point(timestamp_dcs: f64, distance_m: f64) -> TrajectoryDeviation {
+        TrajectoryDeviation {
+            timestamp_dcs,
+            distance_m,
+            gs_deviation_deg: 0.1,
+            lineup_deg: 0.1,
+            lineup_deviation_m: 0.0,
+            track_angle_deg: 0.0,
+            alt_m: 10.0,
+            bank_deg: 0.0,
+            sink_rate_mps: 0.0,
+        }
+    }
+
+    #[test]
+    fn continuous_trajectory_bracket_recovers_missing_required_gate_coverage() {
+        let carrier = CarrierInfo::by_type("CVN_71").unwrap();
+        let plane = AirplaneInfo::by_type("FA-18C_hornet").unwrap();
+        let mut track = Track::new("pilot", carrier, plane);
+        track.groove_entry_time = Some(1.0);
+        track.grading = Some(Grading::Bolter);
+        track.gate_deviations = GateDeviations {
+            at_three_quarter_nm: Some(gate(1.2)),
+            at_half_nm: None,
+            at_quarter_nm: Some(gate(3.0)),
+            three_quarter_quality: valid_quality(),
+            half_quality: GateQuality::default(),
+            quarter_quality: valid_quality(),
+        };
+        track.trajectory_deviations = vec![
+            trajectory_point(1.1, 1_400.0),
+            trajectory_point(1.2, 1_380.0),
+            trajectory_point(1.9, 940.0),
+            trajectory_point(2.0, 910.0),
+            trajectory_point(2.9, 480.0),
+            trajectory_point(3.0, 450.0),
+        ];
+
+        let result = track.finish();
+        assert_eq!(
+            result.telemetry_quality.completeness,
+            Completeness::Complete
+        );
+        assert_eq!(result.pass_grade, PassGrade::Bolter);
+        assert_eq!(
+            result.gate_deviations.half_quality.coverage_source,
+            Some("continuous_trajectory_bracket")
+        );
+        assert!(
+            (result
+                .gate_deviations
+                .half_quality
+                .bracket_gap_ms
+                .expect("trajectory bracket gap")
+                - 100.0)
+                .abs()
+                < 1.0e-6
+        );
+    }
+
+    #[test]
+    fn trajectory_gap_over_300_ms_cannot_recover_gate_coverage() {
+        let mut quality = GateQuality::default();
+        recover_gate_coverage_from_trajectory(
+            &[trajectory_point(1.0, 940.0), trajectory_point(1.31, 910.0)],
+            GATE_HALF_NM,
+            &None,
+            &mut quality,
+        );
+        assert_eq!(quality.status, GateStatus::Missing);
+        assert_eq!(quality.coverage_source, None);
+    }
+
+    #[test]
+    fn unfinished_recognisable_final_is_approach_only_and_keeps_measured_points() {
+        let carrier = CarrierInfo::by_type("CVN_71").unwrap();
+        let plane = AirplaneInfo::by_type("FA-18C_hornet").unwrap();
+        let mut track = Track::new("pilot", carrier, plane);
+        track.entered_groove = true;
+        track.groove_entry_time = Some(1.0);
+        track.gate_deviations = GateDeviations {
+            at_three_quarter_nm: Some(gate(1.2)),
+            at_half_nm: Some(gate(2.0)),
+            at_quarter_nm: Some(gate(3.0)),
+            three_quarter_quality: valid_quality(),
+            half_quality: valid_quality(),
+            quarter_quality: valid_quality(),
+        };
+
+        let result = track.finish();
+        assert_eq!(result.grading, Grading::ApproachOnly);
+        assert_eq!(result.pass_grade, PassGrade::Ok);
+        assert_eq!(result.grade_points, Some(4.0));
+    }
+
+    #[test]
+    fn significant_inner_gate_distinguishes_a_final_from_a_false_start() {
+        let carrier = CarrierInfo::by_type("CVN_71").unwrap();
+        let plane = AirplaneInfo::by_type("FA-18C_hornet").unwrap();
+
+        let mut final_without_outcome = Track::new("pilot", carrier, plane);
+        final_without_outcome.gate_deviations.at_half_nm = Some(gate(2.0));
+        final_without_outcome.gate_deviations.half_quality = valid_quality();
+        let result = final_without_outcome.finish();
+        assert_eq!(result.grading, Grading::ApproachOnly);
+        assert_eq!(result.pass_grade, PassGrade::Incomplete);
+        assert_eq!(result.grade_points, None);
+
+        let mut outer_pattern_only = Track::new("pilot", carrier, plane);
+        outer_pattern_only.gate_deviations.at_three_quarter_nm = Some(gate(1.0));
+        outer_pattern_only.gate_deviations.three_quarter_quality = valid_quality();
+        assert_eq!(outer_pattern_only.finish().grading, Grading::Unknown);
     }
 
     #[test]
@@ -5652,6 +5948,7 @@ mod tests {
                 distance_m: 700.0,
                 gs_deviation_deg: 1.5,
                 lineup_deg: 0.0,
+                lineup_deviation_m: 0.0,
                 track_angle_deg: 0.0,
                 alt_m: 0.0,
                 bank_deg: 0.0,
@@ -5662,6 +5959,7 @@ mod tests {
                 distance_m: 690.0,
                 gs_deviation_deg: 1.5,
                 lineup_deg: 0.0,
+                lineup_deviation_m: 0.0,
                 track_angle_deg: 0.0,
                 alt_m: 0.0,
                 bank_deg: 0.0,
@@ -5873,11 +6171,28 @@ mod tests {
                  purely by a shrinking x: {deviation:?}"
             );
             assert!(
-                deviation.lineup_deg.abs() < 2.0,
+                deviation.lineup_deg.abs() < 0.5,
                 "a constant, realistic lateral offset must not be amplified into a large angle \
                  purely by a shrinking x: {deviation:?}"
             );
+            assert!((deviation.lineup_deviation_m - 0.8).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn late_window_lineup_uses_one_consistent_lateral_severity() {
+        // The human F-14B(U) corpus exposed the discontinuity in meaning caused by the former
+        // 75 m floor: 1.5 degrees meant 3.93 m at 150 m but only 1.96 m in close. A constant
+        // lateral displacement must now retain the same normalized angle throughout the entire
+        // 150 m late window, while a genuinely larger displacement still crosses the threshold.
+        let threshold_offset_m = 150.0 * 1.5_f64.to_radians().tan();
+        let at_window = trajectory_deviation_angles_deg(0.0, threshold_offset_m, 150.0).1;
+        let at_ramp = trajectory_deviation_angles_deg(0.0, threshold_offset_m, 4.0).1;
+        assert!((at_window - 1.5).abs() < 1e-12);
+        assert!((at_ramp - at_window).abs() < 1e-12);
+
+        let real_large_offset = trajectory_deviation_angles_deg(0.0, 5.0, 4.0).1;
+        assert!(real_large_offset > 1.5);
     }
 
     #[test]
@@ -6029,6 +6344,7 @@ mod tests {
             distance_m: 700.0,
             gs_deviation_deg: 5.0,
             lineup_deg: 0.0,
+            lineup_deviation_m: 0.0,
             track_angle_deg: 0.0,
             alt_m: 0.0,
             bank_deg: 0.0,
@@ -6069,8 +6385,9 @@ mod tests {
             .telemetry_quality
             .diagnostics
             .contains(&DiagnosticCause::EventStreamUnavailable));
-        assert_eq!(result.grading, Grading::WaveoffUnknown);
-        assert_eq!(result.grade_points, None);
+        assert_eq!(result.grading, Grading::ApproachOnly);
+        assert_eq!(result.pass_grade, PassGrade::Ok);
+        assert_eq!(result.grade_points, Some(4.0));
     }
 
     #[test]

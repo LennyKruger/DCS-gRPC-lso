@@ -2,10 +2,11 @@
 
 > Document de continuité, à tenir à jour à chaque changement significatif de code ou de contrat.
 > Dépôt `E:\DCS stuffs\Initiative ESG\DCS-gRPC-lso`, branche `feature/refonte-v3-lua-buffer`.
-> Dernier commit : HEAD `42ebdecd` ("Ajout d'un exemple de fichier de configuration externe"). Working tree
-> actuellement **non propre** : refonte Rust du détecteur d'entrée en groove Case I CATOBAR et
-> mise à jour documentaire associée. Les tranches sûres du P0 sur la restitution graduée et la
-> couverture des observations source invalides sont implémentées ; le rendu du pattern sépare les circuits antérieurs de la branche
+> Dernier commit : HEAD `6917223` ("Nouvelle détection de groove-entry"). Working tree
+> actuellement **non propre** : achèvement des tranches développables du P0 sur la réduction des
+> `Grading unavailable` et mise à jour documentaire associée. La restitution graduée, la
+> couverture des observations source invalides et des gates, le flux événementiel de session et
+> `ApproachOnly` sont implémentés ; le rendu du pattern sépare les circuits antérieurs de la branche
 > finale. La correction de segmentation des waveoffs issue du
 > second corpus humain F-14B(U) du 7 septembre 2026 est incluse dans HEAD. L'entrée en groove Case I
 > CATOBAR reconnaît le dernier virage depuis bâbord sous 600 ft puis confirme le roll-out sur une
@@ -17,7 +18,10 @@
 > lever `unconfirmed_arrest` ; la timeline de crosse est un ring récent de 2 048 entrées ; et
 > `lso.exe groove-ab` compare en lecture seule l'ancien et le nouveau détecteur sur des JSON v3 ;
 > un LQM DCS `GRADE:WO` établit désormais l'issue de la tentative courante afin que son départ ferme
-> la track avant le circuit suivant. Crate `lso` 0.2.0,
+> la track avant le circuit suivant. La sentinelle vent `180°/0,0 m/s` intermittente de `GetWind`
+> (confirmée venir du moteur DCS, pas du fork) déclenche désormais un retry borné puis un repli sur
+> la probe haute cohérente, pour la référence AoA comme pour la requête de fin de tentative. Crate
+> `lso` 0.2.0,
 > Rust 2021 ; les changements postérieurs au tag `0.2.0` sont sous `Unreleased` dans
 > [CHANGES.md](CHANGES.md).
 
@@ -105,16 +109,23 @@ Sur le HEAD `e62506d`, qui inclut la correction de segmentation des waveoffs :
 
 Sur le working tree courant :
 
-- `cargo test --locked --no-fail-fast` : **269 réussis, 0 échec** (267 tests du binaire + 2 tests
+- `cargo test --locked --no-fail-fast` : **278 réussis, 0 échec** (276 tests du binaire + 2 tests
   de provenance) ;
 - `cargo fmt --check` et `cargo clippy --locked --all-targets -- -D warnings` propres ;
+- les tests P0 couvrent gate ponctuelle absente mais bracketée par la trajectoire continue à
+  `<=300 ms`, refus au-delà, finale `ApproachOnly` avec points conservés, rejeu filtré du journal
+  événementiel, LQM tardif et reconnexion explicitement comptée ;
 - les tests déterministes du détecteur Case I couvrent sortie nominale, undershoot, overshoot,
   lineup/route/corrections imparfaits, durée de roll-out insuffisante ou suffisante, outbound, gap
   `>300 ms`, retour du temps source, faux initial/break/vent arrière/straight-in, waveoff puis
   nouvelle branche, V/STOL inchangé et parité du détecteur pur avec `groove-ab` ;
+- la géométrie lineup près du pont couvre une sévérité latérale constante dans les 150 derniers
+  mètres, l'exposition de l'écart brut et le maintien de la sanction d'un vrai écart de 5 m ;
 - la segmentation pure du pattern couvre un circuit simple, deux survols suivis de la finale et une
   discontinuité temporelle ; la revue visuelle d’un PNG nominal est propre ; le corpus multi-circuits
-  historique ne peut pas être rerendu depuis ses JSON, qui ne sérialisent pas `pattern_datums`.
+  historique ne peut pas être rerendu depuis ses JSON, qui ne sérialisent pas `pattern_datums` ;
+- un test dédié couvre le repli de la référence AoA sur la probe haute quand la probe basse reste la
+  sentinelle vent `180°/0,0 m/s` après retry.
 
 Le corpus humain `.ignore/tests-20260908-1-humans`, capturé avec le binaire propre au commit
 `42ebdecd499526ef9cbc42d7e7d139d37c388bd4` et les traces `-vv`, contient 28 rapports F-14B(U) de
@@ -129,6 +140,11 @@ séparation et l'atténuation des circuits antérieurs pour CATOBAR/F-14B(U). De
 V/STOL, pattern compacté à sa limite, overhead et waveoff sans LQM restent à couvrir. Plusieurs
 paires de tracks des deux pilotes se chevauchent jusqu'à publication, dont deux T&G simultanés et
 un bolter concurrent d'un T&G, sans collision d'artefact ni contamination inter-track observée.
+La reconstruction de l'écart latéral brut depuis les trajectoires sérialisées identifie 320
+échantillons répartis sur 12 rapports qui franchissaient `LATE_WINDOW_LU_DEG = 1,5°` uniquement
+parce que le dénominateur tombait de 150 à 75 m ; ils restent sous le seuil lorsque la même
+sévérité de 3,93 m est conservée sur toute la fenêtre. Cette analyse calibre le correctif logiciel,
+mais sa comparaison à une nouvelle vérité LSO en mission reste ouverte.
 
 Le rejeu hors ligne `groove-ab` du détecteur Case I courant sur les 12 + 4 + 28 JSON humains des
 7 et 8 septembre retrouve une entrée sur les 44 rapports ; 20 de ces roll-outs restent à bâbord du
@@ -163,7 +179,7 @@ débrief (JSON, PNG, ACMI, SQLite, Discord, board HTTP).
 - `lso run` live ; `lso file` rejoue seulement un ACMI créé par LSO ; `lso cadence-ab` et
   `lso groove-ab` sont des diagnostics hors-ligne en lecture seule, jamais des rejeux live.
 
-Le grade est un score **PROJECT-DERIVED** `project-derived-v4`, jamais une certification
+Le grade est un score **PROJECT-DERIVED** `project-derived-v5`, jamais une certification
 USN/USMC. Puissance moteur, mouvement du pont, et auteur réel du waveoff ne sont pas notés. AoA et
 vent sont persistés dans le rapport (contexte uniquement, jamais notés). Sink rate (`sink_rate_mps`)
 et gîte (`bank_deg`), calculés depuis la télémétrie continue, restent contexte uniquement sur leur
@@ -221,7 +237,7 @@ immuable, ou lors d'une mise à jour ultérieure de ce pin) :
 ```text
 DCS / Mission Scripting Environment
   -> DCS-gRPC Lua + DLL (buffer circulaire RecoveryTelemetry)
-  -> superviseur session/génération + inventaire initial/Birth
+  -> superviseur session/génération + inventaire initial/Birth + hub StreamEvents reconnectable
   -> registre de tâches par noms, IDs, session et génération
   -> détecteur par paire compatible
   -> record_recovery
@@ -240,6 +256,9 @@ Frontières implémentées (fichiers vérifiés présents) :
   prioritaires, alignement et métriques ; aucune dépendance événements/hook/sorties.
 - [src/tasks/event_correlator.rs](src/tasks/event_correlator.rs) : identité plane/carrier, LQM,
   touchdown, disparition et état du stream ; aucune modification de la complétude positionnelle.
+- [src/tasks/event_hub.rs](src/tasks/event_hub.rs) : flux `StreamEvents` partagé par session,
+  journal récent borné à 512 événements, abonnements filtrés par temps DCS et signalement des
+  coupures/reconnexions.
 - [src/tasks/report_pipeline.rs](src/tasks/report_pipeline.rs) : claim par `recovery_id`,
   publication atomique JSON/ACMI/PNG, rendu temporaire nettoyé et refus de remplacement.
 - [src/tasks/record_recovery.rs](src/tasks/record_recovery.rs) : orchestration restante ;
@@ -381,7 +400,11 @@ l'état du code (voir "Règles de vérité" plus haut).
 - Validité : deux samples inbound encadrants, temps croissant, bracket <=300 ms, skew <=300 ms,
   phase/altitude admissibles. `GateQuality` conserve aussi les temps source des deux extrémités :
   une observation source invalide située dans ce bracket reste bloquante même si le bracket vaut
-  au plus 300 ms.
+  au plus 300 ms. Si l'objet gate ponctuel manque mais que deux échantillons adjacents de la
+  trajectoire continue encadrent réellement sa distance, sont valides/inbound/chronologiques et
+  séparés de `<=300 ms`, leur bracket établit la couverture sans inventer de position ;
+  `GateQuality.coverage_source = "continuous_trajectory_bracket"` conserve cette provenance et
+  l'amplitude reste celle des échantillons continus mesurés.
 - Trois gates valides et ordonnées sont obligatoires pour une note favorable **CATOBAR uniquement
   lorsque la porte 3/4 NM a été capturée après l'entrée en groove confirmée** (roll-out, voir
   ci-dessous). Quand la porte 3/4 NM (présente ou non, valide ou non) précède l'entrée en groove,
@@ -485,7 +508,7 @@ l'état du code (voir "Règles de vérité" plus haut).
   de contact (voir le franchissement de seuil de pont ci-dessus) et est la cause probable la plus
   vraisemblable du biais de -1 brin observé sur l'estimation Rust du câble
   (`Track::wire_estimate_at`, voir [tasking-roadmap.md](tasking-roadmap.md)).
-- Grading v4 (`project-derived-v4`) : en plus des trois gates ponctuelles, la trajectoire continue
+- Grading v5 (`project-derived-v5`) : en plus des trois gates ponctuelles, la trajectoire continue
   du groove au touchdown (`trajectory_deviations`) peut dégrader — jamais améliorer — l'amplitude
   retenue, sous réserve d'un garde de persistance (une seule frame aberrante isolée ne compte plus,
   il faut au moins 2 échantillons consécutifs au-dessus du seuil ; jamais appliqué au Cut ni à la
@@ -498,7 +521,11 @@ l'état du code (voir "Règles de vérité" plus haut).
   invisible au facteur de tendance seul) ; une pondération temporelle (`LATE_WINDOW_DISTANCE_M =
   150 m`) plafonne à `--` un écart franchissant `LATE_WINDOW_GS_DEG = 0,8°` ou `LATE_WINDOW_LU_DEG =
   1,5°` (entre les seuils généraux `*_SLIGHT`/`*_SIGNIFICANT`) dans les 150 derniers mètres avant la
-  coupe, jamais appliqué à un `NoGrade`/`Cut` déjà acquis ni au Cut lui-même ; un Cut dédié (seuils
+  coupe. Dans cette fenêtre, le lineup angulaire est normalisé sur
+  `NEAR_TOUCHDOWN_LINEUP_REFERENCE_M = 150 m` : le seuil de 1,5° représente donc toujours environ
+  3,93 m d'écart latéral, au lieu de se resserrer artificiellement à mesure que `x` diminue ;
+  `trajectory_deviations[].lineup_deviation_m` conserve en plus l'écart signé brut. Cette règle
+  n'est jamais appliquée à un `NoGrade`/`Cut` déjà acquis ni au Cut lui-même ; un Cut dédié (seuils
   `PROJECT-DERIVED`, **non chiffrés par NATOPS** — les deux NATOPS de référence ne codifient
   `TMRD`/`W`/`TMA`/`DLW`/`DRW` que comme codes de commentaire qualitatifs, jamais un nombre)
   sanctionne un sink rate (`SINK_RATE_CUT_MPS = 8.0 m/s`, environ le double du régime nominal de
@@ -510,8 +537,8 @@ l'état du code (voir "Règles de vérité" plus haut).
   aussi `alt_m`/`bank_deg`/`sink_rate_mps` en contexte sur
   le reste de leur amplitude/tendance (non notée en dehors de ce Cut). Un échantillon n'est plus
   poussé sous
-  `TRAJECTORY_MIN_DISTANCE_M` (3 m, `src/track.rs`) : `gs_deviation_deg`/`lineup_deg` sont
-  `atan2(écart_m, x)`, et sous ce plancher un flare réaliste de quelques décimètres produisait un
+  `TRAJECTORY_MIN_DISTANCE_M` (3 m, `src/track.rs`) : les angles sont issus d'un `atan2` entre
+  l'écart et une distance de référence bornée, et sous ce plancher un flare réaliste produisait un
   angle de plusieurs dizaines de degrés sans signification géométrique (bug confirmé live le 5
   septembre 2026, corrigé le même jour). Au-dessus de ce plancher mais en dessous de
   `NEAR_TOUCHDOWN_ANGLE_REFERENCE_M` (75 m, ajouté le 5 septembre 2026 suite à un second test live
@@ -520,13 +547,14 @@ l'état du code (voir "Règles de vérité" plus haut).
   second test, appontages propres comme Cut) grossissait mécaniquement jusqu'à des dizaines de
   degrés dans les derniers mètres, faisant retomber à `NoGrade` deux passes par ailleurs
   irréprochables — dont une notée `_OK_` par DCS lui-même. Corrigé en substituant cette distance de
-  référence fixe à `x` dans le calcul d'angle une fois `x` sous ce seuil
+  référence fixe à `x` dans le calcul vertical une fois `x` sous ce seuil
   (`trajectory_deviation_angles_deg`, partagée par `Track::next` et `replay_gate_and_trajectory`) :
-  un écart réel et important continue de dégrader la note comme avant, seul l'arrondi normal et
+  Le lineup utilise séparément 150 m, calibré sur les 28 rapports humains F-14B(U) du 8 septembre
+  2026 : un écart réel et important continue de dégrader la note, seul l'arrondi normal et
   attendu près du pont n'explose plus artificiellement. Voir
   [tasking-roadmap.md](tasking-roadmap.md) pour le détail des deux bugs.
 
-**Table de note CATOBAR** (`project-derived-v4`, `PROJECT-DERIVED` sauf mention contraire ;
+**Table de note CATOBAR** (`project-derived-v5`, `PROJECT-DERIVED` sauf mention contraire ;
 `abs(GS)`/`abs(LU)` = pire valeur sur les gates comptées (voir ci-dessus pour la porte 3/4 NM) **et**
 la trajectoire continue) :
 
@@ -549,7 +577,7 @@ interne ; `cause`/`causes` (voir "Contrats de données") distinguent déjà :
 | `telemetry_gap` | gap dans le segment noté au-delà des limites de gap/extrapolation | Télémétrie trop dégradée pour mesurer |
 | `invalid_telemetry` | un sample noté a échoué à la validation (skew, temps non croissant...) | Télémétrie trop dégradée pour mesurer |
 | `position_buffer_limit` | buffer de position débordé/perdu dans le segment noté | Télémétrie trop dégradée pour mesurer |
-| `insufficient_gates` | télémétrie correcte, mais moins de trois gates valides/ordonnées | Structurel — rien à noter |
+| `insufficient_gates` | télémétrie correcte, mais couverture valide/ordonnée incomplète aux gates requises (deux ou trois selon l'éligibilité CATOBAR 3/4 NM) | Structurel — rien à noter |
 | `unconfirmed_arrest` | contact observé mais aucun brin DCS/LQM ne confirme un arrêt | Preuve manquante, pas une mesure |
 | `unknown` (`Grading::Unknown`) | avion suivi mais jamais devenu une approche notée | Pas un problème de télémétrie du tout |
 
@@ -648,23 +676,38 @@ fiabilité des événements DCS réels côté Tarawa — voir [tasking-roadmap.m
 AoA dans `datums`/`pattern_datums` est corrigé du vent une fois une référence de vent établie
 (deux appels `AtmosphereService.GetWind` à l'entrée du groove, interpolés par altitude), sinon
 retombe sur l'approximation brute (jamais une valeur fabriquée) ; `wind_reference_established`
-enregistre lequel des deux cas s'est produit. Purement diagnostique (6 septembre 2026, ajouté suite à
-une incohérence confirmée live — voir [tasking-roadmap.md](tasking-roadmap.md), P1) : les deux
-réponses brutes de ces appels sont désormais loggées individuellement en DEBUG (`probe = "high"/
-"low"`, avant toute agrégation) et exposées dans le JSON sous `wind_reference_probes` (`altitude`/
-`heading_deg`/`speed_mps` de chacune) quand la référence a été établie ; l'appel `GetWind` séparé fait
-au moment de la finalisation du rapport (`wind_heading_deg`/`wind_speed_mps`, indépendant de la
-référence AoA) logue de même sa réponse en DEBUG désormais. Rien de tout cela ne change la logique de
-correction elle-même ni n'introduit de nouveau seuil — objectif unique : donner, sur le prochain test
-live, la preuve nécessaire pour savoir laquelle des trois requêtes (haute altitude, basse altitude, ou
-requête de rapport) produit la valeur `180°/0,0 m/s` aberrante déjà observée sur 2 rapports/8. AoA
-reste affiché/loggé uniquement, jamais noté. Les
+enregistre lequel des deux cas s'est produit. Purement diagnostique/contextuel, jamais noté.
+
+`GetWind` peut renvoyer de façon intermittente un vecteur vent nul (`180°/0,0 m/s`) : confirmé
+provenir du moteur DCS lui-même, pas d'un bug de calcul côté LSO ni du fork (`../DCS-gRPC`,
+`src/rpc/atmosphere.rs`, produit fidèlement cette valeur exacte pour un vecteur DCS `(x=0, z=0)`,
+hors du contrôle de ce dépôt). Cette sentinelle est mathématiquement indiscernable d'un vrai vent
+calme, donc jamais rejetée à l'aveugle : chaque appel `GetWind` (probe basse d'entrée en groove et
+requête de fin de tentative) est retenté une seule fois — jamais en boucle — s'il la reproduit
+exactement (`query_wind_with_sentinel_retry`, `src/tasks/record_recovery.rs`). Si la probe basse
+d'entrée en groove reste suspecte après ce retry, la référence AoA réutilise la valeur de la probe
+haute (restée cohérente sur tout le corpus revu) pour les deux points d'interpolation ;
+`wind_reference_probes.low` continue toujours d'exposer la lecture brute réellement observée,
+jamais falsifiée, et `wind_reference_probes.low_reading_overridden_by_high` signale ce repli. La
+requête de fin de tentative retombe sur cette même probe haute si elle est encore suspecte après
+son propre retry, avec `wind_reading_is_groove_entry_fallback` pour le signaler dans le JSON ;
+sans référence de groove disponible, `wind_heading_deg`/`wind_speed_mps` restent la valeur brute
+(même suspecte) plutôt que d'inventer une correction. Correctif du 10 septembre 2026, non revalidé
+en mission live — voir [tasking-roadmap.md](tasking-roadmap.md), P1. Les
 tables `aoa_rating` par type (`src/data.rs`) viennent de documentation publique : bracket indexeur
 VRS pour le F/A-18C, manuel Heatblur pour le F-14 (conversion `degrees=((units/1.0989)-3.01)`),
 DisplayElectronicsUnit décompilé pour le VNAO T-45 v1.0.2 — ces tables classent la valeur AoA déjà
 calculée, elles ne la mesurent pas elles-mêmes.
 
 ## Événements et complétude
+
+`StreamEvents` est ouvert une seule fois au niveau de la session et partagé avec toutes les tracks.
+Une fin propre ou une erreur déclenche une reconnexion exponentielle de 500 ms à 30 s sans arrêter
+le collecteur de positions. Le hub conserve les 512 événements les plus récents avec séquence et
+temps DCS ; un nouvel abonnement ne rejoue que ceux dont le temps DCS est postérieur au démarrage
+de la tentative, puis `EventCorrelator` exige toujours les IDs exacts avion/navire. Après une
+fermeture géométrique, une grâce bornée de 2 s récupère dans ce journal un LQM ou contact tardif
+avant publication. `event_correlation` expose les nombres de coupures et de reconnexions.
 
 Une panne ou fermeture propre de `StreamEvents` :
 
@@ -685,6 +728,13 @@ Pour un LQM matching, le premier événement appartient uniquement à la tentati
 `GRADE:WO` est une preuve de l'issue waveoff mais pas de son auteur ; il arme la clôture de la track
 sur le départ géométrique. Les LQM ultérieurs ne sont des doublons que tant que cette même track
 n'est pas encore fermée, jamais à travers plusieurs circuits.
+
+Une finale avec entrée en groove ou gate significative 1/2-1/4 NM mais sans issue prouvée se termine
+en `Grading::ApproachOnly`, jamais en waveoff implicite. Si sa couverture est complète, la note
+d'approche et ses points restent acquis (`grading_availability = "available_approach_only"`) tandis
+que l'issue et la confiance événementielle restent inconnues. Une tentative sans groove, gate
+significative ni événement d'issue conserve `Grading::Unknown` et n'est publiée sur aucune surface
+pilote.
 
 ## Observabilité runtime
 
@@ -851,12 +901,14 @@ Le stream superviseur Birth/session reste nécessaire à la découverte et l'iso
   Discord.
 - Un artefact existant n'est jamais remplacé.
 
-Capacités des buffers bornés en mémoire (`src/track.rs`) : `datums`/`pattern_datums` et ancres
+Capacités des buffers bornés en mémoire (`src/track.rs`, `src/tasks/event_hub.rs`) :
+`datums`/`pattern_datums` et ancres
 valides séquence/tick/temps utilisées pour la couverture, 72 000
 échantillons chacun (`MAX_TRACK_SAMPLES`), `trajectory_deviations` 4 000 (`MAX_TRAJECTORY_SAMPLES`),
 preuves d'événements 256 (`MAX_EVENT_EVIDENCE`), timeline d'observations source invalides 512,
 observations de hook 2 048 (`MAX_HOOK_EVIDENCE`, ~8,5 min à 4 Hz) ; file du superviseur 16
-(`queue_high_watermark`, voir "Observabilité runtime"). Les timelines hook/source-invalide sont des
+(`queue_high_watermark`, voir "Observabilité runtime") ; journal événementiel de session 512. Les
+timelines hook/source-invalide sont des
 rings/diagnostics explicites avec booléen et compteur de troncature ; le hook évince le plus ancien
 afin de préserver prioritairement le dernier quart de nautique et le contact. Leur dépassement ne
 modifie pas la complétude positionnelle. Seule une perte/débordement de positions dans le segment
@@ -909,17 +961,22 @@ journalise display et chaîne debug. Les échecs SQLite/PNG/ACMI/Discord arriven
 JSON reste `schema_version: 3`, évolution additive : aucun ancien champ supprimé/renommé ; `cause`
 reste l'alias primaire ; `causes` contient primaire/secondaires ; `event_correlation`,
 `wind_heading_deg`/`wind_speed_mps`, `wind_reference_established` et `trajectory_deviations` sont
-des ajouts récents ; `trajectory_deviations[].alt_m`/`bank_deg`/`sink_rate_mps` et
+des ajouts récents ; `trajectory_deviations[].lineup_deviation_m`/`alt_m`/`bank_deg`/
+`sink_rate_mps` et
 `datums[].roll_deg` sont des ajouts additifs plus récents encore (contexte sur leur
 amplitude/tendance générale, mais `bank_deg`/`sink_rate_mps` alimentent chacun le Cut dédié
 sink-rate/bank — voir "Gates, outcomes et câble") ; diagnostics possibles
 `event_stream_unavailable` ; `grading_availability` peut valoir
-`unavailable_event_outcome` ; `groove_time_secs` (ajout du 5 septembre 2026) sérialise désormais
+`unavailable_event_outcome` ou `available_approach_only` ; `groove_time_secs` (ajout du 5 septembre 2026) sérialise désormais
 dans le JSON la donnée déjà utilisée pour `_OK_` automatique, auparavant calculée mais visible
 seulement dans l'embed Discord — un rapport live sans Discord configuré ne permettait alors aucune
 vérification a posteriori de l'éligibilité `_OK_`. `wind_reference_probes` (ajout du 6 septembre
 2026, absent si la référence de vent n'a jamais été établie) : les deux réponses brutes
 `GetWind` (altitude/heading/speed) derrière `wind_reference_established`, purement diagnostique.
+`wind_reference_probes.low_reading_overridden_by_high` et `wind_reading_is_groove_entry_fallback`
+(ajouts du 10 septembre 2026, ce dernier toujours présent, `false` par défaut) signalent
+respectivement quand la référence AoA et la requête de fin de tentative ont dû réutiliser la probe
+haute face à la sentinelle vent `180°/0,0 m/s` — voir "Gates, outcomes et câble" plus haut.
 `wire_estimation.arrest_deceleration_onset_time` (ajout du 6 septembre 2026, absent si aucune
 décélération soutenue n'a été détectée) : instant de l'estimateur de brin par décélération, lui
 aussi purement diagnostique. Les ajouts du 7 septembre sont `groove_entry`,
@@ -933,6 +990,11 @@ post-roll-out sans entrer dans le grading. `pattern_rendering` ajoute le nombre 
 compté à partir de zéro, son motif de sélection et le nombre de branches atténuées ; ce diagnostic décrit le
 rendu uniquement et n’affecte jamais le grading. Voir "Gates, outcomes et câble" et "Contrat de
 télémétrie" ci-dessus.
+
+Les ajouts P0 courants sont `Grading::ApproachOnly`,
+`gate_deviations.*_quality.coverage_source = "continuous_trajectory_bracket"`,
+`grading_availability = "available_approach_only"` et les compteurs
+`event_correlation.unavailability_count`/`reconnection_count`. Ils restent additifs au schema-v3.
 
 SQLite utilise le vocabulaire snake_case du JSON. L'absence d'un nouveau champ signifie
 legacy/unknown, jamais favorable. `points_awarded` (`src/db.rs`, booléen) distingue explicitement

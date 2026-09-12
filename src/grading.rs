@@ -363,6 +363,25 @@ pub fn compute_pass_grade_with_reason(
             PassGrade::Incomplete,
             "Grading unavailable: no recognisable approach was recorded.".to_string(),
         ),
+        Grading::ApproachOnly => {
+            if gates.all_valid(groove_entry_time) {
+                let (grade, reason) = grade_from_gates_with_reason(
+                    gates,
+                    trajectory,
+                    groove_time_secs,
+                    groove_entry_time,
+                );
+                (
+                    grade,
+                    format!("Approach only (outcome unknown): {reason}"),
+                )
+            } else {
+                (
+                    PassGrade::Incomplete,
+                    "Grading unavailable: required gate coverage was not captured in valid chronological brackets. A positioning/detection limitation, not a pilot failure.".to_string(),
+                )
+            }
+        }
         Grading::WaveoffUnknown => (
             PassGrade::WaveoffUnknown,
             "WO?: went around; can't tell from the data who or what caused it.".to_string(),
@@ -392,7 +411,7 @@ pub fn compute_pass_grade_with_reason(
         }
         Grading::TouchAndGo { .. } | Grading::Bolter | Grading::Recovered { .. } => (
             PassGrade::Incomplete,
-            "Grading unavailable: fewer than three valid, ordered gates were captured. A positioning/detection limitation, not a pilot failure.".to_string(),
+            "Grading unavailable: required gate coverage was not captured in valid chronological brackets. A positioning/detection limitation, not a pilot failure.".to_string(),
         ),
     }
 }
@@ -406,9 +425,14 @@ pub fn compute_pass_grade_with_reason(
 pub fn compute_vstol_approach_grade_points(
     grading: &Grading,
     gates: &GateDeviations,
+    trajectory: &[TrajectoryDeviation],
 ) -> (PassGrade, Option<f64>) {
     match grading {
         Grading::Unknown => (PassGrade::Incomplete, None),
+        Grading::ApproachOnly if gates.all_valid(None) => {
+            vstol_grade_from_coverage(gates, trajectory)
+        }
+        Grading::ApproachOnly => (PassGrade::Incomplete, None),
         Grading::WaveoffUnknown => (PassGrade::WaveoffUnknown, None),
         // V/STOL never relaxes the 3/4 NM gate requirement: unlike CATOBAR, it has no
         // roll-out-confirmed groove entry to distinguish a mid-turn reading from a real one (see
@@ -417,32 +441,71 @@ pub fn compute_vstol_approach_grade_points(
         Grading::Bolter if gates.all_valid(None) => (PassGrade::Bolter, PassGrade::Bolter.points()),
         Grading::TouchAndGo { .. } => (PassGrade::Incomplete, None),
         Grading::Recovered { .. } if gates.all_valid(None) => {
-            let mut gate_scores = Vec::with_capacity(3);
-            if let Some(gate) = gates.at_three_quarter_nm.as_ref() {
-                gate_scores.push(grade_single_gate(gate, false).points().unwrap_or_default());
-            }
-            if let Some(gate) = gates.at_half_nm.as_ref() {
-                gate_scores.push(grade_single_gate(gate, false).points().unwrap_or_default());
-            }
-            if let Some(gate) = gates.at_quarter_nm.as_ref() {
-                gate_scores.push(grade_single_gate(gate, true).points().unwrap_or_default());
-            }
-
-            if gate_scores.is_empty() {
-                // V/STOL never earns `_OK_`/groove-time bonuses (see this function's doc
-                // comment), so `None` here is not a simplification, it is the actual rule.
-                let fallback = grade_from_gates(gates, &[], None, None);
-                (fallback, fallback.points())
-            } else {
-                let average_points = gate_scores.iter().sum::<f64>() / gate_scores.len() as f64;
-                (
-                    map_vstol_approach_points_to_grade(average_points),
-                    Some(average_points),
-                )
-            }
+            vstol_grade_from_coverage(gates, trajectory)
         }
         Grading::Bolter | Grading::Recovered { .. } => (PassGrade::Incomplete, None),
     }
+}
+
+fn vstol_grade_from_coverage(
+    gates: &GateDeviations,
+    trajectory: &[TrajectoryDeviation],
+) -> (PassGrade, Option<f64>) {
+    let gate_scores = [
+        vstol_gate_points(
+            gates.at_three_quarter_nm.as_ref(),
+            trajectory,
+            crate::track::GATE_THREE_QUARTER_NM,
+            false,
+        ),
+        vstol_gate_points(
+            gates.at_half_nm.as_ref(),
+            trajectory,
+            crate::track::GATE_HALF_NM,
+            false,
+        ),
+        vstol_gate_points(
+            gates.at_quarter_nm.as_ref(),
+            trajectory,
+            crate::track::GATE_QUARTER_NM,
+            true,
+        ),
+    ];
+    let Some(gate_scores) = gate_scores.into_iter().collect::<Option<Vec<_>>>() else {
+        return (PassGrade::Incomplete, None);
+    };
+    let average_points = gate_scores.iter().sum::<f64>() / gate_scores.len() as f64;
+    (
+        map_vstol_approach_points_to_grade(average_points),
+        Some(average_points),
+    )
+}
+
+fn vstol_gate_points(
+    gate: Option<&crate::track::GateDatum>,
+    trajectory: &[TrajectoryDeviation],
+    distance_m: f64,
+    is_quarter: bool,
+) -> Option<f64> {
+    if let Some(gate) = gate {
+        return grade_single_gate(gate, is_quarter).points();
+    }
+    let [outer, inner] = trajectory.windows(2).find_map(|pair| {
+        (pair[0].distance_m > distance_m && pair[1].distance_m <= distance_m)
+            .then(|| [pair[0].clone(), pair[1].clone()])
+    })?;
+    let span = outer.distance_m - inner.distance_m;
+    if span <= f64::EPSILON {
+        return None;
+    }
+    let ratio = (outer.distance_m - distance_m) / span;
+    let interpolate = |a: f64, b: f64| a + (b - a) * ratio;
+    grade_gate_values(
+        interpolate(outer.gs_deviation_deg, inner.gs_deviation_deg),
+        interpolate(outer.lineup_deg, inner.lineup_deg),
+        is_quarter,
+    )
+    .points()
 }
 
 fn map_vstol_approach_points_to_grade(points: f64) -> PassGrade {
@@ -465,13 +528,17 @@ fn map_vstol_approach_points_to_grade(points: f64) -> PassGrade {
 }
 
 fn grade_single_gate(gate: &crate::track::GateDatum, quarter_nm: bool) -> PassGrade {
-    if quarter_nm && gate.gs_deviation_deg < GS_CUT_LOW_DEG {
+    grade_gate_values(gate.gs_deviation_deg, gate.lineup_deg, quarter_nm)
+}
+
+fn grade_gate_values(gs_deviation_deg: f64, lineup_deg: f64, quarter_nm: bool) -> PassGrade {
+    if quarter_nm && gs_deviation_deg < GS_CUT_LOW_DEG {
         return PassGrade::Cut;
     }
 
-    let gs_high = gate.gs_deviation_deg.max(0.0);
-    let gs_low = gate.gs_deviation_deg.min(0.0).abs();
-    let lineup = gate.lineup_deg.abs();
+    let gs_high = gs_deviation_deg.max(0.0);
+    let gs_low = gs_deviation_deg.min(0.0).abs();
+    let lineup = lineup_deg.abs();
 
     if gs_high >= GS_SIGNIFICANT || gs_low >= GS_SIGNIFICANT || lineup >= LU_MEDIUM {
         PassGrade::NoGrade
@@ -1139,6 +1206,7 @@ mod tests {
             distance_m,
             gs_deviation_deg,
             lineup_deg,
+            lineup_deviation_m: 0.0,
             track_angle_deg: 0.0,
             alt_m: 0.0,
             bank_deg: 0.0,
@@ -1159,6 +1227,7 @@ mod tests {
             distance_m,
             gs_deviation_deg,
             lineup_deg,
+            lineup_deviation_m: 0.0,
             track_angle_deg: 0.0,
             alt_m: 0.0,
             bank_deg: 0.0,
@@ -1259,6 +1328,7 @@ mod tests {
             distance_m,
             gs_deviation_deg: 0.0,
             lineup_deg: 0.0,
+            lineup_deviation_m: 0.0,
             track_angle_deg: 0.0,
             alt_m: 0.0,
             bank_deg,
@@ -1878,7 +1948,7 @@ mod tests {
         };
         let gates = gates_deg(0.2, 0.3, -0.2, 0.4, 0.1, 0.2);
 
-        let (grade, points) = compute_vstol_approach_grade_points(&grading, &gates);
+        let (grade, points) = compute_vstol_approach_grade_points(&grading, &gates, &[]);
 
         assert_eq!(grade, PassGrade::Ok);
         assert!((points.unwrap() - 4.0).abs() < 1e-9);
@@ -1893,7 +1963,7 @@ mod tests {
         // 3/4 nm = -- (2.0), other gates = OK (4.0): average = 10 / 3.
         let gates = gates_deg(1.0, 0.2, 0.1, 0.2, 0.1, 0.1);
 
-        let (grade, points) = compute_vstol_approach_grade_points(&grading, &gates);
+        let (grade, points) = compute_vstol_approach_grade_points(&grading, &gates, &[]);
 
         assert_eq!(grade, PassGrade::OkParentheses);
         assert!((points.unwrap() - (10.0 / 3.0)).abs() < 1e-9);
@@ -1908,7 +1978,7 @@ mod tests {
         // 3/4 nm = (OK) (3.0), other gates = OK (4.0): average = 11 / 3.
         let gates = gates_deg(0.5, 0.2, 0.1, 0.2, 0.1, 0.1);
 
-        let (grade, points) = compute_vstol_approach_grade_points(&grading, &gates);
+        let (grade, points) = compute_vstol_approach_grade_points(&grading, &gates, &[]);
 
         assert_eq!(grade, PassGrade::Ok);
         assert!((points.unwrap() - (11.0 / 3.0)).abs() < 1e-9);
@@ -1949,7 +2019,7 @@ mod tests {
 
         for (grading, expected_grade, expected_points) in cases {
             assert_eq!(
-                compute_vstol_approach_grade_points(&grading, &gates),
+                compute_vstol_approach_grade_points(&grading, &gates, &[]),
                 (expected_grade, expected_points)
             );
         }
@@ -2208,7 +2278,7 @@ mod tests {
         assert_eq!(grade, PassGrade::Incomplete);
         assert_eq!(
             reason,
-            "Grading unavailable: fewer than three valid, ordered gates were captured. A positioning/detection limitation, not a pilot failure."
+            "Grading unavailable: required gate coverage was not captured in valid chronological brackets. A positioning/detection limitation, not a pilot failure."
         );
     }
 }

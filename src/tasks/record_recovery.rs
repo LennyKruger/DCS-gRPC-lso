@@ -1,6 +1,8 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::io::Cursor;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::future::Either;
@@ -69,21 +71,29 @@ struct RecoveryReport<'a> {
     /// Continuous groove-to-touchdown GS/lineup series (see `TrajectoryDeviation`), additive
     /// to `gate_deviations`. Empty for a pass that never entered the groove.
     trajectory_deviations: &'a [TrajectoryDeviation],
-    /// Wind at the carrier's position, queried once at report time. Contextual only: it never
-    /// changes `pass_grade`/`grade_points` (see docs/GRADING_REFERENCE.md, "Wind"). Absent when
-    /// the query failed.
+    /// Wind at the carrier's position, queried once at report time (with one bounded retry and a
+    /// fallback to the groove-entry high probe if `GetWind` keeps reading DCS's known
+    /// `180deg/0.0 m/s` sentinel — see `wind_reading_is_groove_entry_fallback` and
+    /// `tasking-roadmap.md`, P1). Contextual only: it never changes `pass_grade`/`grade_points`
+    /// (see docs/GRADING_REFERENCE.md, "Wind"). Absent when every query attempt failed outright.
     #[serde(skip_serializing_if = "Option::is_none")]
     wind_heading_deg: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     wind_speed_mps: Option<f32>,
+    /// `true` when `wind_heading_deg`/`wind_speed_mps` above come from the groove-entry high
+    /// probe rather than this report's own `GetWind` query, because that query still looked like
+    /// the sentinel after one retry. `false` otherwise, including when the query simply failed
+    /// (in which case the two fields above are absent). Diagnostic only, never used for grading.
+    wind_reading_is_groove_entry_fallback: bool,
     /// Whether a wind reference was established for the AoA correction in `datums`/
     /// `pattern_datums` (see docs/GRADING_REFERENCE.md, "AoA"). `false` means every recorded
     /// `aoa` value is the raw, wind-uncorrected geometric approximation for this recovery.
     wind_reference_established: bool,
     /// Raw `GetWind` probes behind `wind_reference_established`, kept for live diagnosis of a
-    /// confirmed anomaly (two reports out of eight reading `180deg/0.0 m/s` against a consistent
-    /// `95deg/0.99-1.42 m/s` on the other six, same ship/mission/timeframe) — see
-    /// `tasking-roadmap.md`. Never used for grading.
+    /// confirmed anomaly (the low-altitude probe intermittently reading DCS's `180deg/0.0 m/s`
+    /// sentinel while the high probe stays coherent) — see `tasking-roadmap.md`, P1. Never used
+    /// for grading; see `WindReferenceProbes::low_reading_overridden_by_high` for when the
+    /// sentinel forced a fallback to the high probe for the AoA correction itself.
     #[serde(skip_serializing_if = "Option::is_none")]
     wind_reference_probes: Option<crate::track::WindReferenceProbes>,
     datums: &'a [Datum],
@@ -196,9 +206,10 @@ struct ReportCauses<'a> {
 // (`trajectory_deviations`), not only the three point-in-time gates.
 // v3: a worsening correction trend in the final seconds can cap an otherwise-Ok pass at (OK).
 // v4: a moderate deviation inside the last 150 m before the ramp can cap an otherwise-Ok/(OK)
-// pass at NoGrade — see docs/GRADING_REFERENCE.md, "Continuous trajectory", "Correction trend"
-// and "Late-approach weighting".
-const GRADING_VERSION: &str = "project-derived-v4";
+// pass at NoGrade.
+// v5: lineup inside that window uses a fixed 150 m angular reference and exposes its raw offset
+// in metres, so proximity to the ramp does not silently tighten the lateral threshold.
+const GRADING_VERSION: &str = "project-derived-v5";
 const GRADING_SOURCE: &str = "PROJECT-DERIVED";
 #[derive(Debug)]
 struct HookPoll {
@@ -324,6 +335,45 @@ fn unix_time_ms() -> u64 {
         .min(u64::MAX as u128) as u64
 }
 
+/// Query `GetWind`, retrying once (bounded — never a loop) if the first response looks like
+/// DCS's known `180deg/0.0 m/s` sentinel (`tasking-roadmap.md`, P1). A single retry is enough to
+/// ride out a transient hit without stacking extra `GetWind` calls onto the Lua-side telemetry
+/// thread for the rest of the groove; a persistent sentinel after the retry is still returned
+/// as-is; callers decide whether/how to fall back. `probe` only labels the tracing spans.
+async fn query_wind_with_sentinel_retry(
+    atmo: &mut crate::client::AtmosphereClient,
+    lat: f64,
+    lon: f64,
+    alt: f64,
+    probe: &'static str,
+) -> Option<(u16, f32)> {
+    let first = atmo.get_wind(lat, lon, alt).await;
+    tracing::debug!(probe, alt_m = alt, result = ?first, "wind query");
+    match first {
+        Ok(w) if crate::track::is_wind_sentinel(w) => {
+            let retried = atmo.get_wind(lat, lon, alt).await;
+            tracing::debug!(
+                probe,
+                alt_m = alt,
+                result = ?retried,
+                "wind query retry after suspected DCS sentinel"
+            );
+            match retried {
+                Ok(w) => Some(w),
+                Err(err) => {
+                    tracing::warn!(probe, ?err, "failed to query wind on sentinel retry");
+                    None
+                }
+            }
+        }
+        Ok(w) => Some(w),
+        Err(err) => {
+            tracing::warn!(probe, ?err, "failed to query wind");
+            None
+        }
+    }
+}
+
 fn drain_hook_samples(
     rx: &mut mpsc::Receiver<HookPoll>,
     track: &mut Track,
@@ -363,6 +413,7 @@ pub static GRADE_DATE_FORMAT: Lazy<Vec<time::format_description::FormatItem<'_>>
 fn recovery_outcome(grading: &Grading, is_vstol: bool) -> String {
     match (is_vstol, grading) {
         (_, Grading::Unknown) => "unknown".to_string(),
+        (_, Grading::ApproachOnly) => "Approach only — outcome unknown".to_string(),
         (_, Grading::Bolter) => "Bolter".to_string(),
         // Intentional bolters are valid only for arrested recoveries. Keep the
         // V/STOL fallback defensive in case an invalid grading reaches this layer.
@@ -403,11 +454,73 @@ fn completeness_cause(completeness: crate::track::Completeness) -> &'static str 
     }
 }
 
+fn correlate_late_event(
+    correlator: &mut super::event_correlator::EventCorrelator,
+    track: &mut Track,
+    event: super::event_hub::SessionEvent,
+) {
+    match (event.time_dcs, event.event) {
+        (
+            time,
+            Event::LandingQualityMark(LandingQualityMarkEvent {
+                initiator:
+                    Some(Initiator {
+                        initiator: Some(initiator::Initiator::Unit(plane)),
+                    }),
+                place:
+                    Some(Airbase {
+                        unit: Some(carrier),
+                        ..
+                    }),
+                comment,
+            }),
+        ) if correlator.accepts_pair(plane.id, carrier.id) => {
+            correlator.landing_quality_mark(track, time, comment);
+        }
+        (
+            time,
+            Event::Land(LandEvent {
+                initiator:
+                    Some(Initiator {
+                        initiator: Some(initiator::Initiator::Unit(plane)),
+                    }),
+                place:
+                    Some(Airbase {
+                        unit: Some(carrier),
+                        ..
+                    }),
+            }),
+        ) if correlator.accepts_pair(plane.id, carrier.id) => {
+            correlator.touchdown(track, "late_land", time, carrier, plane);
+        }
+        (
+            time,
+            Event::RunwayTouch(RunwayTouchEvent {
+                initiator:
+                    Some(Initiator {
+                        initiator: Some(initiator::Initiator::Unit(plane)),
+                    }),
+                place:
+                    Some(Airbase {
+                        unit: Some(carrier),
+                        ..
+                    }),
+            }),
+        ) if correlator.accepts_pair(plane.id, carrier.id) => {
+            correlator.touchdown(track, "late_runway_touch", time, carrier, plane);
+        }
+        _ => {}
+    }
+}
+
 #[tracing::instrument(
     skip_all,
     fields(carrier_name = params.carrier_name, plane_name = params.plane_name)
 )]
-pub async fn record_recovery(params: TaskParams<'_>) -> Result<(), crate::error::Error> {
+pub async fn record_recovery(
+    params: TaskParams<'_>,
+    attempt_started_at_dcs: f64,
+) -> Result<(), crate::error::Error> {
     let recording_started = Instant::now();
     let _recovery_guard = crate::metrics::RUNTIME_METRICS.recovery();
     let _priority_guard = PriorityCollectorGuard::new(&params);
@@ -531,25 +644,29 @@ pub async fn record_recovery(params: TaskParams<'_>) -> Result<(), crate::error:
         write_acmi!(create_initial_update(client, 2, params.plane_name).await?);
     }
 
-    let events: BoxStream<'_, Result<(f64, Event), tonic::Status>> = if params.positions_only {
-        futures_util::stream::pending().boxed()
+    let (events, event_progress): (
+        BoxStream<'_, super::event_hub::SessionEventMessage>,
+        Arc<AtomicU64>,
+    ) = if params.positions_only {
+        (
+            futures_util::stream::pending().boxed(),
+            Arc::new(AtomicU64::new(0)),
+        )
     } else {
-        match mission
-            .as_mut()
-            .expect("mission client enabled outside positions-only")
-            .stream_events()
-            .await
-        {
-            Ok(events) => events
-                .chain(futures_util::stream::once(async {
-                    Err(tonic::Status::unavailable("clean_end_of_event_stream"))
-                }))
-                .boxed(),
-            Err(status) => futures_util::stream::once(async move { Err(*status) }).boxed(),
-        }
+        let (subscription, event_progress) = params
+            .event_hub
+            .as_ref()
+            .expect("session event hub enabled outside positions-only")
+            .subscribe(attempt_started_at_dcs);
+        (
+            futures_util::stream::unfold(subscription, |mut subscription| async move {
+                let message = subscription.recv().await;
+                Some((message, subscription))
+            })
+            .boxed(),
+            event_progress,
+        )
     };
-    let _event_stream_guard =
-        (!params.positions_only).then(|| crate::metrics::RUNTIME_METRICS.stream());
     let (mut hook_rx, _hook_sampler) = match (
         params.carrier_info.is_vstol(),
         params.hook_sampling.mode == super::HookSamplingMode::Independent,
@@ -774,32 +891,47 @@ pub async fn record_recovery(params: TaskParams<'_>) -> Result<(), crate::error:
                     {
                         wind_reference_queried = true;
                         let mut atmo = crate::client::AtmosphereClient::new(params.ch.clone());
-                        // Logged individually, on both success and failure, so a live anomaly
-                        // (`AGENTS.md`/`tasking-roadmap.md`: two reports out of eight reading
-                        // `180deg/0.0 m/s` against a consistent `95deg/0.99-1.42 m/s` on the other
-                        // six) can be traced to a specific probe rather than only the combined
-                        // outcome below.
-                        let high = atmo.get_wind(plane.lat, plane.lon, plane.alt).await;
-                        tracing::debug!(
-                            probe = "high",
-                            alt_m = plane.alt,
-                            result = ?high,
-                            "wind reference probe for AoA correction"
-                        );
-                        let low = atmo.get_wind(plane.lat, plane.lon, carrier.alt).await;
-                        tracing::debug!(
-                            probe = "low",
-                            alt_m = carrier.alt,
-                            result = ?low,
-                            "wind reference probe for AoA correction"
-                        );
+                        // The low probe (near the deck) is the one seen hitting DCS's sentinel in
+                        // practice; each query is individually retried once on that sentinel so a
+                        // live anomaly can still be traced to a specific probe/attempt below.
+                        let high = query_wind_with_sentinel_retry(
+                            &mut atmo, plane.lat, plane.lon, plane.alt, "high",
+                        )
+                        .await;
+                        let low = query_wind_with_sentinel_retry(
+                            &mut atmo,
+                            plane.lat,
+                            plane.lon,
+                            carrier.alt,
+                            "low",
+                        )
+                        .await;
                         match (high, low) {
-                            (Ok((high_dir, high_speed)), Ok((low_dir, low_speed))) => {
+                            (Some((high_dir, high_speed)), Some((low_dir, low_speed))) => {
+                                let high_is_sentinel =
+                                    crate::track::is_wind_sentinel((high_dir, high_speed));
+                                let low_is_sentinel =
+                                    crate::track::is_wind_sentinel((low_dir, low_speed));
+                                // Still sentinel after the bounded retry above: reuse the high
+                                // probe's wind vector for the low-altitude point too (DCS wind is
+                                // altitude-dependent but static over time, and the high probe has
+                                // stayed coherent in every corpus report reviewed so far) rather
+                                // than feed a known-bad zero into the AoA correction. The raw
+                                // `low` reading is still recorded as-is in `WindProbe` below.
+                                let use_high_for_low = low_is_sentinel && !high_is_sentinel;
+                                let (reference_low_dir, reference_low_speed) = if use_high_for_low {
+                                    (high_dir, high_speed)
+                                } else {
+                                    (low_dir, low_speed)
+                                };
                                 datums.set_wind_reference(
                                     plane.alt,
                                     crate::track::wind_velocity_vector(high_dir, high_speed),
                                     carrier.alt,
-                                    crate::track::wind_velocity_vector(low_dir, low_speed),
+                                    crate::track::wind_velocity_vector(
+                                        reference_low_dir,
+                                        reference_low_speed,
+                                    ),
                                 );
                                 datums.set_wind_reference_probes(
                                     crate::track::WindProbe {
@@ -812,6 +944,7 @@ pub async fn record_recovery(params: TaskParams<'_>) -> Result<(), crate::error:
                                         heading_deg: low_dir,
                                         speed_mps: low_speed,
                                     },
+                                    use_high_for_low,
                                 );
                             }
                             (high, low) => {
@@ -855,18 +988,19 @@ pub async fn record_recovery(params: TaskParams<'_>) -> Result<(), crate::error:
                 }
             }
 
-            Either::Right(Err(status)) => {
-                tracing::warn!(?status, "mission event stream ended during recovery");
-                let detail = if status.message() == "clean_end_of_event_stream" {
-                    "clean_end_of_stream".to_string()
-                } else {
-                    format!("{}: {}", grpc_code_name(status.code()), status.message())
-                };
+            Either::Right(super::event_hub::SessionEventMessage::StreamUnavailable(detail)) => {
+                tracing::warn!(%detail, "mission event stream unavailable during recovery");
                 event_correlator.stream_unavailable(&mut datums, detail);
             }
 
+            Either::Right(super::event_hub::SessionEventMessage::StreamAvailable) => {
+                event_correlator.stream_available(&mut datums);
+            }
+
             // DCS landing grade
-            Either::Right(Ok(event)) => match event {
+            Either::Right(super::event_hub::SessionEventMessage::Event {
+                time_dcs, event, ..
+            }) => match (time_dcs, *event) {
                 (
                     time,
                     Event::LandingQualityMark(LandingQualityMarkEvent {
@@ -1087,6 +1221,31 @@ pub async fn record_recovery(params: TaskParams<'_>) -> Result<(), crate::error:
         );
     }
 
+    // Geometry can close a pass just before DCS publishes its LQM/contact event. Keep a short,
+    // bounded grace period, then replay only newer entries from the session journal. This closes
+    // the hand-off race without holding the next track open or accepting an event from an older
+    // attempt (the journal is additionally filtered by attempt DCS time and exact unit IDs).
+    if !params.positions_only && datums.has_recognisable_approach() {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        if let Some(event_hub) = params.event_hub.as_ref() {
+            for event in event_hub.snapshot_since(attempt_started_at_dcs) {
+                if event.sequence <= event_progress.load(Ordering::Relaxed) {
+                    continue;
+                }
+                correlate_late_event(&mut event_correlator, &mut datums, event);
+            }
+            let (available, detail) = event_hub.status();
+            if available {
+                event_correlator.stream_available(&mut datums);
+            } else {
+                event_correlator.stream_unavailable(
+                    &mut datums,
+                    detail.unwrap_or_else(|| "event_stream_unavailable".to_string()),
+                );
+            }
+        }
+    }
+
     // If the plane was never below 100 m MSL, discard as a non-attempt.
     // Waveoffs and bolters still pass this check since they require being in the groove.
     if lowest_altitude > 100.0 {
@@ -1223,6 +1382,7 @@ pub async fn record_recovery(params: TaskParams<'_>) -> Result<(), crate::error:
         | crate::track::Completeness::BufferLimit) => completeness_cause(cause),
         crate::track::Completeness::Complete => match track.grading {
             Grading::WaveoffUnknown => "go_around_initiator_unknown",
+            Grading::ApproachOnly => "approach_only_outcome_unknown",
             Grading::Bolter => "deck_crossing_without_arrest",
             Grading::TouchAndGo { .. } => "hook_up_near_deck",
             Grading::Recovered { .. } => "correlated_touchdown",
@@ -1256,6 +1416,8 @@ pub async fn record_recovery(params: TaskParams<'_>) -> Result<(), crate::error:
     let grading_availability =
         if track.telemetry_quality.completeness != crate::track::Completeness::Complete {
             "unavailable_technical"
+        } else if matches!(track.grading, Grading::ApproachOnly) {
+            "available_approach_only"
         } else if event_outcome_unavailable {
             "unavailable_event_outcome"
         } else {
@@ -1276,31 +1438,40 @@ pub async fn record_recovery(params: TaskParams<'_>) -> Result<(), crate::error:
     };
     let json_path = pipeline.json_path();
 
-    // Query wind at the carrier's last known position, once per recovery. Purely contextual:
-    // see docs/GRADING_REFERENCE.md, "Wind" — it never affects pass_grade/grade_points. A query
-    // failure is non-fatal and just omits the field from the report. Skipped in
+    // Query wind at the carrier's last known position, once per recovery (with one bounded retry
+    // on DCS's known sentinel — see `query_wind_with_sentinel_retry`). Purely contextual: see
+    // docs/GRADING_REFERENCE.md, "Wind" — it never affects pass_grade/grade_points. Skipped in
     // `--positions-only`, which documents that it never queries output-only DCS metadata.
-    let wind_mps: Option<(u16, f32)> = if params.positions_only {
-        None
+    let (wind_mps, wind_reading_is_groove_entry_fallback): (Option<(u16, f32)>, bool) = if params
+        .positions_only
+    {
+        (None, false)
     } else {
         let mut atmo = crate::client::AtmosphereClient::new(params.ch.clone());
-        match atmo
-            .get_wind(last_carrier_lat, last_carrier_lon, last_carrier_alt)
-            .await
+        match query_wind_with_sentinel_retry(
+            &mut atmo,
+            last_carrier_lat,
+            last_carrier_lon,
+            last_carrier_alt,
+            "report_time",
+        )
+        .await
         {
-            Ok(w) => {
-                tracing::debug!(
-                    heading_deg = w.0,
-                    speed_mps = w.1,
-                    alt_m = last_carrier_alt,
-                    "report-time wind query at carrier position"
-                );
-                Some(w)
+            Some(w) if crate::track::is_wind_sentinel(w) => {
+                // Still the sentinel after the retry: fall back to this recovery's
+                // groove-entry high probe (queried at the aircraft's own altitude, stayed
+                // coherent in every corpus report reviewed so far) instead of surfacing a
+                // known-bad zero, when one was established.
+                match track.wind_reference_probes.map(|p| p.high) {
+                    Some(high)
+                        if !crate::track::is_wind_sentinel((high.heading_deg, high.speed_mps)) =>
+                    {
+                        (Some((high.heading_deg, high.speed_mps)), true)
+                    }
+                    _ => (Some(w), false),
+                }
             }
-            Err(err) => {
-                tracing::warn!(?err, "failed to query wind at carrier position");
-                None
-            }
+            other => (other, false),
         }
     };
 
@@ -1318,7 +1489,7 @@ pub async fn record_recovery(params: TaskParams<'_>) -> Result<(), crate::error:
         || track.gate_deviations.at_three_quarter_nm.is_some()
         || track.gate_deviations.at_half_nm.is_some()
         || track.gate_deviations.at_quarter_nm.is_some();
-    let has_outcome = !matches!(track.grading, Grading::Unknown);
+    let has_outcome = !matches!(track.grading, Grading::Unknown | Grading::ApproachOnly);
     let assessment_scope = if track.telemetry_quality.completeness
         == crate::track::Completeness::Complete
         && has_approach_evidence
@@ -1383,6 +1554,7 @@ pub async fn record_recovery(params: TaskParams<'_>) -> Result<(), crate::error:
         trajectory_deviations: &track.trajectory_deviations,
         wind_heading_deg: wind_mps.map(|(heading, _)| heading),
         wind_speed_mps: wind_mps.map(|(_, speed)| speed),
+        wind_reading_is_groove_entry_fallback,
         wind_reference_established: track.wind_reference_established,
         wind_reference_probes: track.wind_reference_probes,
         datums: &track.datums,
@@ -1675,17 +1847,37 @@ pub async fn record_recovery(params: TaskParams<'_>) -> Result<(), crate::error:
                 .field(
                     "Gates (GS / LU)",
                     {
-                        let fmt = |g: Option<&crate::track::GateDatum>| match g {
-                            Some(d) => {
-                                format!("{:+.1}° / {:+.1}°", d.gs_deviation_deg, d.lineup_deg)
+                        let fmt = |g: Option<&crate::track::GateDatum>,
+                                   q: &crate::track::GateQuality|
+                         -> String {
+                            match g {
+                                Some(d) => format!(
+                                    "{:+.1}° / {:+.1}°",
+                                    d.gs_deviation_deg, d.lineup_deg
+                                ),
+                                None
+                                    if q.coverage_source
+                                        == Some("continuous_trajectory_bracket") =>
+                                {
+                                    "covered by continuous trajectory".to_string()
+                                }
+                                None => "-".to_string(),
                             }
-                            None => "-".to_string(),
                         };
                         Cow::Owned(format!(
                             "3/4nm: {}\n1/2nm: {}\n1/4nm: {}",
-                            fmt(track.gate_deviations.at_three_quarter_nm.as_ref()),
-                            fmt(track.gate_deviations.at_half_nm.as_ref()),
-                            fmt(track.gate_deviations.at_quarter_nm.as_ref()),
+                            fmt(
+                                track.gate_deviations.at_three_quarter_nm.as_ref(),
+                                &track.gate_deviations.three_quarter_quality
+                            ),
+                            fmt(
+                                track.gate_deviations.at_half_nm.as_ref(),
+                                &track.gate_deviations.half_quality
+                            ),
+                            fmt(
+                                track.gate_deviations.at_quarter_nm.as_ref(),
+                                &track.gate_deviations.quarter_quality
+                            ),
                         ))
                     },
                     false,
@@ -1923,11 +2115,57 @@ fn changed_precision(a: Option<f64>, b: Option<f64>, theta: f64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{drain_hook_samples, grpc_code_name, recovery_id, recovery_outcome, HookPoll};
+    use super::{
+        correlate_late_event, drain_hook_samples, grpc_code_name, recovery_id, recovery_outcome,
+        HookPoll,
+    };
     use crate::data::{AirplaneInfo, CarrierInfo};
     use crate::tasks::event_correlator::transform_from_event_unit;
     use crate::track::{Grading, HookSampleStatus, Track};
-    use stubs::common::v0::{Orientation, Position, Unit};
+    use stubs::common::v0::{initiator, Airbase, Initiator, Orientation, Position, Unit};
+    use stubs::mission::v0::stream_events_response::{Event, LandingQualityMarkEvent};
+
+    #[test]
+    fn late_journal_lqm_is_correlated_to_the_current_pair() {
+        let carrier_info = CarrierInfo::by_type("CVN_71").unwrap();
+        let plane_info = AirplaneInfo::by_type("FA-18C_hornet").unwrap();
+        let mut track = Track::new("pilot", carrier_info, plane_info);
+        let mut correlator = crate::tasks::event_correlator::EventCorrelator::new(10, 20);
+        correlate_late_event(
+            &mut correlator,
+            &mut track,
+            crate::tasks::event_hub::SessionEvent {
+                sequence: 7,
+                time_dcs: 42.0,
+                event: Event::LandingQualityMark(LandingQualityMarkEvent {
+                    initiator: Some(Initiator {
+                        initiator: Some(initiator::Initiator::Unit(Unit {
+                            id: 10,
+                            ..Unit::default()
+                        })),
+                    }),
+                    place: Some(Airbase {
+                        unit: Some(Unit {
+                            id: 20,
+                            ..Unit::default()
+                        }),
+                        ..Airbase::default()
+                    }),
+                    comment: "LSO: GRADE:OK : WIRE# 3 [BC]".to_string(),
+                }),
+            },
+        );
+
+        let result = track.finish();
+        assert_eq!(
+            result.grading,
+            Grading::Recovered {
+                cable: Some(3),
+                cable_estimated: None,
+            }
+        );
+        assert!(correlator.summary(&result.grading).outcome_confirmed);
+    }
 
     #[tokio::test]
     async fn independent_hook_work_does_not_delay_position_ticks() {

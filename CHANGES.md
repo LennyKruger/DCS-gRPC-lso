@@ -7,6 +7,15 @@ This file records user-visible changes. The crate version remains `0.2.0`; chang
 
 ### Added
 
+- Session-level `StreamEvents` hub with in-place reconnect, a 512-event DCS-time journal, exact
+  aircraft/carrier correlation and a two-second finalization grace period for late LQM/contact
+  events. JSON event correlation reports interruption and reconnection counts
+  (`src/tasks/event_hub.rs`, `src/commands/run.rs`, `src/tasks/record_recovery.rs`).
+- `ApproachOnly` distinguishes a recognisable final with no proven outcome from both a waveoff and
+  a false start. A complete positional assessment keeps its project grade and points even when the
+  event outcome is unavailable; attempts with no groove, significant gate or outcome remain
+  unpublished (`src/track.rs`, `src/grading.rs`, `src/tasks/record_recovery.rs`).
+
 - Additive `pattern_rendering` JSON diagnostic records the number of continuous pattern branches,
   the zero-based primary branch selected for normal display, why it was selected and how many
   older branches were attenuated (`src/draw.rs`, `src/tasks/record_recovery.rs`).
@@ -20,6 +29,12 @@ This file records user-visible changes. The crate version remains `0.2.0`; chang
 
 ### Changed
 
+- Grading is now versioned `project-derived-v5`. Continuous lineup inside the final 150 m uses a
+  dedicated 150 m angular reference instead of the vertical 75 m flare reference, so the 1.5°
+  late-lineup threshold consistently represents about 3.93 m throughout that window. The raw
+  signed lateral displacement is serialized additively as
+  `trajectory_deviations[].lineup_deviation_m`; the 75 m glideslope guard is unchanged
+  (`src/track.rs`, `src/tasks/record_recovery.rs`).
 - Case I CATOBAR groove entry now follows an explicit port-pattern/final-turn/roll-out state
   machine: the last turn arms only inbound below 600 ft, and `|bank| <= 10°` must then persist for
   0.75 source seconds. The 3/4 NM distance, lineup, ground route and lineup trend no longer delay a
@@ -34,6 +49,23 @@ This file records user-visible changes. The crate version remains `0.2.0`; chang
   is offline corpus evidence only, not live DCS validation (`src/commands/groove_ab.rs`).
 
 ### Fixed
+
+- `GetWind` queries (groove-entry low probe and the end-of-attempt report query) now retry once,
+  bounded, when the raw response looks like DCS's `180deg/0.0 m/s` zero-wind sentinel, confirmed by
+  inspecting `../DCS-gRPC` to come from the DCS engine itself rather than this crate or the fork. If
+  the groove-entry low probe still looks suspect after its retry, the AoA correction reuses the
+  high probe's wind vector for both interpolation points instead; the end-of-attempt query falls
+  back to that same high probe if it too is still suspect after its own retry. Raw probe readings
+  are still serialized as observed, never overwritten; the two new additive JSON fields
+  `wind_reference_probes.low_reading_overridden_by_high` and
+  `wind_reading_is_groove_entry_fallback` record when a fallback fired (`src/track.rs`,
+  `src/tasks/record_recovery.rs`).
+- Missing point-in-time gate objects can be replaced as coverage evidence by adjacent valid,
+  inbound continuous-trajectory samples that chronologically bracket the required distance within
+  300 ms. Serialized gate quality records this provenance, PNG/Discord identify it, V/STOL keeps
+  its three-distance rule, and incomplete wording no longer incorrectly requires “three” gates
+  when CATOBAR 3/4 NM is legitimately excluded (`src/track.rs`, `src/grading.rs`, `src/draw.rs`,
+  `src/tasks/record_recovery.rs`).
 
 - Live CATOBAR validation on 8 September 2026 (28 clean-build F-14B(U) reports, two human pilots)
   confirms the pattern renderer separates and attenuates earlier circuits without spurious joins:

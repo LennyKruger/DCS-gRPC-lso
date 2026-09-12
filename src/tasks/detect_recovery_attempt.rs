@@ -42,7 +42,8 @@ pub async fn detect_recovery_attempt(params: TaskParams<'_>) -> Result<(), crate
                 if is_recovery_attempt(&carrier, &plane) {
                     // record_recovery runs to completion (landed / bolter / waveoff /
                     // crash) before we check again — no cooldown needed here.
-                    if let Err(err) = super::record_recovery::record_recovery(params.clone()).await
+                    if let Err(err) =
+                        super::record_recovery::record_recovery(params.clone(), plane.time).await
                     {
                         tracing::error!(
                             %err,

@@ -235,7 +235,10 @@ bruts que les étapes suivantes vont recouper avec la trajectoire. C'est volonta
 séparé de la caméra de l'étape 2 : **si ce canal d'événements a un problème (coupure, fermeture
 propre du flux), la trajectoire positionnelle continue d'être enregistrée sans interruption, et le
 rapport le dit explicitement** (un diagnostic distinct, jamais confondu avec un vrai trou de
-positions).
+positions). Un seul canal est partagé par toute la session et tente de se reconnecter tout seul. Un
+petit journal garde les événements récents ; à la fermeture d'une vraie approche, le programme
+laisse encore deux secondes à un contact ou un texte LSO retardataire pour arriver, en vérifiant
+toujours l'heure DCS et les identités exactes de l'avion et du bateau.
 
 **Exemple fictif :** à 12:04:02.30, DCS envoie l'événement "Land" pour Wolf 1-1. Deux secondes
 plus tard, un message `"LSO: GRADE:OK : WIRE# 3"` arrive.
@@ -307,7 +310,7 @@ distances précises et traditionnellement utilisées en doctrine LSO :
 > de l'axe aide au diagnostic, mais n'est pas obligatoire : un undershoot qui reste à gauche ou un
 > overshoot qui traverse vite l'axe ont quand même un groove. Leur mauvais lineup, leur route
 > imparfaite et leurs corrections sont conservés dès le roll-out au lieu d'être cachés par une
-> entrée tardive. Le repère ¾ NM reste une photo de trajectoire, plus la définition du départ du
+> entrée tardive. Le repère ¾ NM reste une photo de trajectoire, mais ne définit plus le départ du
 > groove. Cette logique ne concerne que le Case I CATOBAR ; un straight-in Case II/III n'est pas
 > activé implicitement et l'AV-8B/Tarawa garde sa boîte historique.
 
@@ -334,6 +337,13 @@ trou de données, pas de décalage temporel suspect entre avion et bateau, avion
 approche et pas trop désaxé). Si les conditions ne sont pas réunies, la photo est marquée
 "invalide" plutôt que d'inventer un chiffre approximatif.
 
+Si l'objet « photo » manque alors que deux mesures continues réelles encadrent exactement la même
+distance, sont toutes deux valides et ne sont séparées que de 300 ms au maximum, cette paire peut
+prouver la couverture de la porte. Le rapport et les affichages disent alors explicitement
+« couvert par la trajectoire continue » : aucune position n'est recréée et les écarts réellement
+mesurés dans la trajectoire restent ceux qui déterminent la note. Une vraie capture tardive ou un
+trou plus long reste incomplet et n'accorde aucun point.
+
 **Pourquoi ces trois photos précises comptent encore, alors que la trajectoire est déjà
 enregistrée en continu ?** Parce qu'elles apportent une vérification de fiabilité renforcée. En
 CATOBAR, si la photo ¾ NM a été prise avant la vraie entrée en groove — donc encore dans le virage
@@ -349,6 +359,13 @@ programme combine les photos utiles avec toute la trajectoire continue — voir 
 En observant en continu la distance entre l'avion et le point d'atterrissage (est-ce que ça
 diminue toujours, ou est-ce que ça recommence à augmenter ?), combiné aux événements DCS de
 l'étape 3, le programme détermine l'issue :
+
+- **Approche seule (`ApproachOnly`)** : la finale est clairement reconnue (groove ou porte ½/¼ NM),
+  mais aucun contact, waveoff ou arrêt certain n'a pu être établi. Ce n'est pas renommé en remise
+  de gaz par défaut. Si toute la trajectoire nécessaire est couverte, sa note d'approche et ses
+  points restent visibles ; seule l'issue demeure inconnue. Un simple passage dans la grande zone
+  de détection, sans groove, porte significative ni événement d'issue, ne produit aucun rapport
+  pilote.
 
 - **Posé/arrêté ("Recovered")** : un contact `Land`/`RunwayTouch` prouve le toucher, mais seul un
   message DCS `WIRE#` confirme aujourd'hui l'arrestation pour rendre la passe notable. Sans ce
@@ -459,7 +476,10 @@ notable du tout (étape 5) ? — mais une fois cette question réglée, le calcu
 3. **La proximité du pont** est enfin prise en compte : un écart modéré (ni négligeable, ni
    franchement dangereux) situé dans les 150 derniers mètres avant la coupe plafonne la note à
    `--` au lieu de `OK`/`(OK)`, parce qu'il ne reste quasiment plus de temps pour le corriger à cet
-   endroit. Le même écart, plus tôt dans l'approche, est noté normalement.
+   endroit. Le même écart, plus tôt dans l'approche, est noté normalement. Pour le lineup, cette
+   zone garde une échelle fixe : le seuil de 1,5° correspond partout à environ 3,9 m d'écart
+   latéral. La simple proximité du pont ne grossit donc plus artificiellement un petit décalage ;
+   le rapport conserve aussi l'écart réel en mètres afin qu'un LSO puisse contrôler ce diagnostic.
 4. **`_OK_`, la passe parfaite (nouveau, 5 septembre 2026).** Une fois qu'une passe a déjà mérité
    `OK` par les trois points ci-dessus, le programme regarde s'il ne s'agit pas d'une passe
    carrément parfaite. Il faut alors, en plus, que **chaque** photo et **chaque** instant de la
@@ -494,7 +514,7 @@ programme sort donc **`OK`, 4.0 points** — 0.4° dépasse la fenêtre encore p
 `_OK_`, donc cette passe, déjà très propre, n'atteint pas la perfection.
 
 > Important à savoir : cette grille de seuils reste une règle **du projet**
-> (`PROJECT-DERIVED`, version `project-derived-v4`), pas une reconstruction certifiée de la
+> (`PROJECT-DERIVED`, version `project-derived-v5`), pas une reconstruction certifiée de la
 > doctrine officielle de l'US Navy — le rapport et la documentation technique le rappellent
 > systématiquement. Le vrai LSO humain juge aussi l'AoA, la puissance, l'assiette, le mouvement du
 > pont et bien d'autres dimensions qui ne sont, pour l'instant, ni mesurables de façon fiable ni
@@ -515,6 +535,12 @@ programme sort donc **`OK`, 4.0 points** — 0.4° dépasse la fenêtre encore p
 Le rapport contient désormais le vent au moment de l'appontage (direction et vitesse) — purement
 informatif, pour donner du contexte à une déviation (une dérive par vent de travers fort n'a pas le
 même sens qu'une dérive par ciel calme), sans jamais changer la note automatiquement.
+
+DCS renvoie parfois, de façon intermittente et sans lien avec ce programme, un vent "à zéro" absurde
+(180°, 0 nœud) près du niveau de la mer, indiscernable d'un vrai jour sans vent. Le programme
+réessaie une fois avant de faire confiance à cette valeur, et si elle persiste, affiche à la place la
+mesure prise un peu plus haut en altitude au début du groove — qui, elle, reste fiable dans tous les
+cas observés jusqu'ici.
 
 L'incidence (AoA) affichée sur les graphiques est une estimation géométrique (à partir de la
 vitesse et de l'orientation de l'avion), désormais corrigée du vent une fois celui-ci mesuré en

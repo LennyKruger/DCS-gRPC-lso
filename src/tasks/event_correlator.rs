@@ -17,6 +17,8 @@ pub struct EventCorrelationSummary {
     pub detail: Option<String>,
     pub outcome_evidence_seen_before_unavailability: bool,
     pub outcome_confirmed: bool,
+    pub unavailability_count: u32,
+    pub reconnection_count: u32,
 }
 
 #[derive(Debug)]
@@ -36,6 +38,8 @@ pub struct EventCorrelator {
     stream_detail: Option<String>,
     outcome_evidence_seen: bool,
     dcs_waveoff_evidence_seen: bool,
+    unavailability_count: u32,
+    reconnection_count: u32,
 }
 
 impl EventCorrelator {
@@ -47,6 +51,8 @@ impl EventCorrelator {
             stream_detail: None,
             outcome_evidence_seen: false,
             dcs_waveoff_evidence_seen: false,
+            unavailability_count: 0,
+            reconnection_count: 0,
         }
     }
 
@@ -58,6 +64,8 @@ impl EventCorrelator {
             stream_detail: Some("positions_only".to_string()),
             outcome_evidence_seen: false,
             dcs_waveoff_evidence_seen: false,
+            unavailability_count: 0,
+            reconnection_count: 0,
         }
     }
 
@@ -130,7 +138,24 @@ impl EventCorrelator {
         let detail = detail.into();
         self.stream_status = EventStreamStatus::Unavailable;
         self.stream_detail = Some(detail.clone());
+        self.unavailability_count = self.unavailability_count.saturating_add(1);
         track.mark_event_stream_unavailable(detail);
+    }
+
+    pub fn stream_available(&mut self, track: &mut Track) {
+        if self.stream_status != EventStreamStatus::Unavailable {
+            return;
+        }
+        self.stream_status = EventStreamStatus::Available;
+        self.stream_detail = None;
+        self.reconnection_count = self.reconnection_count.saturating_add(1);
+        let timestamp = track.last_observed_time_dcs().unwrap_or_default();
+        track.record_event(
+            "event_stream_reconnected",
+            timestamp,
+            true,
+            "session_event_stream_restored",
+        );
     }
 
     pub fn summary(&self, grading: &Grading) -> EventCorrelationSummary {
@@ -138,13 +163,17 @@ impl EventCorrelator {
             Grading::Recovered { cable: Some(_), .. } => self.outcome_evidence_seen,
             Grading::Bolter | Grading::TouchAndGo { .. } => true,
             Grading::WaveoffUnknown => self.dcs_waveoff_evidence_seen,
-            Grading::Unknown | Grading::Recovered { cable: None, .. } => false,
+            Grading::Unknown | Grading::ApproachOnly | Grading::Recovered { cable: None, .. } => {
+                false
+            }
         };
         EventCorrelationSummary {
             stream_status: self.stream_status.clone(),
             detail: self.stream_detail.clone(),
             outcome_evidence_seen_before_unavailability: self.outcome_evidence_seen,
             outcome_confirmed,
+            unavailability_count: self.unavailability_count,
+            reconnection_count: self.reconnection_count,
         }
     }
 }
@@ -179,6 +208,24 @@ mod tests {
             track.finish().telemetry_quality.completeness,
             crate::track::Completeness::InsufficientGates
         );
+    }
+
+    #[test]
+    fn stream_reconnection_is_explicit_and_preserves_prior_outcome_evidence() {
+        let mut track = catobar_track();
+        let mut correlator = EventCorrelator::new(10, 20);
+        correlator.stream_unavailable(&mut track, "unavailable");
+        correlator.stream_available(&mut track);
+
+        let summary = correlator.summary(&Grading::ApproachOnly);
+        assert_eq!(summary.stream_status, EventStreamStatus::Available);
+        assert_eq!(summary.unavailability_count, 1);
+        assert_eq!(summary.reconnection_count, 1);
+        assert!(track
+            .finish()
+            .events
+            .iter()
+            .any(|event| event.kind == "event_stream_reconnected"));
     }
 
     #[test]
